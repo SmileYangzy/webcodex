@@ -7,3 +7,6 @@ pub mod project_context;
 pub mod project_overview;
 #[cfg(feature = "workspace-checkpoints")]
 pub mod workspace_checkpoint;
+
+#[cfg(all(test, feature = "workspace-checkpoints"))]
+mod workspace_checkpoint_tests;

@@ -17,7 +17,7 @@ use super::{
     parse_required_clean_string, parse_usize_field, project_root, validate_artifact_runner_path,
 };
 use crate::apply_edits_shared::is_lowercase_hex_sha256 as is_hex_sha256;
-use crate::artifact_policy::ooxml_extension_for_mime;
+use crate::artifact_policy::{ooxml_extension_for_mime, GENERIC_BINARY_MIME};
 
 pub(super) const MAX_ARTIFACT_UPLOAD_BYTES: usize = 256 * 1024 * 1024;
 pub(super) const MAX_ARTIFACT_UPLOAD_CHUNK_BYTES: usize = 1024 * 1024;
@@ -863,7 +863,10 @@ pub(super) fn handle_artifact_upload_finish(
             );
         }
     }
-    let presentation_mime = detected_mime.or_else(|| state.mime_type.clone());
+    let presentation_mime = detected_mime
+        .filter(|mime| mime != GENERIC_BINARY_MIME)
+        .or_else(|| state.mime_type.clone())
+        .or_else(|| Some(GENERIC_BINARY_MIME.to_string()));
     let exists = std::fs::symlink_metadata(resolved).is_ok();
     if exists && !state.overwrite {
         return line_edit_stdout(

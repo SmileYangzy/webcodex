@@ -200,6 +200,57 @@ fn file_read_project_artifact_metadata_counts_zip_without_extracting() {
 }
 
 #[test]
+fn file_read_project_artifact_preserves_markdown_policy_and_magic_precedence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let policy = project_policy(tmp.path());
+    let streamed_max_bytes = 10 * 1024 * 1024 + 1;
+
+    for path in ["README.md", "README.MD", "README.markdown"] {
+        std::fs::write(tmp.path().join(path), b"# artifact\n").unwrap();
+        let read = line_edit_json(handle_file_request(
+            &policy,
+            &json_file_op_request(
+                tmp.path(),
+                "file_read_project_artifact",
+                path,
+                serde_json::json!({"path": path, "max_file_bytes": 1024}),
+            ),
+        ));
+        assert_eq!(read["mime_type"], "text/markdown", "{path}");
+
+        let metadata = line_edit_json(handle_file_request(
+            &policy,
+            &json_file_op_request(
+                tmp.path(),
+                "file_read_project_artifact_metadata",
+                path,
+                serde_json::json!({"path": path, "max_bytes": streamed_max_bytes}),
+            ),
+        ));
+        assert_eq!(metadata["mime_type"], "text/markdown", "{path}");
+    }
+
+    let magic_path = "report.MD";
+    std::fs::write(tmp.path().join(magic_path), b"%PDF-1.7\n").unwrap();
+    for (kind, limits) in [
+        (
+            "file_read_project_artifact",
+            serde_json::json!({"path": magic_path, "max_file_bytes": 1024}),
+        ),
+        (
+            "file_read_project_artifact_metadata",
+            serde_json::json!({"path": magic_path, "max_bytes": streamed_max_bytes}),
+        ),
+    ] {
+        let output = line_edit_json(handle_file_request(
+            &policy,
+            &json_file_op_request(tmp.path(), kind, magic_path, limits),
+        ));
+        assert_eq!(output["mime_type"], "application/pdf", "{kind}");
+    }
+}
+
+#[test]
 fn file_read_project_artifact_detects_ooxml_mime_from_package_content() {
     let tmp = tempfile::tempdir().unwrap();
     let policy = project_policy(tmp.path());
@@ -286,7 +337,7 @@ fn file_read_project_artifact_does_not_trust_ooxml_extension_or_malformed_packag
             serde_json::json!({"path": "not-a-zip.docx", "max_bytes": 1024}),
         ),
     ));
-    assert!(non_zip["mime_type"].is_null());
+    assert_eq!(non_zip["mime_type"], "application/octet-stream");
 
     let malformed = fake_ooxml_zip(
         "word/document.xml",
@@ -375,7 +426,7 @@ fn file_read_project_artifact_reads_binary_chunks() {
     assert!(first["sha256"]
         .as_str()
         .is_some_and(|value| value.len() == 64));
-    assert!(first.get("mime_type").is_some());
+    assert_eq!(first["mime_type"], "application/octet-stream");
     assert_eq!(first["offset"], 0);
     assert_eq!(first["bytes_returned"], 4);
     assert_eq!(first["next_offset"], 4);

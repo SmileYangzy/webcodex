@@ -156,6 +156,39 @@ fn lsp_supervisor_is_lazy_and_reuses_one_process_for_concurrent_project_calls() 
 }
 
 #[test]
+fn default_capacity_accepts_mixed_languages_but_keeps_runner_bound() {
+    let supervisor = LspSupervisor::new(LspSupervisorConfig {
+        background_reaper: false,
+        ..LspSupervisorConfig::default()
+    });
+    let mut servers = HashMap::new();
+    for profile in super::super::language::LANGUAGES {
+        let key = ProcessKey {
+            project_root: PathBuf::from("mixed-project"),
+            kind: profile.kind,
+        };
+        supervisor.check_capacity(&servers, &key).unwrap();
+        servers.insert(
+            key,
+            Arc::new(ServerSlot {
+                state: Mutex::new(SlotState::Starting),
+                ready: Condvar::new(),
+            }),
+        );
+    }
+    let other_project = ProcessKey {
+        project_root: PathBuf::from("another-project"),
+        kind: LspServerKind::RustAnalyzer,
+    };
+    assert!(matches!(
+        supervisor.check_capacity(&servers, &other_project),
+        Err(LspError::CapacityExceeded {
+            limit: DEFAULT_MAX_SERVERS_PER_AGENT
+        })
+    ));
+}
+
+#[test]
 fn concurrent_document_refresh_uses_one_monotonic_version() {
     let _serial = super::super::serialize_fake_lsp_test();
     let fixture = Fixture::new("normal");
@@ -227,12 +260,13 @@ fn concurrent_document_refresh_uses_one_monotonic_version() {
 fn failed_did_change_does_not_advance_document_state() {
     let _serial = super::super::serialize_fake_lsp_test();
     let documents = Mutex::new(HashMap::new());
+    let diagnostics = DiagnosticsCache::default();
     let initial = DocumentOpen {
         uri: "file:///workspace/main.rs",
         language_id: "rust",
         text: "fn initial() {}\n",
     };
-    synchronize_document_state(&documents, initial, |method, _| {
+    synchronize_document_state(&documents, initial, &diagnostics, |method, _| {
         assert_eq!(method, "textDocument/didOpen");
         Ok(())
     })
@@ -242,7 +276,7 @@ fn failed_did_change_does_not_advance_document_state() {
         text: "fn changed() {}\n",
         ..initial
     };
-    let error = synchronize_document_state(&documents, changed, |method, _| {
+    let error = synchronize_document_state(&documents, changed, &diagnostics, |method, _| {
         assert_eq!(method, "textDocument/didChange");
         Err(LspError::WriterFailed("injected failure".to_string()))
     })
@@ -255,19 +289,19 @@ fn failed_did_change_does_not_advance_document_state() {
         document_fingerprint(initial.text)
     );
 
-    let version = synchronize_document_state(&documents, changed, |method, params| {
+    let state = synchronize_document_state(&documents, changed, &diagnostics, |method, params| {
         assert_eq!(method, "textDocument/didChange");
         assert_eq!(params["textDocument"]["version"], 2);
         Ok(())
     })
     .unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(state.version, 2);
 }
 
 #[test]
 fn document_version_overflow_is_safe_and_state_is_fingerprint_only() {
     let _serial = super::super::serialize_fake_lsp_test();
-    assert!(std::mem::size_of::<OpenDocumentState>() <= 40);
+    assert!(std::mem::size_of::<OpenDocumentState>() <= 48);
     let uri = "file:///workspace/main.rs";
     let initial_text = "fn initial() {}\n";
     let documents = Mutex::new(HashMap::from([(
@@ -275,6 +309,7 @@ fn document_version_overflow_is_safe_and_state_is_fingerprint_only() {
         OpenDocumentState {
             version: i32::MAX,
             content_fingerprint: document_fingerprint(initial_text),
+            diagnostics_generation: 0,
         },
     )]));
     let error = synchronize_document_state(
@@ -284,6 +319,7 @@ fn document_version_overflow_is_safe_and_state_is_fingerprint_only() {
             language_id: "rust",
             text: "fn changed() {}\n",
         },
+        &DiagnosticsCache::default(),
         |_, _| panic!("overflow must be rejected before notification"),
     )
     .unwrap_err();
@@ -386,7 +422,7 @@ fn diagnostics_cache_wait_has_version_generation_and_timeout_semantics() {
     let cache = DiagnosticsCache::default();
     let uri = "file:///workspace/main.rs";
     let no_cache = cache
-        .wait_for_publication(uri, 1, 0, Instant::now())
+        .wait_for_publication(uri, 1, 0, 0, Instant::now())
         .unwrap();
     assert!(no_cache.0.is_none());
     assert!(no_cache.1);
@@ -398,15 +434,27 @@ fn diagnostics_cache_wait_has_version_generation_and_timeout_semantics() {
     })));
     let baseline = cache.generation();
     let stale = cache
-        .wait_for_publication(uri, 1, baseline, Instant::now())
+        .wait_for_publication(uri, 1, baseline, baseline, Instant::now())
         .unwrap();
     assert_eq!(stale.0.unwrap().version, Some(0));
     assert!(stale.1);
 
     let version_match = cache
-        .wait_for_publication(uri, 0, baseline, Instant::now())
+        .wait_for_publication(uri, 0, baseline, baseline, Instant::now())
         .unwrap();
     assert!(!version_match.1);
+
+    // A late publication for the previous version is still stale even when
+    // it arrived after the diagnostics query began.
+    cache.record_publish_diagnostics(Some(&json!({
+        "uri": uri,
+        "version": 0,
+        "diagnostics": [],
+    })));
+    let late_old_version = cache
+        .wait_for_publication(uri, 1, baseline, baseline, Instant::now())
+        .unwrap();
+    assert!(late_old_version.1);
 
     let before = cache.generation();
     cache.record_publish_diagnostics(Some(&json!({
@@ -414,7 +462,7 @@ fn diagnostics_cache_wait_has_version_generation_and_timeout_semantics() {
         "diagnostics": [],
     })));
     let new_generation = cache
-        .wait_for_publication(uri, 1, before, Instant::now())
+        .wait_for_publication(uri, 1, before, before, Instant::now())
         .unwrap();
     assert!(!new_generation.1);
 }
@@ -455,6 +503,96 @@ fn diagnostics_cache_is_cleared_with_server_instance_restart() {
     assert!(lock_unpoison(&second_server.diagnostics.state)
         .publications
         .is_empty());
+}
+
+#[cfg(windows)]
+#[test]
+fn diagnostics_cache_matches_windows_uri_spelling_without_conflating_files() {
+    let cache = DiagnosticsCache::default();
+    cache.record_publish_diagnostics(Some(&json!({
+        "uri": "file:///c%3A/work%20space/probe.ts",
+        "version": 1,
+        "diagnostics": [],
+    })));
+    let matched = cache
+        .wait_for_publication("file:///C:/work%20space/probe.ts", 1, 0, 0, Instant::now())
+        .unwrap();
+    assert!(matched.0.is_some());
+    assert!(!matched.1);
+    for uri in [
+        "file:///D:/work%20space/probe.ts",
+        "file:///C:/work%20space/other.ts",
+        "file:///C:/work%20space/Probe.ts",
+        "file:///C:/work%20space/probe.ts?other=1",
+        "https://example.invalid/C:/work%20space/probe.ts",
+    ] {
+        let unmatched = cache
+            .wait_for_publication(uri, 1, 0, 0, Instant::now())
+            .unwrap();
+        assert!(unmatched.0.is_none(), "{uri}");
+        assert!(unmatched.1, "{uri}");
+    }
+}
+
+#[test]
+fn diagnostics_unversioned_publication_survives_navigation_and_repeated_reads_not_edits() {
+    let _serial = super::super::serialize_fake_lsp_test();
+    let fixture = Fixture::new("diagnostics_unversioned_once");
+    let path = fixture.root.join("main.rs");
+    let text = "fn main() {}\n";
+    fs::write(&path, text).unwrap();
+    let uri = Url::from_file_path(&path).unwrap().to_string();
+    fixture
+        .supervisor
+        .prepare_document(
+            &fixture.root,
+            LspServerKind::RustAnalyzer,
+            &uri,
+            "rust",
+            text,
+        )
+        .unwrap();
+    let server = fixture
+        .supervisor
+        .server_for_test(&fixture.root, LspServerKind::RustAnalyzer)
+        .unwrap();
+    assert!(wait_until(Duration::from_secs(1), || server
+        .diagnostics
+        .generation()
+        > 0));
+    for _ in 0..2 {
+        let snapshot = fixture
+            .supervisor
+            .document_diagnostics(
+                &fixture.root,
+                LspServerKind::RustAnalyzer,
+                &uri,
+                "rust",
+                text,
+                Instant::now() + Duration::from_millis(100),
+            )
+            .unwrap();
+        assert!(
+            !snapshot.timed_out,
+            "unchanged versionless diagnostics must be reusable"
+        );
+        assert_eq!(snapshot.publication.unwrap().version, None);
+    }
+    let changed = fixture
+        .supervisor
+        .document_diagnostics(
+            &fixture.root,
+            LspServerKind::RustAnalyzer,
+            &uri,
+            "rust",
+            "fn changed() {}\n",
+            Instant::now(),
+        )
+        .unwrap();
+    assert!(
+        changed.timed_out,
+        "pre-edit diagnostics must not be reported as fresh"
+    );
 }
 
 #[test]
@@ -1014,10 +1152,10 @@ fn lsp_initialize_uses_constrained_rust_analyzer_profile() {
     );
 }
 
-/// Start the fake server under `kind` and return the `initializationOptions`
-/// it recorded from the `initialize` request. Lets per-language security
-/// profiles be asserted without the real language server installed.
-fn captured_initialize_options(kind: LspServerKind) -> Value {
+/// Start the fake server under `kind` and return the params it recorded from
+/// the `initialize` request. Lets client capabilities and per-language
+/// security profiles be asserted without the real language server installed.
+fn captured_initialize_params(kind: LspServerKind) -> Value {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("project");
     fs::create_dir(&root).unwrap();
@@ -1041,9 +1179,33 @@ fn captured_initialize_options(kind: LspServerKind) -> Value {
         .find(|line| line.starts_with("initialize:"))
         .expect("fake server records the initialize body");
     let body: Value = serde_json::from_str(line.strip_prefix("initialize:").unwrap()).unwrap();
-    body.pointer("/params/initializationOptions")
+    body.get("params")
         .cloned()
-        .expect("initializationOptions present")
+        .expect("initialize params present")
+}
+
+fn captured_initialize_options(kind: LspServerKind) -> Value {
+    captured_initialize_params(kind)["initializationOptions"].clone()
+}
+
+#[test]
+fn diagnostics_initialize_advertises_push_support_without_pull_or_registration() {
+    let _serial = super::super::serialize_fake_lsp_test();
+    let params = captured_initialize_params(LspServerKind::TypeScriptLanguageServer);
+    assert_eq!(
+        params.pointer("/capabilities/textDocument/publishDiagnostics/versionSupport"),
+        Some(&json!(true))
+    );
+    assert_eq!(
+        params.pointer("/capabilities/textDocument/publishDiagnostics/relatedInformation"),
+        Some(&json!(false))
+    );
+    assert!(params
+        .pointer("/capabilities/textDocument/diagnostic")
+        .is_none());
+    assert!(params
+        .pointer("/capabilities/workspace/configuration")
+        .is_none());
 }
 
 #[test]

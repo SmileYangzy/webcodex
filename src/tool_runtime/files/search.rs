@@ -208,8 +208,7 @@ impl SearchOptions {
             .unwrap_or(DEFAULT_SEARCH_TIMEOUT_SECS as i64)
             .clamp(MIN_SEARCH_TIMEOUT_SECS, MAX_SEARCH_TIMEOUT_SECS)
             as u64;
-        // Capability features that require ripgrep. Empty glob arrays and
-        // timeout_secs are not rg-only capabilities (timeout is runner-owned).
+        // Empty glob arrays, count mode, and timeout_secs support grep fallback.
         let mut requested_features = Vec::new();
         if !include_globs.is_empty() {
             requested_features.push("include_globs".to_string());
@@ -217,7 +216,7 @@ impl SearchOptions {
         if !exclude_globs.is_empty() {
             requested_features.push("exclude_globs".to_string());
         }
-        if result_mode != SearchResultMode::Matches {
+        if result_mode == SearchResultMode::FilesWithMatches {
             requested_features.push(format!("result_mode={}", result_mode.as_str()));
         }
 
@@ -245,7 +244,7 @@ impl SearchOptions {
     pub(crate) fn requires_ripgrep(&self) -> bool {
         !self.include_globs.is_empty()
             || !self.exclude_globs.is_empty()
-            || self.result_mode != SearchResultMode::Matches
+            || self.result_mode == SearchResultMode::FilesWithMatches
     }
 }
 
@@ -633,19 +632,24 @@ fn grep_search_command(options: &SearchOptions) -> String {
         SearchPatternMode::Regex => "-E ",
         SearchPatternMode::Literal => "-F ",
     };
+    let mode_args = match options.result_mode {
+        SearchResultMode::Matches => format!(
+            "-rnI --null {pattern_mode_arg}-B {} -A {}",
+            options.context_before, options.context_after
+        ),
+        SearchResultMode::Count => format!("-rI --null -c {pattern_mode_arg}"),
+        SearchResultMode::FilesWithMatches => unreachable!("files_with_matches requires ripgrep"),
+    };
     format!(
-        "grep -rnI --null {pattern_mode_arg}{excludes} -B {before} -A {after} -e {pattern} -- {target} 2>/dev/null",
+        "grep {mode_args} {excludes} -e {pattern} -- {target} 2>/dev/null",
         excludes = search_project_text_exclude_args(),
-        before = options.context_before,
-        after = options.context_after,
         pattern = shell_escape_simple(&options.pattern),
         target = shell_escape_simple(&options.path),
     )
 }
 
-/// Build one bounded capability-selecting command for every search mode. Basic
-/// matches calls retain grep fallback; requests that need full capabilities
-/// emit a machine-readable marker when ripgrep is unavailable.
+/// Build a bounded command with grep fallback for matches and counts.
+/// Other capabilities emit a structured marker when ripgrep is unavailable.
 pub(crate) fn search_project_text_command(options: &SearchOptions) -> String {
     search_project_text_command_with_head_fallbacks(
         options,
@@ -671,10 +675,17 @@ pub(crate) fn search_project_text_command_with_head_fallbacks(
     let fallback = if options.requires_ripgrep() {
         search_project_text_marker_command("grep", true)
     } else {
+        // grep -c also emits zero records; retain the byte bound without
+        // letting empty files consume the requested positive-result limit.
+        let grep_head = if options.result_mode == SearchResultMode::Count {
+            SEARCH_OUTPUT_BYTE_BUDGET
+        } else {
+            head
+        };
         wrap_search_project_text_backend_command(
             "grep",
             &grep_search_command(options),
-            head,
+            grep_head,
             head_bytes,
         )
     };
@@ -1268,7 +1279,7 @@ fn parse_file_paths(stdout: &str, limit: usize) -> (Vec<SearchFile>, bool, bool)
     )
 }
 
-fn parse_file_counts(stdout: &str, limit: usize) -> ParsedFileCounts {
+fn parse_file_counts(stdout: &str, limit: usize, backend: &str) -> ParsedFileCounts {
     let (lines, bytes_truncated) = split_complete_search_lines(stdout);
     let mut counts = Vec::<(String, u64)>::new();
     let mut evidence = CountParseEvidence::default();
@@ -1276,7 +1287,6 @@ fn parse_file_counts(stdout: &str, limit: usize) -> ParsedFileCounts {
         if serde_json::from_str::<Value>(line).is_ok() {
             continue;
         }
-        evidence.data_record_seen = true;
         let parsed = line
             .split_once('\0')
             .or_else(|| line.rsplit_once(':'))
@@ -1284,9 +1294,14 @@ fn parse_file_counts(stdout: &str, limit: usize) -> ParsedFileCounts {
                 Some((path, count.trim_end_matches('\r').parse::<u64>().ok()?))
             });
         let Some((path, count)) = parsed else {
+            evidence.data_record_seen = true;
             evidence.malformed_record_seen = true;
             continue;
         };
+        if count == 0 && backend == "grep" {
+            continue;
+        }
+        evidence.data_record_seen = true;
         evidence.parsed_record_count = evidence.parsed_record_count.saturating_add(1);
         if count == 0 {
             evidence.malformed_record_seen = true;
@@ -1340,7 +1355,7 @@ fn parse_search_result(stdout: &str, options: &SearchOptions, backend: String) -
             )
         }
         SearchResultMode::Count => {
-            let parsed = parse_file_counts(stdout, options.limit);
+            let parsed = parse_file_counts(stdout, options.limit, &backend);
             let count_complete = !parsed.limit_truncated
                 && !parsed.bytes_truncated
                 && !result_retention_truncated
@@ -2300,6 +2315,46 @@ mod tests {
         let matches = result.output["matches"].as_array().unwrap();
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0]["preview"], "RuntimeInfo { value.* }");
+    }
+
+    #[test]
+    fn search_count_supports_grep_zero_records_without_consuming_limit() {
+        let options = SearchOptions::normalize(SearchRequest {
+            pattern: "needle".to_string(),
+            path: None,
+            limit: Some(1),
+            context_before: None,
+            context_after: None,
+            include_globs: None,
+            exclude_globs: None,
+            result_mode: Some(SearchResultMode::Count),
+            timeout_secs: None,
+        })
+        .unwrap();
+        assert!(!options.requires_ripgrep());
+        assert!(grep_search_command(&options).contains("grep -rI --null -c"));
+        let stdout = concat!(
+            "{\"webcodex_search\":{\"backend\":\"grep\",\"feature_unavailable\":false}}\n",
+            "src/zero.rs\x000\n",
+            "src/a.rs\x002\n",
+        );
+        let result = search_project_text_output("demo", &options, stdout, Some(0), "");
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(result.output["returned_match_count"], 2);
+        assert_eq!(result.output["count_complete"], true);
+        assert_eq!(result.output["total_matches"], 2);
+        let empty = concat!(
+            "{\"webcodex_search\":{\"backend\":\"grep\",\"feature_unavailable\":false}}\n",
+            "src/zero.rs\x000\n",
+        );
+        let result = search_project_text_output("demo", &options, empty, Some(1), "");
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(result.output["total_matches"], 0);
+        assert!(
+            parse_file_counts("src/a.rs\x000\n", 1, "rg")
+                .evidence
+                .malformed_record_seen
+        );
     }
 
     #[test]

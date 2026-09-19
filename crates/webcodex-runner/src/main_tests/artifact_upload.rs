@@ -305,6 +305,83 @@ fn file_artifact_upload_finish_detects_ooxml_mime_from_file() {
 }
 
 #[test]
+fn file_artifact_upload_unknown_extension_uses_octet_stream_metadata_after_commit() {
+    check_unknown_upload_mime(None);
+    check_unknown_upload_mime(Some("text/plain"));
+}
+
+fn check_unknown_upload_mime(claimed_mime: Option<&str>) {
+    let tmp = tempfile::tempdir().unwrap();
+    let policy = project_policy(tmp.path());
+    let path = "artifacts/imports/opaque.customblob";
+    let bytes = b"opaque artifact payload";
+
+    let begin = line_edit_json(handle_file_request(
+        &policy,
+        &json_file_op_request(
+            tmp.path(),
+            "file_artifact_upload_begin",
+            path,
+            serde_json::json!({
+                "path": path,
+                "expected_bytes": bytes.len(),
+                "expected_sha256": sha256_hex_bytes(bytes),
+                "mime_type": claimed_mime,
+                "overwrite": false,
+                "max_bytes": 1024,
+            }),
+        ),
+    ));
+    let upload_id = begin["upload_id"].as_str().unwrap().to_string();
+    let chunk = line_edit_json(handle_file_request(
+        &policy,
+        &json_file_op_request(
+            tmp.path(),
+            "file_artifact_upload_chunk",
+            path,
+            serde_json::json!({
+                "path": path,
+                "upload_id": upload_id.clone(),
+                "offset": 0,
+                "content_base64": base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    bytes,
+                ),
+                "max_chunk_bytes": 1024,
+            }),
+        ),
+    ));
+    assert_eq!(chunk["received_bytes"], bytes.len());
+
+    let finish = line_edit_json(handle_file_request(
+        &policy,
+        &json_file_op_request(
+            tmp.path(),
+            "file_artifact_upload_finish",
+            path,
+            serde_json::json!({"path": path, "upload_id": upload_id}),
+        ),
+    ));
+    assert_eq!(finish["committed"], true);
+    assert_eq!(
+        finish["mime_type"],
+        claimed_mime.unwrap_or("application/octet-stream")
+    );
+
+    let metadata = line_edit_json(handle_file_request(
+        &policy,
+        &json_file_op_request(
+            tmp.path(),
+            "file_read_project_artifact_metadata",
+            path,
+            serde_json::json!({"path": path}),
+        ),
+    ));
+    assert_eq!(metadata["mime_type"], "application/octet-stream");
+    assert_eq!(metadata["sha256"], sha256_hex_bytes(bytes));
+}
+
+#[test]
 fn file_artifact_upload_finish_rejects_claimed_ooxml_mime_when_package_differs() {
     let tmp = tempfile::tempdir().unwrap();
     let policy = project_policy(tmp.path());

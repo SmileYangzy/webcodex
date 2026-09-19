@@ -1,5 +1,6 @@
 use crate::artifact_policy::{
-    ooxml_extension_for_mime, preferred_mime_for_path, DOCX_MIME, PPTX_MIME, XLSX_MIME,
+    ooxml_extension_for_mime, preferred_mime_for_path, DOCX_MIME, GENERIC_BINARY_MIME, PPTX_MIME,
+    XLSX_MIME,
 };
 use flate2::read::DeflateDecoder;
 use sha2::{Digest, Sha256};
@@ -594,7 +595,7 @@ pub(super) fn artifact_mime(path: &str, data: &[u8], sniff_json: bool) -> Option
             mime = Some("application/json");
         }
     }
-    mime.map(str::to_string)
+    Some(mime.unwrap_or(GENERIC_BINARY_MIME).to_string())
 }
 
 pub(super) fn artifact_mime_from_file(
@@ -637,7 +638,7 @@ pub(super) fn artifact_mime_from_file(
             mime = Some("application/json");
         }
     }
-    mime.map(str::to_string)
+    Some(mime.unwrap_or(GENERIC_BINARY_MIME).to_string())
 }
 
 pub(super) fn read_file_range_with_digest(

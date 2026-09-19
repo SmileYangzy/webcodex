@@ -23,7 +23,9 @@ pub(crate) const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const DEFAULT_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(15);
 pub(crate) const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 pub(crate) const DEFAULT_IDLE_TTL: Duration = Duration::from_secs(15 * 60);
-const DEFAULT_MAX_SERVERS_PER_PROJECT: usize = 1;
+// A mixed-language project may use each registered server; the Runner-wide
+// limit still bounds the total number of child processes.
+const DEFAULT_MAX_SERVERS_PER_PROJECT: usize = super::language::LANGUAGES.len();
 const DEFAULT_MAX_SERVERS_PER_AGENT: usize = 4;
 const MAX_STDERR_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_DIAGNOSTIC_DOCUMENTS: usize = 256;
@@ -545,8 +547,8 @@ impl LspSupervisor {
                 Err(error) => return Err(error),
             };
             let baseline_generation = server.diagnostics.generation();
-            let document_version = match server.synchronize_document(document) {
-                Ok(version) => version,
+            let document_state = match server.synchronize_document(document) {
+                Ok(state) => state,
                 Err(error) if attempt == 0 && error.permits_restart() => continue,
                 Err(error) if attempt == 1 && error.permits_restart() => {
                     self.evict_unusable(&key);
@@ -556,8 +558,9 @@ impl LspSupervisor {
             };
             match server.diagnostics.wait_for_publication(
                 document_uri,
-                document_version,
+                document_state.version,
                 baseline_generation,
+                document_state.diagnostics_generation,
                 deadline,
             ) {
                 Ok((publication, timed_out)) => {
@@ -1612,6 +1615,7 @@ struct DocumentOpen<'a> {
 struct OpenDocumentState {
     version: i32,
     content_fingerprint: [u8; 32],
+    diagnostics_generation: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -1738,6 +1742,27 @@ struct DiagnosticsCacheState {
     closed: bool,
 }
 
+fn diagnostics_uri_key(uri: &str) -> String {
+    let normalized = Url::parse(uri).ok().and_then(|url| {
+        if url.scheme() != "file" || url.query().is_some() || url.fragment().is_some() {
+            return None;
+        }
+        let path = url.to_file_path().ok()?;
+        #[cfg(windows)]
+        let path = {
+            let mut text = path.to_str()?.to_string();
+            // Servers may percent-encode the colon and lowercase the drive.
+            // Preserve path-component case for case-sensitive directories.
+            if text.as_bytes().get(1) == Some(&b':') && text.as_bytes()[0].is_ascii_alphabetic() {
+                text[..1].make_ascii_lowercase();
+            }
+            PathBuf::from(text)
+        };
+        Url::from_file_path(path).ok().map(|url| url.to_string())
+    });
+    normalized.unwrap_or_else(|| uri.to_string())
+}
+
 #[derive(Default)]
 struct DiagnosticsCache {
     state: Mutex<DiagnosticsCacheState>,
@@ -1794,10 +1819,11 @@ impl DiagnosticsCache {
             .cloned()
             .collect::<Vec<_>>();
 
+        let uri = diagnostics_uri_key(uri);
         let mut state = lock_unpoison(&self.state);
         state.generation = state.generation.saturating_add(1);
         let generation = state.generation;
-        if !state.publications.contains_key(uri)
+        if !state.publications.contains_key(&uri)
             && state.publications.len() >= MAX_DIAGNOSTIC_DOCUMENTS
         {
             let oldest = state
@@ -1810,7 +1836,7 @@ impl DiagnosticsCache {
             }
         }
         state.publications.insert(
-            uri.to_string(),
+            uri,
             DiagnosticsPublication {
                 generation,
                 version,
@@ -1829,13 +1855,22 @@ impl DiagnosticsCache {
         uri: &str,
         document_version: i32,
         baseline_generation: u64,
+        document_generation: u64,
         deadline: Instant,
     ) -> Result<(Option<DiagnosticsPublication>, bool), LspError> {
+        let uri = diagnostics_uri_key(uri);
         let mut state = lock_unpoison(&self.state);
         loop {
-            if let Some(publication) = state.publications.get(uri) {
-                let fresh = publication.generation > baseline_generation
-                    || publication.version == Some(document_version);
+            if let Some(publication) = state.publications.get(&uri) {
+                // Unchanged documents are not reopened; versionless servers need
+                // the generation at the last didOpen/didChange, not this query.
+                let fresh = match publication.version {
+                    Some(version) => version == document_version,
+                    None => {
+                        publication.generation > baseline_generation
+                            || publication.generation > document_generation
+                    }
+                };
                 if fresh {
                     return Ok((Some(publication.clone()), false));
                 }
@@ -1845,7 +1880,7 @@ impl DiagnosticsCache {
             }
             let remaining = remaining_until(deadline);
             if remaining.is_zero() {
-                return Ok((state.publications.get(uri).cloned(), true));
+                return Ok((state.publications.get(&uri).cloned(), true));
             }
             let waited = self.changed.wait_timeout(state, remaining);
             state = match waited {
@@ -1877,18 +1912,20 @@ fn document_fingerprint(text: &str) -> [u8; 32] {
 fn synchronize_document_state(
     documents: &Mutex<HashMap<String, OpenDocumentState>>,
     document: DocumentOpen<'_>,
+    diagnostics: &DiagnosticsCache,
     mut notify: impl FnMut(&str, Value) -> Result<(), LspError>,
-) -> Result<i32, LspError> {
+) -> Result<OpenDocumentState, LspError> {
     let fingerprint = document_fingerprint(document.text);
     // Serialize comparison, notification, and commit for a URI. The state
     // changes only after the notification is accepted by the writer.
     let mut documents = lock_unpoison(documents);
     match documents.get(document.uri).copied() {
-        Some(state) if state.content_fingerprint == fingerprint => Ok(state.version),
+        Some(state) if state.content_fingerprint == fingerprint => Ok(state),
         Some(state) => {
             let version = state.version.checked_add(1).ok_or_else(|| {
                 LspError::ProtocolError("LSP document version exhausted".to_string())
             })?;
+            let diagnostics_generation = diagnostics.generation();
             notify(
                 "textDocument/didChange",
                 json!({
@@ -1901,16 +1938,16 @@ fn synchronize_document_state(
                     }],
                 }),
             )?;
-            documents.insert(
-                document.uri.to_string(),
-                OpenDocumentState {
-                    version,
-                    content_fingerprint: fingerprint,
-                },
-            );
-            Ok(version)
+            let state = OpenDocumentState {
+                version,
+                content_fingerprint: fingerprint,
+                diagnostics_generation,
+            };
+            documents.insert(document.uri.to_string(), state);
+            Ok(state)
         }
         None => {
+            let diagnostics_generation = diagnostics.generation();
             notify(
                 "textDocument/didOpen",
                 json!({
@@ -1922,14 +1959,13 @@ fn synchronize_document_state(
                     }
                 }),
             )?;
-            documents.insert(
-                document.uri.to_string(),
-                OpenDocumentState {
-                    version: 1,
-                    content_fingerprint: fingerprint,
-                },
-            );
-            Ok(1)
+            let state = OpenDocumentState {
+                version: 1,
+                content_fingerprint: fingerprint,
+                diagnostics_generation,
+            };
+            documents.insert(document.uri.to_string(), state);
+            Ok(state)
         }
     }
 }
@@ -2130,6 +2166,10 @@ impl ServerInstance {
                 "positionEncodings": ["utf-8", "utf-16", "utf-32"]
             },
             "textDocument": {
+                "publishDiagnostics": {
+                    "relatedInformation": false,
+                    "versionSupport": true
+                },
                 "callHierarchy": {
                     "dynamicRegistration": false
                 }
@@ -2294,13 +2334,18 @@ impl ServerInstance {
         }))
     }
 
-    fn synchronize_document(&self, document: DocumentOpen<'_>) -> Result<i32, LspError> {
-        let version =
-            synchronize_document_state(&self.open_documents, document, |method, params| {
-                self.notify(method, params)
-            })?;
+    fn synchronize_document(
+        &self,
+        document: DocumentOpen<'_>,
+    ) -> Result<OpenDocumentState, LspError> {
+        let state = synchronize_document_state(
+            &self.open_documents,
+            document,
+            &self.diagnostics,
+            |method, params| self.notify(method, params),
+        )?;
         self.touch_last_used();
-        Ok(version)
+        Ok(state)
     }
 
     fn write(&self, message: &Value) -> Result<(), LspError> {

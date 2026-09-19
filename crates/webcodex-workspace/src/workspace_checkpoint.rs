@@ -268,6 +268,12 @@ fn restore_workspace_checkpoint_inner(root: &Path, checkpoint: &Value) -> Result
     for item in &untracked_files {
         push_unique(&mut changed_paths, &item.path);
     }
+    for path in changed_paths_from_diff(&current_unstaged)
+        .into_iter()
+        .chain(changed_paths_from_diff(&current_staged))
+    {
+        push_unique(&mut changed_paths, &path);
+    }
 
     Ok(json!({
         "restored": true,
@@ -352,6 +358,9 @@ fn git_output(
     command.args(args).current_dir(root);
     if input.is_some() {
         command.stdin(Stdio::piped());
+    } else {
+        // Desktop Runner stdin is a liveness lease, not input for Git.
+        command.stdin(Stdio::null());
     }
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command

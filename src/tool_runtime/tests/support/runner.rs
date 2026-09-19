@@ -204,7 +204,8 @@ pub(in crate::tool_runtime::tests) fn run_runner_skill_resource_request_locally(
                 "g = {'__name__': '__main__', '__file__': p, '__package__': None, '__spec__': None, '__builtins__': __builtins__}\n",
                 "exec(compile(src, p, 'exec'), g, g)\n",
             );
-            let mut command = std::process::Command::new("python3");
+            let mut command =
+                std::process::Command::new(if cfg!(windows) { "python" } else { "python3" });
             command.args(["-B", "-c", WRAPPER, target]);
             command.args(&skill.args);
             command

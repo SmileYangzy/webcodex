@@ -100,11 +100,21 @@ fn skill_execution_candidates(
             let mut py = Vec::with_capacity(common.len() + 1);
             py.push("-3".to_string());
             py.extend(common.iter().cloned());
-            vec![
-                ("python3".to_string(), common.clone()),
-                ("python".to_string(), common),
-                ("py".to_string(), py),
-            ]
+            // Prefer the Windows launcher over executable Store aliases. Never
+            // retry a script after an interpreter has started executing it.
+            if cfg!(windows) {
+                vec![
+                    ("py".to_string(), py),
+                    ("python".to_string(), common.clone()),
+                    ("python3".to_string(), common),
+                ]
+            } else {
+                vec![
+                    ("python3".to_string(), common.clone()),
+                    ("python".to_string(), common),
+                    ("py".to_string(), py),
+                ]
+            }
         }
         "sh" => {
             let mut args = vec![

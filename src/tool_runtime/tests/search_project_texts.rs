@@ -1575,7 +1575,7 @@ async fn search_project_texts_does_not_retry_nontransient_agent_failures() {
 
     let feature_result = run_single_agent_batch_response(
         "batch-search-no-retry-feature",
-        query("feature", Some(SearchResultMode::Count)),
+        query("feature", Some(SearchResultMode::FilesWithMatches)),
         1,
         r#"{"webcodex_search":{"backend":"grep","feature_unavailable":true}}
 "#

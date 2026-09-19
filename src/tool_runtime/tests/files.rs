@@ -2998,7 +2998,7 @@ fn search_requires_ripgrep_based_on_effective_features_not_field_presence() {
         ..raw_search_request()
     })
     .unwrap();
-    assert!(count_mode.requires_ripgrep());
+    assert!(!count_mode.requires_ripgrep());
 }
 
 #[test]
@@ -3929,7 +3929,7 @@ async fn advanced_search_without_rg_returns_structured_capability_error() {
                     search_call(
                         project,
                         SearchRequest {
-                            result_mode: Some(SearchResultMode::Count),
+                            result_mode: Some(SearchResultMode::FilesWithMatches),
                             ..raw_search_request()
                         },
                     ),

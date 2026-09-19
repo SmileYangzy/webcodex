@@ -404,9 +404,14 @@ fn interpreter_argv_binds_python_file_and_shell_zero_to_runner_owned_target() {
     let request = execution_request(&configured, "scripts/probe.py", PYTHON_PROBE);
     let target = "/trusted/skill/scripts/probe.py";
     let candidates = skill_execution_candidates(&request, target).unwrap();
-    assert_eq!(candidates[0].0, "python3");
+    let preferred = if cfg!(windows) { "py" } else { "python3" };
+    assert_eq!(candidates[0].0, preferred);
+    let start = usize::from(cfg!(windows));
+    if cfg!(windows) {
+        assert_eq!(candidates[0].1[0], "-3");
+    }
     assert_eq!(
-        candidates[0].1[0..4],
+        candidates[0].1[start..start + 4],
         ["-B", "-c", PYTHON_SKILL_WRAPPER, target]
     );
     assert!(PYTHON_SKILL_WRAPPER.contains("sys.path[0] = os.path.dirname(p)"));
@@ -414,7 +419,7 @@ fn interpreter_argv_binds_python_file_and_shell_zero_to_runner_owned_target() {
     let mut uppercase_request = request.clone();
     uppercase_request.path = "scripts/probe.PY".to_string();
     let uppercase_candidates = skill_execution_candidates(&uppercase_request, target).unwrap();
-    assert_eq!(uppercase_candidates[0].0, "python3");
+    assert_eq!(uppercase_candidates[0].0, preferred);
 
     let shell_script = "printf '%s\\n' \"$0\"\n";
     let shell_request = execution_request(&configured, "scripts/probe.sh", shell_script);
