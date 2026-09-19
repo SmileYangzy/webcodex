@@ -18,17 +18,10 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 
 mod import_http;
-mod jobs;
-mod project_files;
 mod projects;
 mod runner_config;
 
 pub use import_http::import_conversation_files_to_project;
-pub use jobs::{job_stop, job_tail, jobs_list, projects_run_job, projects_run_shell};
-pub use project_files::{
-    projects_apply_unified_diff, projects_discard_untracked, projects_git_restore_paths,
-    projects_git_status, projects_list_files,
-};
 pub use projects::{
     projects_create, projects_list, projects_register, projects_resolve_or_register,
     projects_unregister,

@@ -520,7 +520,7 @@ pub(crate) fn handle_project_operation(
             "path": path,
             "description": description,
             "project_record_path": write_result.config_path.to_string_lossy(),
-            "projects_config_path": write_result.config_path.to_string_lossy(),
+
             "created_config": write_result.created_config,
             "overwritten": write_result.overwritten,
             "allow_patch": allow_patch,
@@ -723,7 +723,7 @@ pub(crate) fn handle_project_operation(
         "path": path,
         "description": description,
         "project_record_path": write_result.config_path.to_string_lossy(),
-        "projects_config_path": write_result.config_path.to_string_lossy(),
+
         "created_directory": created_directory,
         "created_config": write_result.created_config,
         "overwritten": write_result.overwritten,

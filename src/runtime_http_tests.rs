@@ -7,12 +7,8 @@ use std::time::Duration;
 
 #[path = "runtime_http/tests/import_http_tests.rs"]
 mod import_http_tests;
-#[path = "runtime_http/tests/jobs_tests.rs"]
-mod jobs_tests;
 #[path = "runtime_http/tests/model_ergonomics_tests.rs"]
 mod model_ergonomics_tests;
-#[path = "runtime_http/tests/project_files_tests.rs"]
-mod project_files_tests;
 #[path = "runtime_http/tests/projects_tests.rs"]
 mod projects_tests;
 #[path = "runtime_http/tests/runner_config_tests.rs"]
@@ -203,10 +199,9 @@ fn runtime_with_local_project(root: &std::path::Path, project_id: &str) -> ToolR
     )
 }
 
-/// Build a router that mirrors the production /api wiring for the new
-/// dedicated project actions: Config, Database, and ToolRuntime are
-/// injected so AuthMiddleware and the handlers resolve state exactly as
-/// in `main.rs`.
+/// Build a router that mirrors the retained production runtime HTTP wiring.
+/// Config, Database, and ToolRuntime are injected so AuthMiddleware and the
+/// canonical handlers resolve state exactly as in `main.rs`.
 fn build_projects_router(
     config: Arc<crate::Config>,
     db: Arc<crate::Database>,
@@ -229,25 +224,6 @@ fn build_projects_router(
                 .push(Router::with_path("projects/list").post(projects_list))
                 .push(Router::with_path("projects/register").post(projects_register))
                 .push(Router::with_path("projects/create").post(projects_create))
-                .push(Router::with_path("projects/git_status").post(projects_git_status))
-                .push(
-                    Router::with_path("projects/apply_unified_diff")
-                        .post(projects_apply_unified_diff),
-                )
-                .push(Router::with_path("projects/run_shell").post(projects_run_shell))
-                .push(
-                    Router::with_path("projects/git_restore_paths")
-                        .post(projects_git_restore_paths),
-                )
-                .push(
-                    Router::with_path("projects/discard_untracked")
-                        .post(projects_discard_untracked),
-                )
-                .push(Router::with_path("projects/run_job").post(projects_run_job))
-                .push(Router::with_path("projects/list_files").post(projects_list_files))
-                .push(Router::with_path("jobs/list").post(jobs_list))
-                .push(Router::with_path("jobs/stop").post(job_stop))
-                .push(Router::with_path("jobs/tail").post(job_tail))
                 .push(Router::with_path("runtime/status").post(runtime_status)),
         )
 }
@@ -317,43 +293,6 @@ async fn register_import_agent_with_capabilities(
 
 async fn register_import_agent(root: &std::path::Path) -> (Arc<ToolRuntime>, Arc<RunnerRegistry>) {
     register_import_agent_with_capabilities(root, None).await
-}
-
-async fn complete_one_agent_request(
-    registry: Arc<RunnerRegistry>,
-    stdout: impl Into<String>,
-    stderr: impl Into<String>,
-    exit_code: i32,
-) {
-    use crate::runner_protocol::{RunnerPollRequest, RunnerResultRequest};
-    let request = loop {
-        if let Some(request) = registry
-            .poll(RunnerPollRequest {
-                client_id: "importer".to_string(),
-                runner_instance_id: "inst-import".to_string(),
-            })
-            .await
-            .unwrap()
-        {
-            break request;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    };
-    registry
-        .complete(RunnerResultRequest {
-            client_id: "importer".to_string(),
-            runner_instance_id: "inst-import".to_string(),
-            request_id: request.request_id,
-            exit_code: Some(exit_code),
-            stdout: Some(stdout.into()),
-            stderr: Some(stderr.into()),
-            stdout_truncated: false,
-            stderr_truncated: false,
-            duration_ms: Some(1),
-            error: None,
-        })
-        .await
-        .unwrap();
 }
 
 fn spawn_startup_agent_executor(registry: Arc<RunnerRegistry>) -> tokio::task::JoinHandle<()> {
@@ -436,7 +375,7 @@ fn spawn_startup_agent_executor(registry: Arc<RunnerRegistry>) -> tokio::task::J
 // =========================================================================
 
 #[tokio::test]
-async fn all_project_endpoints_require_bearer_auth() {
+async fn retained_runtime_endpoints_require_bearer_auth() {
     let _env = crate::auth::AuthEnvGuard::auth_required();
     let config = test_config(Some("secret"));
     let (_tmp, db) = test_db();
@@ -446,11 +385,6 @@ async fn all_project_endpoints_require_bearer_auth() {
 
     let endpoints: Vec<(&str, Value)> = vec![
         ("/api/projects/list", json!({})),
-        ("/api/projects/git_status", json!({"project": "demo"})),
-        (
-            "/api/projects/apply_unified_diff",
-            json!({"project": "demo", "diff": "diff"}),
-        ),
         ("/api/tools/list", json!({})),
         ("/api/tools/call", json!({"tool": "list_tools"})),
         ("/api/runtime/status", json!({})),
@@ -479,6 +413,36 @@ async fn all_project_endpoints_require_bearer_auth() {
 // =========================================================================
 // getRuntimeStatus / /api/runtime/status
 // =========================================================================
+
+#[tokio::test]
+async fn retired_dedicated_runtime_routes_are_unmounted() {
+    let config = test_config(Some("secret"));
+    let (_tmp, db) = test_db();
+    let tmp_proj = tempfile::tempdir().unwrap();
+    let runtime = Arc::new(runtime_with_local_project(tmp_proj.path(), "demo"));
+    let service = Service::new(build_projects_router(config, db, runtime));
+
+    for (group, leaf) in [
+        ("projects", "git_status"),
+        ("projects", "list_files"),
+        ("projects", "apply_unified_diff"),
+        ("projects", "run_shell"),
+        ("projects", "run_job"),
+        ("projects", "git_restore_paths"),
+        ("projects", "discard_untracked"),
+        ("jobs", "list"),
+        ("jobs", "tail"),
+        ("jobs", "stop"),
+    ] {
+        let path = format!("/api/{group}/{leaf}");
+        let resp = TestClient::post(format!("http://localhost{path}"))
+            .bearer_auth("secret")
+            .json(&json!({}))
+            .send(&service)
+            .await;
+        assert_eq!(effective_status(&resp), StatusCode::NOT_FOUND, "{path}");
+    }
+}
 
 #[tokio::test]
 async fn http_runtime_status_rejects_wrong_bearer() {

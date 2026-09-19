@@ -376,18 +376,6 @@ only for local/trusted-network demos."
                 .post(runtime_http::import_conversation_files_to_project),
         )
         .push(
-            Router::with_path(route_metadata::api_path(RouteId::JobsStop))
-                .post(runtime_http::job_stop),
-        )
-        .push(
-            Router::with_path(route_metadata::api_path(RouteId::JobsList))
-                .post(runtime_http::jobs_list),
-        )
-        .push(
-            Router::with_path(route_metadata::api_path(RouteId::JobsTail))
-                .post(runtime_http::job_tail),
-        )
-        .push(
             Router::with_path(route_metadata::api_path(RouteId::RunnerConfigCheck))
                 .post(runtime_http::runner_config_check),
         )
@@ -414,34 +402,6 @@ only for local/trusted-network demos."
         .push(
             Router::with_path(route_metadata::api_path(RouteId::ProjectsResolveOrRegister))
                 .post(runtime_http::projects_resolve_or_register),
-        )
-        .push(
-            Router::with_path(route_metadata::api_path(RouteId::ProjectsGitStatus))
-                .post(runtime_http::projects_git_status),
-        )
-        .push(
-            Router::with_path(route_metadata::api_path(RouteId::ProjectsListFiles))
-                .post(runtime_http::projects_list_files),
-        )
-        .push(
-            Router::with_path(route_metadata::api_path(RouteId::ProjectsApplyUnifiedDiff))
-                .post(runtime_http::projects_apply_unified_diff),
-        )
-        .push(
-            Router::with_path(route_metadata::api_path(RouteId::ProjectsRunShell))
-                .post(runtime_http::projects_run_shell),
-        )
-        .push(
-            Router::with_path(route_metadata::api_path(RouteId::ProjectsGitRestorePaths))
-                .post(runtime_http::projects_git_restore_paths),
-        )
-        .push(
-            Router::with_path(route_metadata::api_path(RouteId::ProjectsDiscardUntracked))
-                .post(runtime_http::projects_discard_untracked),
-        )
-        .push(
-            Router::with_path(route_metadata::api_path(RouteId::ProjectsRunJob))
-                .post(runtime_http::projects_run_job),
         )
         .push(
             Router::with_path(route_metadata::api_path(RouteId::RuntimeStatus))

@@ -82,11 +82,6 @@ fn current_runner_registration_advertises_v2_and_complete_generation_baseline() 
             .contains(&"apply_patch_matching_mode"),
         "matching_mode is additive and must not become a generation-2 registration baseline"
     );
-    assert!(
-        !RUNNER_PROTOCOL_GENERATION_V2_BASELINE_CAPABILITY_NAMES
-            .contains(&"apply_patch_strict_matching"),
-        "strict patch matching is additive and must not become a generation-2 registration baseline"
-    );
     assert_eq!(
         capabilities
             .get("apply_patch_match_metadata")
@@ -100,13 +95,6 @@ fn current_runner_registration_advertises_v2_and_complete_generation_baseline() 
             .and_then(serde_json::Value::as_bool),
         Some(true),
         "current Runner must explicitly advertise enum-based apply_patch matching"
-    );
-    assert_eq!(
-        capabilities
-            .get("apply_patch_strict_matching")
-            .and_then(serde_json::Value::as_bool),
-        Some(true),
-        "current Runner must explicitly advertise strict patch matching"
     );
     for capability in RUNNER_PROTOCOL_GENERATION_V2_BASELINE_CAPABILITY_NAMES {
         assert_eq!(

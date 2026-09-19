@@ -402,27 +402,7 @@ struct ApplyPatchPayload {
     patch: String,
     #[serde(default)]
     dry_run: Option<bool>,
-    #[serde(default)]
-    matching_mode: Option<ApplyPatchMatchingMode>,
-    /// Rolling-wire compatibility for older Servers only. Current model-facing
-    /// requests use matching_mode and never emit this field.
-    #[serde(default)]
-    strict_matching: Option<bool>,
-}
-
-fn apply_patch_matching_mode(
-    payload: &ApplyPatchPayload,
-) -> Result<ApplyPatchMatchingMode, String> {
-    if payload.matching_mode.is_some() && payload.strict_matching.is_some() {
-        return Err("matching_mode and legacy strict_matching cannot be combined".to_string());
-    }
-    Ok(match (payload.matching_mode, payload.strict_matching) {
-        (Some(mode), None) => mode,
-        (None, Some(true)) => ApplyPatchMatchingMode::ExactUnique,
-        // Preserve the old Server wire default when rolling a new Runner first.
-        (None, Some(false) | None) => ApplyPatchMatchingMode::FirstMatch,
-        (Some(_), Some(_)) => unreachable!(),
-    })
+    matching_mode: ApplyPatchMatchingMode,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1434,10 +1414,7 @@ pub(crate) fn handle_apply_patch_file_request(
         }
     };
     let dry_run = payload.dry_run.unwrap_or(false);
-    let matching_mode = match apply_patch_matching_mode(&payload) {
-        Ok(mode) => mode,
-        Err(error) => return batch_error(None, None, None, "invalid_payload", error, start),
-    };
+    let matching_mode = payload.matching_mode;
     let mut touched = HashSet::new();
     let mut plans = Vec::with_capacity(patch.hunks.len());
 

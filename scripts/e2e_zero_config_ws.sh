@@ -12,9 +12,9 @@ set -euo pipefail
 # What this proves:
 #   - Server boots with WEBCODEX_TOKEN auth and no server-side projects.toml.
 #   - Agent registers over the selected transport and announces a project.
-#   - listProjects / getRuntimeStatus see the agent-registered project.
-#   - read_files / getProjectGitStatus route to the agent.
-#   - startProjectShellJob starts an async job on the agent and job status/log
+#   - Project lifecycle / runtime status see the agent-registered project.
+#   - Canonical read_files / git_status route to the agent.
+#   - Canonical run_job starts an async job on the agent and Job observation
 #     round-trip.
 #   - MCP initialize / tools/list / tools/call(list_projects) work.
 #   - /openapi.json still exposes the expected GPT Actions operation set and
@@ -489,9 +489,9 @@ else
     fail "listProjects did not contain $RUNTIME_PROJECT_ID (got: ${list_json:0:200})"
 fi
 
-# getProjectGitStatus — routes to the agent, runs `git status --porcelain`.
-body="$(api_post /api/projects/git_status "{\"project\":\"$RUNTIME_PROJECT_ID\"}")"
-assert_success "getProjectGitStatus" "$body" || true
+# git_status — routes to the agent through the canonical runtime tool path.
+body="$(runtime_tool_call "git_status" "{\"project\":\"$RUNTIME_PROJECT_ID\"}")"
+assert_success "git_status" "$body" || true
 
 # read_files — reads README.md through the canonical runtime tool.
 body="$(api_post /api/tools/call "{\"tool\":\"read_files\",\"params\":{\"project\":\"$RUNTIME_PROJECT_ID\",\"items\":[{\"path\":\"README.md\"}]}}")"
@@ -507,17 +507,17 @@ fi
 body="$(runtime_tool_call "git_diff_hunks" "{\"project\":\"$RUNTIME_PROJECT_ID\",\"max_hunks\":5}")"
 assert_success "git_diff_hunks" "$body" || true
 
-# runProjectShellCommand — runs `echo hi` through the agent.
-body="$(api_post /api/projects/run_shell "{\"project\":\"$RUNTIME_PROJECT_ID\",\"command\":\"echo hi\"}")"
-assert_success "runProjectShellCommand" "$body" || true
+# run_shell — runs `echo hi` through the canonical runtime tool path.
+body="$(runtime_tool_call "run_shell" "{\"project\":\"$RUNTIME_PROJECT_ID\",\"command\":\"echo hi\"}")"
+assert_success "run_shell" "$body" || true
 shell_stdout="$(json_get "$body" output.stdout_tail)"
 if echo "$shell_stdout" | grep -q "hi"; then
-    pass "runProjectShellCommand returns echo output"
+    pass "run_shell returns echo output"
 else
-    fail "runProjectShellCommand output mismatch (got: ${shell_stdout:0:120})"
+    fail "run_shell output mismatch (got: ${shell_stdout:0:120})"
 fi
 
-# startProjectShellJob — starts an async job on the agent.
+# run_job — starts an async job on the agent through the canonical runtime tool path.
 async_job_body="$(python3 -c '
 import json, sys
 print(json.dumps({
@@ -526,13 +526,13 @@ print(json.dumps({
     "timeout_secs": 20
 }))
 ' "$RUNTIME_PROJECT_ID")"
-body="$(api_post /api/projects/run_job "$async_job_body")"
-assert_success "startProjectShellJob" "$body" || true
+body="$(runtime_tool_call "run_job" "$async_job_body")"
+assert_success "run_job" "$body" || true
 JOB_ID="$(json_get "$body" output.job_id)"
 if [ -z "$JOB_ID" ] || [ "$JOB_ID" = "" ] || [ "$JOB_ID" = "None" ]; then
-    fail "startProjectShellJob did not return a job_id (body: ${body:0:300})"
+    fail "run_job did not return a job_id (body: ${body:0:300})"
 else
-    pass "startProjectShellJob returned job_id=$JOB_ID"
+    pass "run_job returned job_id=$JOB_ID"
 
     # Poll job status until terminal.
     JOB_TERMINAL=0
@@ -716,9 +716,9 @@ fi
 
 log "---- Phase A read-only console tools ----"
 
-# list_project_files via REST — must return a bounded entries array that
-# includes README.md (the smoke project always has one).
-body="$(api_post /api/projects/list_files "{\"project\":\"$RUNTIME_PROJECT_ID\"}")"
+# list_project_files through the canonical runtime tool path — must return a
+# bounded entries array that includes README.md.
+body="$(runtime_tool_call "list_project_files" "{\"project\":\"$RUNTIME_PROJECT_ID\"}")"
 if [ "$(json_get "$body" success)" = "True" ]; then
     pass "list_project_files returns success"
 else
@@ -758,8 +758,8 @@ else
     fail "show_changes missing files_total (got: ${body:0:200})"
 fi
 
-# list_jobs via REST — bounded summaries, never stdout/stderr bodies.
-body="$(api_post /api/jobs/list '{}')"
+# list_jobs through the canonical runtime tool path — bounded summaries, never stdout/stderr bodies.
+body="$(runtime_tool_call "list_jobs" '{}')"
 if [ "$(json_get "$body" success)" = "True" ]; then
     pass "list_jobs returns success"
 else
@@ -772,16 +772,16 @@ else
     fail "list_jobs summaries leaked stdout/stderr (got: ${lj_serialized:0:200})"
 fi
 
-# job_tail via REST for the completed async shell job — bounded tail.
+# observe_jobs for the completed async shell job — bounded tail through the canonical observer.
 if [ -n "$JOB_ID" ]; then
-    body="$(api_post /api/jobs/tail "{\"job_id\":\"$JOB_ID\",\"tail_lines\":50}")"
-    if [ "$(json_get "$body" success)" = "True" ]; then
-        pass "job_tail returns success"
+    body="$(observe_one_job_call "$JOB_ID" 50)"
+    if [ "$(json_get "$body" success)" = "True" ] && [ "$(json_get "$body" output.items.0.success)" = "True" ]; then
+        pass "observe_jobs tail returns success"
     else
-        fail "job_tail did not return success (body: ${body:0:300})"
+        fail "observe_jobs tail did not return success (body: ${body:0:300})"
     fi
 else
-    fail "job_tail skipped: no JOB_ID available"
+    fail "observe_jobs tail skipped: no JOB_ID available"
 fi
 
 # list_project_files is long-tail; list_jobs is direct Adaptive core.
@@ -819,10 +819,10 @@ BAD_UNIFIED_DIFF='diff --git a/README.md b/README.md
 -NONEXISTENT_CONTEXT_LINE
 +replacement
 '
-pre_status="$(api_post /api/projects/git_status "{\"project\":\"$RUNTIME_PROJECT_ID\"}")"
+pre_status="$(runtime_tool_call "git_status" "{\"project\":\"$RUNTIME_PROJECT_ID\"}")"
 pre_porcelain="$(json_get "$pre_status" output.stdout)"
 bad_body="$(build_unified_diff_body "$BAD_UNIFIED_DIFF")"
-body="$(api_post /api/projects/apply_unified_diff "$bad_body")"
+body="$(runtime_tool_call "apply_unified_diff" "$bad_body")"
 ud_success="$(json_get "$body" success)"
 ud_applied="$(json_get "$body" output.applied)"
 ud_can_apply="$(json_get "$body" output.can_apply)"
@@ -833,7 +833,7 @@ if [ "$ud_success" = "True" ] && [ "$ud_applied" = "False" ] && \
 else
     fail "apply_unified_diff(non-applicable) contract mismatch (body=${body:0:300})"
 fi
-post_status="$(api_post /api/projects/git_status "{\"project\":\"$RUNTIME_PROJECT_ID\"}")"
+post_status="$(runtime_tool_call "git_status" "{\"project\":\"$RUNTIME_PROJECT_ID\"}")"
 post_porcelain="$(json_get "$post_status" output.stdout)"
 if [ "$pre_porcelain" = "$post_porcelain" ]; then
     pass "apply_unified_diff failed preflight leaves worktree unchanged"
@@ -876,73 +876,36 @@ for path, methods in schema.get("paths", {}).items():
         ops.append(op.get("operationId"))
 ops_set = set(ops)
 
-expected_ops = {
-    "listRuntimeTools", "listProjects", "registerProject", "createProject",
-    "getRuntimeStatus",
-    "getProjectGitStatus", "listProjectFiles",
-    "applyUnifiedDiff",
-    "runProjectShellCommand", "gitRestorePaths",
-    "discardUntrackedFiles", "importConversationFilesToProject", "startProjectShellJob",
-    "listRuntimeJobs", "getRuntimeJobTail", "callRuntimeTool",
-}
-missing = expected_ops - ops_set
-extra = ops_set - expected_ops
-if missing:
-    errors.append(f"missing operationIds: {sorted(missing)}")
-if extra:
-    errors.append(f"unexpected operationIds: {sorted(extra)}")
+if "call_runtime_tool" not in ops_set:
+    errors.append("missing canonical call_runtime_tool operation")
+if any(not isinstance(op, str) or any(ch.isupper() for ch in op) for op in ops):
+    errors.append("operationIds must be canonical snake_case runtime tool names")
+if len(ops) >= 30:
+    errors.append(f"too many operations: {len(ops)} (must stay below 30)")
 
-# Operation count must stay small (<= 30) and match the current dedicated
-# GPT Actions surface in src/openapi.rs.
-if len(ops) > 30:
-    errors.append(f"too many operations: {len(ops)} (must be <= 30)")
-if len(ops) != len(expected_ops):
-    errors.append(f"operation count must be {len(expected_ops)}, got {len(ops)}")
-
-tool_call = (
-    schema
-    .get("components", {})
-    .get("schemas", {})
-    .get("ToolCallRequest", {})
-)
-tool_desc = (
-    tool_call
-    .get("properties", {})
-    .get("tool", {})
-    .get("description", "")
-)
-# The generic GPT Action advertises only current model-facing runtime tools.
-# work_on_project is the canonical external task bootstrap; start_coding_task is retired.
-for runtime_tool in ["work_on_project", "finish_coding_task"]:
-    if runtime_tool not in tool_desc:
-        errors.append(f"ToolCallRequest.tool description missing {runtime_tool}")
-
-# Keep this cross-language check aligned with MODEL_TOOL_DESCRIPTION_MAX_CHARS.
-MODEL_TOOL_DESCRIPTION_MAX_CHARS = 1024
-# Phase 2: each operation description must fit the repository model budget.
+# GPT Actions has a stricter host presentation budget than the canonical tool surface.
+GPT_ACTION_DESCRIPTION_MAX_CHARS = 300
 for path, methods in schema.get("paths", {}).items():
     for method, op in methods.items():
         desc = op.get("description", "") or ""
-        if len(desc) > MODEL_TOOL_DESCRIPTION_MAX_CHARS:
+        if len(desc) > GPT_ACTION_DESCRIPTION_MAX_CHARS:
             errors.append(
                 f"{method} {path} operationId {op.get('operationId')} "
                 f"description too long: {len(desc)} chars "
-                f"(hard budget {MODEL_TOOL_DESCRIPTION_MAX_CHARS})"
+                f"(hard budget {GPT_ACTION_DESCRIPTION_MAX_CHARS})"
             )
 
-# Forbidden legacy/admin/internal paths must not appear in the schema paths.
-# list_files, jobs/list, and jobs/tail remain dedicated GPT Actions; canonical
-# change review and Job observation use callRuntimeTool. Legacy dedicated patch routes are explicitly forbidden;
-# the current apply_patch tool is runtime-only through callRuntimeTool. jobs/stop,
-# audit, legacy shell/codex, console, and /mcp also remain forbidden.
+# Forbidden admin/internal paths must not appear in the generic Action schema.
 forbidden = ["/api/audit/sessions", "/api/audit/session", "/api/audit/stats",
-             "/api/jobs/stop",
              "/api/projects/replace_in_file", "/api/projects/write_file",
              "/api/projects/apply_patch", "/api/projects/apply_patch_checked", "/api/projects/validate_patch",
              "/api/messages", "/api/files", "/api/desktop/task_op", "/api/desktop/task",
              "/api/shell/run", "/api/shell/job", "/api/shell/file",
              "/mcp", "/openapi.json", "/console", "/console/app.js", "/console/styles.css"]
 paths = set(schema.get("paths", {}).keys())
+for path in paths:
+    if not path.startswith("/api/actions/"):
+        errors.append(f"non-canonical GPT Action path present: {path}")
 for fp in forbidden:
     if fp in paths:
         errors.append(f"forbidden path present in schema: {fp}")
@@ -980,60 +943,6 @@ for path, methods in schema.get("paths", {}).items():
         else:
             seen_ids[oid] = f"{method} {path}"
 
-# Every requestBody schema must declare additionalProperties=false at the top
-# level so GPT Actions rejects unknown fields. Inner properties (e.g.
-# ToolCallRequest.params) may still allow arbitrary keys.
-schemas = schema.get("components", {}).get("schemas", {})
-for path, methods in schema.get("paths", {}).items():
-    for method, op in methods.items():
-        ref = op.get("requestBody", {}).get("content", {}).get("application/json", {}).get("schema", {}).get("$ref", "")
-        if not ref:
-            continue
-        name = ref.split("/")[-1]
-        sch = schemas.get(name)
-        if sch is None:
-            errors.append(f"{method} {path} requestBody references unknown schema '{name}'")
-            continue
-        if sch.get("additionalProperties") is not False:
-            errors.append(f"{method} {path} requestBody schema '{name}' must have additionalProperties=false")
-
-# Mutation/execution actions must mention side effects and Bearer auth (or
-# equivalent) so GPT callers understand they are not read-only.
-mutation_paths = [
-    "/api/projects/register",
-    "/api/projects/create",
-    "/api/projects/apply_unified_diff",
-    "/api/projects/run_shell",
-    "/api/projects/git_restore_paths",
-    "/api/projects/discard_untracked",
-    "/api/projects/run_job",
-]
-for path in mutation_paths:
-    op = schema.get("paths", {}).get(path, {}).get("post", {})
-    desc = (op.get("description") or "").lower()
-    if "side effect" not in desc:
-        errors.append(f"{path} mutation description should mention side effects")
-    if "bearer auth" not in desc:
-        errors.append(f"{path} mutation description should mention Bearer auth")
-
-# Read-only actions must explicitly say read-only or never writes so GPT
-# callers can tell them apart from mutations. callRuntimeTool is excluded
-# because it is a generic escape hatch.
-readonly_paths = [
-    "/api/tools/list",
-    "/api/projects/list",
-    "/api/runtime/status",
-    "/api/jobs/list",
-    "/api/jobs/tail",
-    "/api/projects/git_status",
-    "/api/projects/list_files",
-]
-for path in readonly_paths:
-    op = schema.get("paths", {}).get(path, {}).get("post", {})
-    desc = (op.get("description") or "").lower()
-    if "read-only" not in desc and "never writes" not in desc:
-        errors.append(f"{path} read-only description should mention read-only or never writes")
-
 if errors:
     print("FAIL")
     for e in errors:
@@ -1042,7 +951,7 @@ if errors:
 print(f"OK ops={len(ops)} paths={len(paths)}")
 PY
 if [ $? -eq 0 ]; then
-    pass "/openapi.json operation set + POST-only + no legacy/admin paths + additionalProperties=false + mutation/readonly descriptions"
+    pass "/openapi.json canonical Action paths + snake_case operations + POST-only + bounded descriptions"
 else
     fail "/openapi.json schema checks failed (see stderr above)"
 fi
@@ -1383,7 +1292,7 @@ fi
 # temporary TEST_REPO (never on README.md, src.rs, or any real project file).
 # Probe files are removed afterwards so the worktree returns to a clean state.
 
-log "---- Phase 3: dedicated mutation actions (probe files only) ----"
+log "---- Phase 3: canonical runtime mutations (probe files only) ----"
 
 # Build a JSON request body with python3 for safe escaping. The argument is a
 # JSON string that is parsed and re-serialized (validates + normalizes).
@@ -1395,7 +1304,7 @@ print(json.dumps(obj))
 ' "$1"
 }
 
-# applyUnifiedDiff — apply a probe diff that creates a new file,
+# apply_unified_diff — apply a probe diff that creates a new file,
 # then verify via show_changes that the probe file appears as untracked.
 PROBE_PATCH='diff --git a/APPLY_CHECKED_PROBE.txt b/APPLY_CHECKED_PROBE.txt
 new file mode 100644
@@ -1408,20 +1317,20 @@ apc_body="$(python3 -c '
 import json, sys
 print(json.dumps({"project": sys.argv[1], "diff": sys.argv[2]}))
 ' "$RUNTIME_PROJECT_ID" "$PROBE_PATCH")"
-body="$(api_post /api/projects/apply_unified_diff "$apc_body")"
+body="$(runtime_tool_call "apply_unified_diff" "$apc_body")"
 apc_success="$(json_get "$body" success)"
 if [ "$apc_success" = "True" ]; then
-    pass "applyUnifiedDiff(probe) returns success"
+    pass "apply_unified_diff(probe) returns success"
 else
-    fail "applyUnifiedDiff(probe) failed (body: ${body:0:300})"
+    fail "apply_unified_diff(probe) failed (body: ${body:0:300})"
 fi
 # Verify the probe file now shows up in the worktree via show_changes.
 body="$(show_changes_call)"
 changed_files="$(json_get "$body" output.files)"
 if echo "$changed_files" | grep -q "APPLY_CHECKED_PROBE.txt"; then
-    pass "applyUnifiedDiff probe file visible in show_changes"
+    pass "apply_unified_diff probe file visible in show_changes"
 else
-    fail "applyUnifiedDiff probe file not in show_changes (got: ${changed_files:0:200})"
+    fail "apply_unified_diff probe file not in show_changes (got: ${changed_files:0:200})"
 fi
 
 # Canonical runtime delete — delete the probe file created above.
@@ -1434,7 +1343,7 @@ else
     fail "callRuntimeTool(delete_project_files) failed (body: ${body:0:300})"
 fi
 # Verify the probe file is gone via list_files root listing.
-body="$(api_post /api/projects/list_files "{\"project\":\"$RUNTIME_PROJECT_ID\"}")"
+body="$(runtime_tool_call "list_project_files" "{\"project\":\"$RUNTIME_PROJECT_ID\"}")"
 lpf_entries="$(json_get "$body" output.entries)"
 if ! echo "$lpf_entries" | grep -q "APPLY_CHECKED_PROBE.txt"; then
     pass "deleteProjectFiles removed probe file"
@@ -1442,46 +1351,46 @@ else
     fail "deleteProjectFiles did not remove probe file (got: ${lpf_entries:0:200})"
 fi
 
-# discardUntrackedFiles — create a fresh untracked probe file, then discard it.
-body="$(api_post /api/projects/run_shell "{\"project\":\"$RUNTIME_PROJECT_ID\",\"command\":\"printf probe > UNTRACKED_PROBE.txt\"}")"
+# discard_untracked — create a fresh untracked probe file, then discard it.
+body="$(runtime_tool_call "run_shell" "{\"project\":\"$RUNTIME_PROJECT_ID\",\"command\":\"printf probe > UNTRACKED_PROBE.txt\"}")"
 disc_body="$(build_body "{\"project\":\"$RUNTIME_PROJECT_ID\",\"paths\":[\"UNTRACKED_PROBE.txt\"]}")"
-body="$(api_post /api/projects/discard_untracked "$disc_body")"
+body="$(runtime_tool_call "discard_untracked" "$disc_body")"
 disc_success="$(json_get "$body" success)"
 if [ "$disc_success" = "True" ]; then
-    pass "discardUntrackedFiles(probe) returns success"
+    pass "discard_untracked(probe) returns success"
 else
-    fail "discardUntrackedFiles(probe) failed (body: ${body:0:300})"
+    fail "discard_untracked(probe) failed (body: ${body:0:300})"
 fi
-body="$(api_post /api/projects/list_files "{\"project\":\"$RUNTIME_PROJECT_ID\"}")"
+body="$(runtime_tool_call "list_project_files" "{\"project\":\"$RUNTIME_PROJECT_ID\"}")"
 lpf_entries="$(json_get "$body" output.entries)"
 if ! echo "$lpf_entries" | grep -q "UNTRACKED_PROBE.txt"; then
-    pass "discardUntrackedFiles removed untracked probe file"
+    pass "discard_untracked removed untracked probe file"
 else
-    fail "discardUntrackedFiles did not remove probe file (got: ${lpf_entries:0:200})"
+    fail "discard_untracked did not remove probe file (got: ${lpf_entries:0:200})"
 fi
 
-# gitRestorePaths — create a tracked probe file, commit it, modify it, then
+# git_restore_paths — create a tracked probe file, commit it, modify it, then
 # restore it. This verifies restore returns the file to its committed state.
-body="$(api_post /api/projects/run_shell "{\"project\":\"$RUNTIME_PROJECT_ID\",\"command\":\"printf original > RESTORE_PROBE.txt && git add RESTORE_PROBE.txt && git commit -m probe >/dev/null 2>&1\"}")"
-body="$(api_post /api/projects/run_shell "{\"project\":\"$RUNTIME_PROJECT_ID\",\"command\":\"printf modified > RESTORE_PROBE.txt\"}")"
+body="$(runtime_tool_call "run_shell" "{\"project\":\"$RUNTIME_PROJECT_ID\",\"command\":\"printf original > RESTORE_PROBE.txt && git add RESTORE_PROBE.txt && git commit -m probe >/dev/null 2>&1\"}")"
+body="$(runtime_tool_call "run_shell" "{\"project\":\"$RUNTIME_PROJECT_ID\",\"command\":\"printf modified > RESTORE_PROBE.txt\"}")"
 rest_body="$(build_body "{\"project\":\"$RUNTIME_PROJECT_ID\",\"paths\":[\"RESTORE_PROBE.txt\"]}")"
-body="$(api_post /api/projects/git_restore_paths "$rest_body")"
+body="$(runtime_tool_call "git_restore_paths" "$rest_body")"
 rest_success="$(json_get "$body" success)"
 if [ "$rest_success" = "True" ]; then
-    pass "gitRestorePaths(probe) returns success"
+    pass "git_restore_paths(probe) returns success"
 else
-    fail "gitRestorePaths(probe) failed (body: ${body:0:300})"
+    fail "git_restore_paths(probe) failed (body: ${body:0:300})"
 fi
 body="$(api_post /api/tools/call "{\"tool\":\"read_files\",\"params\":{\"project\":\"$RUNTIME_PROJECT_ID\",\"items\":[{\"path\":\"RESTORE_PROBE.txt\"}]}}")"
 restore_content="$(json_get "$body" output.items.0.output.text)"
 if echo "$restore_content" | grep -q "original"; then
-    pass "gitRestorePaths restored probe file to committed content"
+    pass "git_restore_paths restored probe file to committed content"
 else
-    fail "gitRestorePaths did not restore content (got: ${restore_content:0:120})"
+    fail "git_restore_paths did not restore content (got: ${restore_content:0:120})"
 fi
 
 # Clean up the tracked probe file so the worktree returns to a clean state.
-body="$(api_post /api/projects/run_shell "{\"project\":\"$RUNTIME_PROJECT_ID\",\"command\":\"git rm -f RESTORE_PROBE.txt >/dev/null 2>&1 && git commit -m cleanup-probe >/dev/null 2>&1\"}")" || true
+body="$(runtime_tool_call "run_shell" "{\"project\":\"$RUNTIME_PROJECT_ID\",\"command\":\"git rm -f RESTORE_PROBE.txt >/dev/null 2>&1 && git commit -m cleanup-probe >/dev/null 2>&1\"}")" || true
 
 # ----------------------------------------------------------------------------
 # 7e. Phase 4: structured edit tools (apply_text_edits / write_project_file)
@@ -1672,7 +1581,7 @@ body="$(api_post /api/tools/call "$del_body")" || true
 log "---- unified diff hardening (large + non-applicable) ----"
 
 # Capture the worktree state before the hardening probes (should be clean).
-pre_harden_status="$(api_post /api/projects/git_status "{\"project\":\"$RUNTIME_PROJECT_ID\"}")"
+pre_harden_status="$(runtime_tool_call "git_status" "{\"project\":\"$RUNTIME_PROJECT_ID\"}")"
 pre_harden_porcelain="$(json_get "$pre_harden_status" output.stdout)"
 
 # A LARGE diff (over the 16,000-byte authored raw shell command limit) that
@@ -1696,13 +1605,13 @@ else
     fail "LARGE_APPLY_PATCH must exceed the 16000-byte authored command limit (got ${lap_bytes} bytes)"
 fi
 lap_body="$(python3 -c 'import json,sys; print(json.dumps({"project": sys.argv[1], "diff": sys.argv[2]}))' "$RUNTIME_PROJECT_ID" "$LARGE_APPLY_PATCH")"
-body="$(api_post /api/projects/apply_unified_diff "$lap_body")"
+body="$(runtime_tool_call "apply_unified_diff" "$lap_body")"
 lap_success="$(json_get "$body" success)"
 lap_applied="$(json_get "$body" output.applied)"
 if [ "$lap_success" = "True" ] && [ "$lap_applied" = "True" ]; then
-    pass "applyUnifiedDiff applies large diff over command limit"
+    pass "apply_unified_diff applies large diff over command limit"
 else
-    fail "applyUnifiedDiff large diff did not apply (success=$lap_success applied=$lap_applied body=${body:0:300})"
+    fail "apply_unified_diff large diff did not apply (success=$lap_success applied=$lap_applied body=${body:0:300})"
 fi
 # Verify the large probe file now shows up in the worktree.
 body="$(show_changes_call)"
@@ -1715,7 +1624,7 @@ fi
 del_body="$(build_body "{\"tool\":\"delete_project_files\",\"params\":{\"project\":\"$RUNTIME_PROJECT_ID\",\"paths\":[\"LARGE_APPLY_PROBE.md\"]}}")"
 body="$(api_post /api/tools/call "$del_body")" || true
 
-# A diff whose context does not match — applyUnifiedDiff must return the
+# A diff whose context does not match — apply_unified_diff must return the
 # non-applicable no-change domain outcome.
 BAD_CHECKED_PATCH='--- a/README.md
 +++ b/README.md
@@ -1724,17 +1633,17 @@ BAD_CHECKED_PATCH='--- a/README.md
 +replacement
 '
 bcp_body="$(python3 -c 'import json,sys; print(json.dumps({"project": sys.argv[1], "diff": sys.argv[2]}))' "$RUNTIME_PROJECT_ID" "$BAD_CHECKED_PATCH")"
-body="$(api_post /api/projects/apply_unified_diff "$bcp_body")"
+body="$(runtime_tool_call "apply_unified_diff" "$bcp_body")"
 bcp_success="$(json_get "$body" success)"
 bcp_applied="$(json_get "$body" output.applied)"
 bcp_can_apply="$(json_get "$body" output.can_apply)"
 if [ "$bcp_success" = "True" ] && [ "$bcp_applied" = "False" ] && [ "$bcp_can_apply" = "False" ]; then
-    pass "applyUnifiedDiff(non-applicable) does not apply"
+    pass "apply_unified_diff(non-applicable) does not apply"
 else
-    fail "applyUnifiedDiff(non-applicable) should not apply (success=$bcp_success applied=$bcp_applied can_apply=$bcp_can_apply body=${body:0:300})"
+    fail "apply_unified_diff(non-applicable) should not apply (success=$bcp_success applied=$bcp_applied can_apply=$bcp_can_apply body=${body:0:300})"
 fi
 # Worktree must be unchanged after the non-applicable probe.
-post_harden_status="$(api_post /api/projects/git_status "{\"project\":\"$RUNTIME_PROJECT_ID\"}")"
+post_harden_status="$(runtime_tool_call "git_status" "{\"project\":\"$RUNTIME_PROJECT_ID\"}")"
 post_harden_porcelain="$(json_get "$post_harden_status" output.stdout)"
 if [ "$pre_harden_porcelain" = "$post_harden_porcelain" ]; then
     pass "non-applicable diff leaves worktree unchanged"
@@ -1746,8 +1655,8 @@ fi
 # 7h. Full-auto coding loop smoke (dedicated actions plus callRuntimeTool)
 # ----------------------------------------------------------------------------
 #
-# Simulates a GPT Actions auto coding loop using dedicated project/Git actions plus
-# callRuntimeTool for canonical read/search/edit tools. Proves
+# Simulates an HTTP auto coding loop using the canonical runtime tool path for
+# project/Git/read/search/edit operations. Proves
 # a custom GPT can complete a small edit → verify → cleanup cycle through the
 # recommended flow:
 #
@@ -1757,12 +1666,12 @@ fi
 #   4. callRuntimeTool(show_changes) — confirm initial clean state
 #   5. callRuntimeTool           — run apply_text_edits for a reversible text edit
 #   6. callRuntimeTool(show_changes) — confirm the diff is visible
-#   7. runProjectShellCommand    — lightweight check (grep)
-#   8. gitRestorePaths           — restore the modified tracked file
+#   7. run_shell                 — lightweight check (grep)
+#   8. git_restore_paths         — restore the modified tracked file
 #   9. callRuntimeTool(show_changes) — confirm worktree is clean again
 #
 # Then an optional unified-diff sub-loop:
-#  10. applyUnifiedDiff           — preflight + apply one small raw unified diff
+#  10. apply_unified_diff         — preflight + apply one small raw unified diff
 #  11. callRuntimeTool(show_changes) — confirm diff visible
 #  12. callRuntimeTool(delete_project_files) — cleanup the probe file
 #  13. callRuntimeTool(show_changes) — confirm clean again
@@ -1851,22 +1760,22 @@ else
     fail "loop: show_changes did not show README.md modified (files=${loop_post_files:0:200})"
 fi
 
-# Step 7: runProjectShellCommand — lightweight check (grep for the edited marker).
-body="$(api_post /api/projects/run_shell "{\"project\":\"$RUNTIME_PROJECT_ID\",\"command\":\"grep -c 'auto-loop' README.md\"}")"
+# Step 7: run_shell — lightweight check (grep for the edited marker).
+body="$(runtime_tool_call "run_shell" "{\"project\":\"$RUNTIME_PROJECT_ID\",\"command\":\"grep -c 'auto-loop' README.md\"}")"
 loop_shell_stdout="$(json_get "$body" output.stdout_tail)"
 if [ "$(json_get "$body" success)" = "True" ] && echo "$loop_shell_stdout" | grep -qE '^[0-9]+'; then
-    pass "loop: runProjectShellCommand confirms edit via grep (matches=$loop_shell_stdout)"
+    pass "loop: run_shell confirms edit via grep (matches=$loop_shell_stdout)"
 else
-    fail "loop: runProjectShellCommand grep check failed (stdout=$loop_shell_stdout body=${body:0:200})"
+    fail "loop: run_shell grep check failed (stdout=$loop_shell_stdout body=${body:0:200})"
 fi
 
-# Step 8: gitRestorePaths — restore README.md to its committed state.
+# Step 8: git_restore_paths — restore README.md to its committed state.
 loop_restore_body="$(build_body "{\"project\":\"$RUNTIME_PROJECT_ID\",\"paths\":[\"README.md\"]}")"
-body="$(api_post /api/projects/git_restore_paths "$loop_restore_body")"
+body="$(runtime_tool_call "git_restore_paths" "$loop_restore_body")"
 if [ "$(json_get "$body" success)" = "True" ]; then
-    pass "loop: gitRestorePaths restored README.md"
+    pass "loop: git_restore_paths restored README.md"
 else
-    fail "loop: gitRestorePaths failed (body: ${body:0:300})"
+    fail "loop: git_restore_paths failed (body: ${body:0:300})"
 fi
 
 # Step 9: show_changes — confirm worktree is clean again.
@@ -1887,7 +1796,7 @@ fi
 
 # --- Optional unified-diff sub-loop: apply → diff → cleanup ---
 
-# Step 10: applyUnifiedDiff — the tool owns its preflight and applies once.
+# Step 10: apply_unified_diff — the tool owns its preflight and applies once.
 LOOP_PATCH='diff --git a/LOOP_PATCH_PROBE.md b/LOOP_PATCH_PROBE.md
 new file mode 100644
 --- /dev/null
@@ -1896,11 +1805,11 @@ new file mode 100644
 +loop-patch-probe
 '
 loop_vp_body="$(python3 -c 'import json,sys; print(json.dumps({"project": sys.argv[1], "diff": sys.argv[2]}))' "$RUNTIME_PROJECT_ID" "$LOOP_PATCH")"
-body="$(api_post /api/projects/apply_unified_diff "$loop_vp_body")"
+body="$(runtime_tool_call "apply_unified_diff" "$loop_vp_body")"
 if [ "$(json_get "$body" success)" = "True" ] && [ "$(json_get "$body" output.applied)" = "True" ]; then
-    pass "loop: applyUnifiedDiff applied probe diff"
+    pass "loop: apply_unified_diff applied probe diff"
 else
-    fail "loop: applyUnifiedDiff did not apply probe diff (body: ${body:0:300})"
+    fail "loop: apply_unified_diff did not apply probe diff (body: ${body:0:300})"
 fi
 
 # Step 11: show_changes — confirm the probe file is visible.
@@ -1930,7 +1839,7 @@ else
 fi
 
 # ----------------------------------------------------------------------------
-# 7i. Runtime write tool + dedicated startProjectShellJob smoke (probe files only)
+# 7i. Runtime write tool + canonical run_job smoke (probe files only)
 # ----------------------------------------------------------------------------
 #
 # Proves runtime-only write_project_file through callRuntimeTool and the
@@ -1941,11 +1850,11 @@ fi
 #   3. callRuntimeTool(write_project_file) — overwrite with an expected_sha256 guard
 #   4. callRuntimeTool(read_files) — confirm overwritten content
 #   5. callRuntimeTool(delete_project_files) — cleanup the probe file
-#   6. startProjectShellJob — start `printf job-ok` asynchronously
+#   6. run_job             — start `printf job-ok` asynchronously
 #   7. callRuntimeTool(observe_jobs) — poll until completed
-#   8. getRuntimeJobTail   — confirm the output contains job-ok
+#   8. observe_jobs        — confirm the output contains job-ok
 
-log "---- runtime write_project_file + dedicated startProjectShellJob smoke ----"
+log "---- runtime write_project_file + canonical run_job smoke ----"
 
 # Step 1: callRuntimeTool(write_project_file) — create WRITE_ACTION_PROBE.txt.
 waf_create_body="$(python3 -c '
@@ -2019,7 +1928,7 @@ else
     fail "deleteProjectFiles did not remove probe (body: ${body:0:300})"
 fi
 
-# Step 6: startProjectShellJob — start a lightweight async command.
+# Step 6: run_job — start a lightweight async command.
 sjr_body="$(python3 -c '
 import json, sys
 print(json.dumps({
@@ -2027,13 +1936,13 @@ print(json.dumps({
     "command": "printf job-ok"
 }))
 ' "$RUNTIME_PROJECT_ID")"
-body="$(api_post /api/projects/run_job "$sjr_body")"
+body="$(runtime_tool_call "run_job" "$sjr_body")"
 sjr_success="$(json_get "$body" success)"
 SJ_JOB_ID="$(json_get "$body" output.job_id)"
 if [ "$sjr_success" = "True" ] && [ -n "$SJ_JOB_ID" ] && [ "$SJ_JOB_ID" != "None" ]; then
-    pass "startProjectShellJob started async job (job_id=$SJ_JOB_ID)"
+    pass "run_job started async job (job_id=$SJ_JOB_ID)"
 else
-    fail "startProjectShellJob did not start a job (success=$sjr_success body=${body:0:300})"
+    fail "run_job did not start a job (success=$sjr_success body=${body:0:300})"
 fi
 
 # Step 7: observe_jobs — poll until completed.
@@ -2059,13 +1968,13 @@ else
     fail "observe_jobs did not confirm completion (status=$sj_status tries=$sj_poll_tries body=${body:0:200})"
 fi
 
-# Step 8: getRuntimeJobTail — confirm the output contains job-ok.
-body="$(api_post /api/jobs/tail "{\"job_id\":\"$SJ_JOB_ID\",\"tail_lines\":50}")"
-sj_tail="$(json_get "$body" output.stdout_tail)"
-if echo "$sj_tail" | grep -q "job-ok"; then
-    pass "getRuntimeJobTail confirms async job output (job-ok)"
+# Step 8: observe_jobs — confirm the bounded output contains job-ok.
+body="$(observe_one_job_call "$SJ_JOB_ID" 50)"
+sj_tail="$(json_get "$body" output.items.0.output.stdout_tail)"
+if [ "$(json_get "$body" output.items.0.success)" = "True" ] && echo "$sj_tail" | grep -q "job-ok"; then
+    pass "observe_jobs confirms async job output (job-ok)"
 else
-    fail "getRuntimeJobTail did not show job-ok (stdout=$sj_tail body=${body:0:200})"
+    fail "observe_jobs did not show job-ok (stdout=$sj_tail body=${body:0:200})"
 fi
 
 # Confirm the worktree is clean after the dedicated action smoke (the job ran

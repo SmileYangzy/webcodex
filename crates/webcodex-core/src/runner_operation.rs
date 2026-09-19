@@ -1274,7 +1274,7 @@ fn decode_operation(wire: &RunnerRequest) -> Result<RunnerOperation, String> {
         }
         crate::lsp_bridge::AGENT_LSP_REQUEST_KIND => {
             ensure_only_lsp_payload(wire)?;
-            ensure_lsp_legacy_compatible_generic_fields(wire)?;
+            ensure_empty_generic_execution_fields(wire, false)?;
             Ok(RunnerOperation::Lsp {
                 payload: wire
                     .lsp
@@ -1708,7 +1708,6 @@ fn validate_file_payload(kind: &str, payload: &RunnerFilePayload) -> Result<(), 
     if kind == "file_read" {
         match (payload.start_line, payload.end_line) {
             (Some(start), Some(end)) if start > 0 && end >= start => {}
-            (None, None) => {}
             _ => return Err("file_read line range is invalid".to_string()),
         }
     } else if payload.start_line.is_some() || payload.end_line.is_some() {
@@ -1933,29 +1932,6 @@ fn ensure_empty_generic_execution_fields(
             "{} contains incompatible generic fields",
             wire.kind
         ));
-    }
-    Ok(())
-}
-
-/// Historical V2 LSP requests could carry legacy shell `cwd`/`command`
-/// baggage. The LSP handler deliberately ignored both fields, and existing
-/// rolling-compatibility regression coverage depends on that behavior. Keep
-/// this allowance local to LSP decoding; canonical encoding still emits
-/// neither field, and all other execution/file/job fields remain fail-closed.
-fn ensure_lsp_legacy_compatible_generic_fields(wire: &RunnerRequest) -> Result<(), String> {
-    if wire.job_id.is_some()
-        || wire.path.is_some()
-        || wire.content.is_some()
-        || wire.max_bytes.is_some()
-        || wire.expected_sha256.is_some()
-        || wire.expected_prefix.is_some()
-        || wire.start_line.is_some()
-        || wire.end_line.is_some()
-        || wire.create_dirs
-        || wire.stdin.is_some()
-        || wire.job_context.is_some()
-    {
-        return Err("lsp contains incompatible generic fields".to_string());
     }
     Ok(())
 }
@@ -2271,7 +2247,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_lsp_shell_baggage_decodes_but_encoder_stays_canonical() {
+    fn lsp_wire_rejects_generic_execution_baggage() {
         let operation = RunnerOperation::Lsp {
             payload: RunnerLspPayload {
                 project_id: "demo".to_string(),
@@ -2283,20 +2259,31 @@ mod tests {
         assert_eq!(canonical.kind, crate::lsp_bridge::AGENT_LSP_REQUEST_KIND);
         assert!(canonical.cwd.is_none());
         assert!(canonical.command.is_empty());
-
-        let mut legacy = canonical.clone();
-        legacy.cwd = Some("/historical/ignored/cwd".to_string());
-        legacy.command = "printf must-not-run".to_string();
         assert!(matches!(
-            legacy.decode_operation().unwrap(),
+            canonical.decode_operation().unwrap(),
             RunnerOperation::Lsp { .. }
         ));
 
-        legacy.process = Some(ShellProcessArgv {
+        let mut with_cwd = canonical.clone();
+        with_cwd.cwd = Some("/historical/ignored/cwd".to_string());
+        assert!(with_cwd
+            .decode_operation()
+            .unwrap_err()
+            .contains("incompatible generic fields"));
+
+        let mut with_command = canonical.clone();
+        with_command.command = "printf must-not-run".to_string();
+        assert!(with_command
+            .decode_operation()
+            .unwrap_err()
+            .contains("incompatible generic fields"));
+
+        let mut with_process = canonical;
+        with_process.process = Some(ShellProcessArgv {
             executable: "printf".to_string(),
             args: vec!["conflict".to_string()],
         });
-        assert!(legacy
+        assert!(with_process
             .decode_operation()
             .unwrap_err()
             .contains("conflicting"));
@@ -2545,7 +2532,11 @@ mod tests {
         ];
 
         let file_operations = vec![
-            RunnerFileOperation::Read(file_payload(None)),
+            RunnerFileOperation::Read(RunnerFilePayload {
+                start_line: Some(1),
+                end_line: Some(1),
+                ..file_payload(None)
+            }),
             RunnerFileOperation::Write(file_payload(Some("body"))),
             RunnerFileOperation::List(file_payload(None)),
             RunnerFileOperation::ProjectOverview(file_payload(None)),

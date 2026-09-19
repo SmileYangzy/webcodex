@@ -400,7 +400,6 @@ mod tests {
                         apply_patch: false,
                         apply_patch_match_metadata: false,
                         apply_patch_matching_mode: false,
-                        apply_patch_strict_matching: false,
                         git: false,
                         jobs: true,
                         async_jobs: true,

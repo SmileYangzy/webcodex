@@ -16,22 +16,24 @@ use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 
 struct V8Initialization {
     _platform: v8::SharedRef<v8::Platform>,
 }
 
 static V8_INITIALIZATION: OnceLock<Result<V8Initialization, String>> = OnceLock::new();
-static EXECUTION_SLOTS: OnceLock<Semaphore> = OnceLock::new();
+static EXECUTION_SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
-fn execution_slots() -> &'static Semaphore {
+fn execution_slots() -> Arc<Semaphore> {
     // Process configuration is sampled once, before the first V8 cell acquires a
     // slot. Later environment mutation cannot silently resize a live semaphore.
-    EXECUTION_SLOTS.get_or_init(|| {
+    Arc::clone(EXECUTION_SLOTS.get_or_init(|| {
         let configured = std::env::var(MAX_CONCURRENT_EXECUTIONS_ENV).ok();
-        Semaphore::new(normalized_max_concurrent_executions(configured.as_deref()))
-    })
+        Arc::new(Semaphore::new(normalized_max_concurrent_executions(
+            configured.as_deref(),
+        )))
+    }))
 }
 
 fn ensure_v8_initialized() -> Result<(), String> {
@@ -95,7 +97,156 @@ struct SpawnedRuntime {
     command_tx: std_mpsc::Sender<RuntimeCommand>,
     event_rx: mpsc::UnboundedReceiver<RuntimeEvent>,
     isolate_handle: v8::IsolateHandle,
+    join: Option<RuntimeJoin>,
+}
+
+impl SpawnedRuntime {
+    fn release_execution_slot(&mut self) {
+        if let Some(join) = self.join.as_mut() {
+            drop(join.execution_slot.take());
+        }
+    }
+
+    fn take_join(&mut self) -> RuntimeJoin {
+        self.join.take().expect("runtime owns join handle")
+    }
+}
+
+impl Drop for SpawnedRuntime {
+    fn drop(&mut self) {
+        let Some(join) = self.join.take() else {
+            return;
+        };
+        let _ = self.isolate_handle.terminate_execution();
+        let _ = self.command_tx.send(RuntimeCommand::Terminate);
+        reap_runtime(join);
+    }
+}
+
+struct RuntimeJoin {
     join: thread::JoinHandle<()>,
+    execution_slot: Option<OwnedSemaphorePermit>,
+    #[cfg(test)]
+    reaped: Option<Arc<tokio::sync::Notify>>,
+}
+
+impl RuntimeJoin {
+    fn join(mut self) {
+        let _ = self.join.join();
+        // Cancellation cleanup keeps active-cell capacity owned until the OS
+        // runtime thread has actually stopped. Notify tests only after release.
+        drop(self.execution_slot.take());
+        #[cfg(test)]
+        if let Some(reaped) = self.reaped {
+            reaped.notify_one();
+        }
+    }
+}
+
+#[derive(Debug)]
+enum RuntimeStartupDecision {
+    Run,
+}
+
+struct RuntimeStartupSignal {
+    observed_at: tokio::time::Instant,
+    result: Result<v8::IsolateHandle, String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RuntimeStartupError {
+    Runtime(String),
+    Timeout,
+}
+
+struct RuntimeStartup {
+    command_tx: Option<std_mpsc::Sender<RuntimeCommand>>,
+    event_rx: Option<mpsc::UnboundedReceiver<RuntimeEvent>>,
+    readiness_rx: oneshot::Receiver<RuntimeStartupSignal>,
+    activation_tx: Option<std_mpsc::Sender<RuntimeStartupDecision>>,
+    join: Option<RuntimeJoin>,
+}
+
+impl RuntimeStartup {
+    async fn wait_until(
+        mut self,
+        deadline: tokio::time::Instant,
+    ) -> Result<SpawnedRuntime, RuntimeStartupError> {
+        use tokio::sync::oneshot::error::TryRecvError;
+
+        let mut deadline_sleep = Box::pin(tokio::time::sleep_until(deadline));
+        let signal = tokio::select! {
+            biased;
+            signal = &mut self.readiness_rx => {
+                signal.map_err(|_| RuntimeStartupError::Runtime(
+                    "code mode runtime failed before isolate readiness".to_string()
+                ))?
+            }
+            _ = &mut deadline_sleep => {
+                match self.readiness_rx.try_recv() {
+                    Ok(signal) if signal.observed_at <= deadline => signal,
+                    Ok(_) | Err(TryRecvError::Empty) => return Err(RuntimeStartupError::Timeout),
+                    Err(TryRecvError::Closed) => {
+                        return Err(RuntimeStartupError::Runtime(
+                            "code mode runtime failed before isolate readiness".to_string()
+                        ));
+                    }
+                }
+            }
+        };
+
+        if signal.observed_at > deadline {
+            return Err(RuntimeStartupError::Timeout);
+        }
+        let isolate_handle = signal.result.map_err(RuntimeStartupError::Runtime)?;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(RuntimeStartupError::Timeout);
+        }
+        let activation_tx = self.activation_tx.take().ok_or_else(|| {
+            RuntimeStartupError::Runtime("code mode runtime startup owner was lost".to_string())
+        })?;
+        activation_tx
+            .send(RuntimeStartupDecision::Run)
+            .map_err(|_| {
+                RuntimeStartupError::Runtime(
+                    "code mode runtime ended before startup activation".to_string(),
+                )
+            })?;
+
+        Ok(SpawnedRuntime {
+            command_tx: self.command_tx.take().expect("startup owns command sender"),
+            event_rx: self.event_rx.take().expect("startup owns event receiver"),
+            isolate_handle,
+            join: Some(self.join.take().expect("startup owns runtime join handle")),
+        })
+    }
+}
+
+impl Drop for RuntimeStartup {
+    fn drop(&mut self) {
+        // Dropping the activation sender is the startup cancellation fence. The
+        // runtime thread never evaluates user JavaScript until it receives Run.
+        self.activation_tx.take();
+        if let Some(join) = self.join.take() {
+            reap_runtime(join);
+        }
+    }
+}
+
+#[derive(Default)]
+struct RuntimeStartupConfig {
+    #[cfg(test)]
+    test_hook: Option<RuntimeStartupTestHook>,
+}
+
+#[cfg(test)]
+struct RuntimeStartupTestHook {
+    before_readiness: Option<Box<dyn FnOnce() + Send>>,
+    fail_before_readiness: bool,
+    ready_published: Option<Arc<tokio::sync::Notify>>,
+    run_started: Arc<std::sync::atomic::AtomicBool>,
+    run_started_notify: Arc<tokio::sync::Notify>,
+    reaped: Arc<tokio::sync::Notify>,
 }
 
 struct RuntimeState {
@@ -126,6 +277,23 @@ pub async fn execute_with_termination_mode(
     request: CodeModeExecuteRequest,
     termination_mode: CodeModeTerminationMode,
 ) -> Result<CodeModeExecution, CodeModeError> {
+    execute_with_termination_mode_inner(
+        host,
+        request,
+        termination_mode,
+        execution_slots(),
+        RuntimeStartupConfig::default(),
+    )
+    .await
+}
+
+async fn execute_with_termination_mode_inner(
+    host: Arc<dyn CodeModeHost>,
+    request: CodeModeExecuteRequest,
+    termination_mode: CodeModeTerminationMode,
+    execution_slots: Arc<Semaphore>,
+    startup_config: RuntimeStartupConfig,
+) -> Result<CodeModeExecution, CodeModeError> {
     let started_at = Instant::now();
     validate_request(&request).map_err(|message| CodeModeError {
         kind: CodeModeErrorKind::InvalidRequest,
@@ -138,7 +306,7 @@ pub async fn execute_with_termination_mode(
     let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
     let slot_wait_started_at = Instant::now();
     let execution_slot = tokio::select! {
-        permit = execution_slots().acquire() => permit.map_err(|_| CodeModeError {
+        permit = Arc::clone(&execution_slots).acquire_owned() => permit.map_err(|_| CodeModeError {
             kind: CodeModeErrorKind::Runtime,
             message: "code mode execution slots are unavailable".to_string(),
             stats: CodeModeStats {
@@ -165,18 +333,48 @@ pub async fn execute_with_termination_mode(
         }
     };
     let slot_wait_ms = elapsed_ms(slot_wait_started_at);
-    let mut execution_slot = Some(execution_slot);
-    let mut runtime =
-        spawn_runtime(request.source, request.allowed_tools).map_err(|message| CodeModeError {
-            kind: CodeModeErrorKind::Runtime,
-            message,
-            stats: CodeModeStats {
-                slot_wait_ms,
-                ..CodeModeStats::default()
-            },
-            child_failure: None,
-            limit: None,
-        })?;
+    let startup = spawn_runtime(
+        request.source,
+        request.allowed_tools,
+        execution_slot,
+        startup_config,
+    )
+    .map_err(|message| CodeModeError {
+        kind: CodeModeErrorKind::Runtime,
+        message,
+        stats: CodeModeStats {
+            slot_wait_ms,
+            ..CodeModeStats::default()
+        },
+        child_failure: None,
+        limit: None,
+    })?;
+    let mut runtime = match startup.wait_until(deadline).await {
+        Ok(runtime) => runtime,
+        Err(RuntimeStartupError::Runtime(message)) => {
+            return Err(CodeModeError {
+                kind: CodeModeErrorKind::Runtime,
+                message,
+                stats: finish_stats(started_at, 0, 0, 0, slot_wait_ms),
+                child_failure: None,
+                limit: None,
+            });
+        }
+        Err(RuntimeStartupError::Timeout) => {
+            if termination_mode.drains_started_children() {
+                host.stop_accepting_calls();
+            }
+            return Err(CodeModeError {
+                kind: CodeModeErrorKind::Timeout,
+                message: format!(
+                    "code mode execution exceeded {timeout_ms} ms while starting the runtime"
+                ),
+                stats: finish_stats(started_at, 0, 0, 0, slot_wait_ms),
+                child_failure: None,
+                limit: None,
+            });
+        }
+    };
 
     let mut deadline_sleep = Box::pin(tokio::time::sleep_until(deadline));
     let mut content = Vec::new();
@@ -231,10 +429,10 @@ pub async fn execute_with_termination_mode(
                 }
                 let _ = runtime.isolate_handle.terminate_execution();
                 let _ = runtime.command_tx.send(RuntimeCommand::Terminate);
-                join_runtime(runtime.join).await;
-                // The process-wide permit bounds active V8 cells, not post-frontend
-                // host reconciliation. Release it before the bounded child drain.
-                drop(execution_slot.take());
+                let join = runtime.take_join();
+                join_runtime(join).await;
+                // RuntimeJoin retains the execution permit through termination and
+                // releases it before this post-frontend host reconciliation.
                 if let Some(max_drain_ms) = termination_mode.drain_timeout_ms() {
                     let _ = drain_in_flight(
                         &mut in_flight,
@@ -271,7 +469,7 @@ pub async fn execute_with_termination_mode(
                         runtime_finished = Some(failure);
                         // RuntimeEvent::Finished means the V8 decision phase has
                         // ended. Host reconciliation must not consume V8 capacity.
-                        drop(execution_slot.take());
+                        runtime.release_execution_slot();
                         if let Some(max_drain_ms) = termination_mode.drain_timeout_ms() {
                             let drained = drain_in_flight(
                                 &mut in_flight,
@@ -299,7 +497,7 @@ pub async fn execute_with_termination_mode(
                         runtime_finished = Some(Some(runtime_failure(
                             "code mode runtime thread ended without a terminal result",
                         )));
-                        drop(execution_slot.take());
+                        runtime.release_execution_slot();
                         if let Some(max_drain_ms) = termination_mode.drain_timeout_ms() {
                             let _ = drain_in_flight(
                                 &mut in_flight,
@@ -336,8 +534,9 @@ pub async fn execute_with_termination_mode(
     }
 
     let failure = runtime_finished.flatten();
-    drop(execution_slot.take());
-    join_runtime(runtime.join).await;
+    runtime.release_execution_slot();
+    let join = runtime.take_join();
+    join_runtime(join).await;
     let stats = finish_stats(
         started_at,
         tool_calls,
@@ -479,27 +678,58 @@ async fn drain_in_flight(
     false
 }
 
-async fn join_runtime(join: thread::JoinHandle<()>) {
+async fn join_runtime(join: RuntimeJoin) {
     let _ = tokio::task::spawn_blocking(move || join.join()).await;
 }
 
-fn spawn_runtime(source: String, allowed_tools: Vec<String>) -> Result<SpawnedRuntime, String> {
-    ensure_v8_initialized()?;
+fn reap_runtime(join: RuntimeJoin) {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let _ = handle.spawn_blocking(move || join.join());
+        return;
+    }
+    join.join();
+}
+
+fn spawn_runtime(
+    source: String,
+    allowed_tools: Vec<String>,
+    execution_slot: OwnedSemaphorePermit,
+    startup_config: RuntimeStartupConfig,
+) -> Result<RuntimeStartup, String> {
     let (command_tx, command_rx) = std_mpsc::channel();
     let (event_tx, event_rx) = mpsc::unbounded_channel();
-    let (handle_tx, handle_rx) = std_mpsc::sync_channel(1);
+    let (readiness_tx, readiness_rx) = oneshot::channel();
+    let (activation_tx, activation_rx) = std_mpsc::channel();
+    #[cfg(test)]
+    let reaped = startup_config
+        .test_hook
+        .as_ref()
+        .map(|hook| Arc::clone(&hook.reaped));
     let join = thread::Builder::new()
         .name("webcodex-code-mode-v8".to_string())
-        .spawn(move || run_runtime(source, allowed_tools, command_rx, event_tx, handle_tx))
+        .spawn(move || {
+            run_runtime(
+                source,
+                allowed_tools,
+                command_rx,
+                event_tx,
+                readiness_tx,
+                activation_rx,
+                startup_config,
+            )
+        })
         .map_err(|error| format!("failed to spawn code mode runtime thread: {error}"))?;
-    let isolate_handle = handle_rx
-        .recv()
-        .map_err(|_| "code mode runtime failed before isolate initialization".to_string())?;
-    Ok(SpawnedRuntime {
-        command_tx,
-        event_rx,
-        isolate_handle,
-        join,
+    Ok(RuntimeStartup {
+        command_tx: Some(command_tx),
+        event_rx: Some(event_rx),
+        readiness_rx,
+        activation_tx: Some(activation_tx),
+        join: Some(RuntimeJoin {
+            join,
+            execution_slot: Some(execution_slot),
+            #[cfg(test)]
+            reaped,
+        }),
     })
 }
 
@@ -508,13 +738,77 @@ fn run_runtime(
     allowed_tools: Vec<String>,
     command_rx: std_mpsc::Receiver<RuntimeCommand>,
     event_tx: mpsc::UnboundedSender<RuntimeEvent>,
-    handle_tx: std_mpsc::SyncSender<v8::IsolateHandle>,
+    readiness_tx: oneshot::Sender<RuntimeStartupSignal>,
+    activation_rx: std_mpsc::Receiver<RuntimeStartupDecision>,
+    startup_config: RuntimeStartupConfig,
 ) {
-    let isolate = &mut v8::Isolate::new(v8::CreateParams::default());
-    let isolate_handle = isolate.thread_safe_handle();
-    if handle_tx.send(isolate_handle).is_err() {
+    #[cfg(test)]
+    let mut startup_config = startup_config;
+    #[cfg(not(test))]
+    let _startup_config = startup_config;
+
+    if let Err(message) = ensure_v8_initialized() {
+        let _ = readiness_tx.send(RuntimeStartupSignal {
+            observed_at: tokio::time::Instant::now(),
+            result: Err(message),
+        });
         return;
     }
+
+    let isolate = &mut v8::Isolate::new(v8::CreateParams::default());
+    let isolate_handle = isolate.thread_safe_handle();
+    #[cfg(test)]
+    if let Some(before_readiness) = startup_config
+        .test_hook
+        .as_mut()
+        .and_then(|hook| hook.before_readiness.take())
+    {
+        before_readiness();
+    }
+    #[cfg(test)]
+    if startup_config
+        .test_hook
+        .as_ref()
+        .is_some_and(|hook| hook.fail_before_readiness)
+    {
+        return;
+    }
+
+    let readiness = RuntimeStartupSignal {
+        observed_at: tokio::time::Instant::now(),
+        result: Ok(isolate_handle.clone()),
+    };
+    if let Err(readiness) = readiness_tx.send(readiness) {
+        if let Ok(late_handle) = readiness.result {
+            let _ = late_handle.terminate_execution();
+        }
+        return;
+    }
+    #[cfg(test)]
+    if let Some(ready_published) = startup_config
+        .test_hook
+        .as_ref()
+        .and_then(|hook| hook.ready_published.as_ref())
+    {
+        ready_published.notify_one();
+    }
+
+    match activation_rx.recv() {
+        Ok(RuntimeStartupDecision::Run) =>
+        {
+            #[cfg(test)]
+            if let Some(hook) = startup_config.test_hook.as_ref() {
+                hook.run_started
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                hook.run_started_notify.notify_one();
+            }
+        }
+        Err(_) => {
+            let _ = isolate_handle.terminate_execution();
+            return;
+        }
+    }
+
     isolate.set_host_import_module_dynamically_callback(dynamic_import_callback);
 
     v8::scope!(let scope, isolate);
@@ -1068,6 +1362,275 @@ mod tests {
         }
     }
 
+    fn startup_test_hook(
+        before_readiness: Option<Box<dyn FnOnce() + Send>>,
+        fail_before_readiness: bool,
+        ready_published: Option<Arc<Notify>>,
+    ) -> (
+        RuntimeStartupTestHook,
+        Arc<AtomicBool>,
+        Arc<Notify>,
+        Arc<Notify>,
+    ) {
+        let run_started = Arc::new(AtomicBool::new(false));
+        let run_started_notify = Arc::new(Notify::new());
+        let reaped = Arc::new(Notify::new());
+        (
+            RuntimeStartupTestHook {
+                before_readiness,
+                fail_before_readiness,
+                ready_published,
+                run_started: Arc::clone(&run_started),
+                run_started_notify: Arc::clone(&run_started_notify),
+                reaped: Arc::clone(&reaped),
+            },
+            run_started,
+            run_started_notify,
+            reaped,
+        )
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn startup_handshake_runs_source_and_reaps_runtime() {
+        let slots = Arc::new(Semaphore::new(1));
+        let (hook, run_started, _run_started_notify, reaped) = startup_test_hook(None, false, None);
+        let result = execute_with_termination_mode_inner(
+            Arc::new(RecordingHost::default()),
+            request("text('ready')", &[]),
+            CodeModeTerminationMode::ReturnAtFrontendDeadline,
+            Arc::clone(&slots),
+            RuntimeStartupConfig {
+                test_hook: Some(hook),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.content, ["ready"]);
+        assert!(run_started.load(Ordering::SeqCst));
+        assert_eq!(slots.available_permits(), 1);
+        tokio::time::timeout(Duration::from_secs(1), reaped.notified())
+            .await
+            .expect("normal runtime must be joined before completion");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn delayed_startup_deadline_is_async_fenced_reaped_and_releases_slot() {
+        ensure_v8_initialized().unwrap();
+        let entered = Arc::new(Notify::new());
+        let entered_for_thread = Arc::clone(&entered);
+        let (release_tx, release_rx) = std_mpsc::channel();
+        let before_readiness = Box::new(move || {
+            entered_for_thread.notify_one();
+            let _ = release_rx.recv();
+        });
+        let (hook, run_started, _run_started_notify, reaped) =
+            startup_test_hook(Some(before_readiness), false, None);
+        let slots = Arc::new(Semaphore::new(1));
+        let slots_for_task = Arc::clone(&slots);
+        let mut req = request("text('must not run')", &[]);
+        req.timeout_ms = Some(100);
+        let task = tokio::spawn(async move {
+            execute_with_termination_mode_inner(
+                Arc::new(RecordingHost::default()),
+                req,
+                CodeModeTerminationMode::ReturnAtFrontendDeadline,
+                slots_for_task,
+                RuntimeStartupConfig {
+                    test_hook: Some(hook),
+                },
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("runtime thread must reach the deterministic startup gate");
+        let error = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("startup deadline must not block the Tokio worker")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind, CodeModeErrorKind::Timeout);
+        assert!(error.message.contains("while starting the runtime"));
+        assert!(!run_started.load(Ordering::SeqCst));
+        assert_eq!(slots.available_permits(), 0);
+
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), reaped.notified())
+            .await
+            .expect("late startup thread must be reaped after its gate is released");
+        assert!(!run_started.load(Ordering::SeqCst));
+        assert_eq!(slots.available_permits(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn startup_task_cancellation_before_readiness_fences_js_and_releases_slot() {
+        ensure_v8_initialized().unwrap();
+        let entered = Arc::new(Notify::new());
+        let entered_for_thread = Arc::clone(&entered);
+        let (release_tx, release_rx) = std_mpsc::channel();
+        let before_readiness = Box::new(move || {
+            entered_for_thread.notify_one();
+            let _ = release_rx.recv();
+        });
+        let (hook, run_started, _run_started_notify, reaped) =
+            startup_test_hook(Some(before_readiness), false, None);
+        let slots = Arc::new(Semaphore::new(1));
+        let slots_for_task = Arc::clone(&slots);
+        let task = tokio::spawn(async move {
+            execute_with_termination_mode_inner(
+                Arc::new(RecordingHost::default()),
+                request("text('must not run')", &[]),
+                CodeModeTerminationMode::ReturnAtFrontendDeadline,
+                slots_for_task,
+                RuntimeStartupConfig {
+                    test_hook: Some(hook),
+                },
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("runtime thread must reach the startup gate");
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(slots.available_permits(), 0);
+        assert!(!run_started.load(Ordering::SeqCst));
+
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), reaped.notified())
+            .await
+            .expect("cancelled startup must retain a reaper owner");
+        assert!(!run_started.load(Ordering::SeqCst));
+        assert_eq!(slots.available_permits(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancellation_after_ready_publication_before_activation_fences_js() {
+        ensure_v8_initialized().unwrap();
+        let ready_published = Arc::new(Notify::new());
+        let (hook, run_started, _run_started_notify, reaped) =
+            startup_test_hook(None, false, Some(Arc::clone(&ready_published)));
+        let slots = Arc::new(Semaphore::new(1));
+        let execution_slot = Arc::clone(&slots).acquire_owned().await.unwrap();
+        let startup = spawn_runtime(
+            "text('must not run')".to_string(),
+            Vec::new(),
+            execution_slot,
+            RuntimeStartupConfig {
+                test_hook: Some(hook),
+            },
+        )
+        .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), ready_published.notified())
+            .await
+            .expect("runtime must publish readiness before cancellation");
+        assert_eq!(slots.available_permits(), 0);
+        drop(startup);
+        tokio::time::timeout(Duration::from_secs(1), reaped.notified())
+            .await
+            .expect("ready-but-not-activated runtime must be terminated and reaped");
+        assert!(!run_started.load(Ordering::SeqCst));
+        assert_eq!(slots.available_permits(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancellation_after_activation_terminates_reaps_and_releases_slot() {
+        ensure_v8_initialized().unwrap();
+        let (hook, run_started, run_started_notify, reaped) = startup_test_hook(None, false, None);
+        let slots = Arc::new(Semaphore::new(1));
+        let slots_for_task = Arc::clone(&slots);
+        let task = tokio::spawn(async move {
+            execute_with_termination_mode_inner(
+                Arc::new(RecordingHost::default()),
+                request("while (true) {}", &[]),
+                CodeModeTerminationMode::ReturnAtFrontendDeadline,
+                slots_for_task,
+                RuntimeStartupConfig {
+                    test_hook: Some(hook),
+                },
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), run_started_notify.notified())
+            .await
+            .expect("runtime must cross the activation fence before cancellation");
+        assert!(run_started.load(Ordering::SeqCst));
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(slots.available_permits(), 0);
+        tokio::time::timeout(Duration::from_secs(1), reaped.notified())
+            .await
+            .expect("activated runtime must retain its slot until it is reaped");
+        assert_eq!(slots.available_permits(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failure_before_readiness_is_bounded_runtime_error_and_releases_slot() {
+        ensure_v8_initialized().unwrap();
+        let (hook, run_started, _run_started_notify, reaped) = startup_test_hook(None, true, None);
+        let slots = Arc::new(Semaphore::new(1));
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            execute_with_termination_mode_inner(
+                Arc::new(RecordingHost::default()),
+                request("text('must not run')", &[]),
+                CodeModeTerminationMode::ReturnAtFrontendDeadline,
+                Arc::clone(&slots),
+                RuntimeStartupConfig {
+                    test_hook: Some(hook),
+                },
+            ),
+        )
+        .await
+        .expect("startup thread failure must not hang")
+        .unwrap_err();
+
+        assert_eq!(result.kind, CodeModeErrorKind::Runtime);
+        assert!(result.message.contains("failed before isolate readiness"));
+        assert!(!run_started.load(Ordering::SeqCst));
+        tokio::time::timeout(Duration::from_secs(1), reaped.notified())
+            .await
+            .expect("failed startup thread must be reaped");
+        assert_eq!(slots.available_permits(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn panic_before_readiness_closes_handshake_reaps_and_releases_slot() {
+        ensure_v8_initialized().unwrap();
+        let before_readiness = Box::new(|| panic!("deterministic startup panic"));
+        let (hook, run_started, _run_started_notify, reaped) =
+            startup_test_hook(Some(before_readiness), false, None);
+        let slots = Arc::new(Semaphore::new(1));
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            execute_with_termination_mode_inner(
+                Arc::new(RecordingHost::default()),
+                request("text('must not run')", &[]),
+                CodeModeTerminationMode::ReturnAtFrontendDeadline,
+                Arc::clone(&slots),
+                RuntimeStartupConfig {
+                    test_hook: Some(hook),
+                },
+            ),
+        )
+        .await
+        .expect("startup thread panic must close readiness without hanging")
+        .unwrap_err();
+
+        assert_eq!(result.kind, CodeModeErrorKind::Runtime);
+        assert!(result.message.contains("failed before isolate readiness"));
+        assert!(!run_started.load(Ordering::SeqCst));
+        tokio::time::timeout(Duration::from_secs(1), reaped.notified())
+            .await
+            .expect("panicked startup thread must be joined by the reaper");
+        assert_eq!(slots.available_permits(), 1);
+    }
+
     #[test]
     fn slot_wait_is_diagnostic_only_and_not_serialized_in_model_stats() {
         let stats = finish_stats(Instant::now(), 2, 1, 3, 17);
@@ -1512,12 +2075,14 @@ mod tests {
         req.timeout_ms = Some(1_000);
         let host_for_execute = host.clone();
         let task = tokio::spawn(async move {
-            execute_with_termination_mode(
+            execute_with_termination_mode_inner(
                 host_for_execute,
                 req,
                 CodeModeTerminationMode::DrainStartedChildren {
                     max_drain_ms: 5_000,
                 },
+                Arc::new(Semaphore::new(1)),
+                RuntimeStartupConfig::default(),
             )
             .await
         });
@@ -1549,10 +2114,12 @@ mod tests {
         req.timeout_ms = Some(50);
         let host_for_execute = host.clone();
         let task = tokio::spawn(async move {
-            execute_with_termination_mode(
+            execute_with_termination_mode_inner(
                 host_for_execute,
                 req,
                 CodeModeTerminationMode::DrainStartedChildren { max_drain_ms: 50 },
+                Arc::new(Semaphore::new(1)),
+                RuntimeStartupConfig::default(),
             )
             .await
         });
@@ -1574,10 +2141,12 @@ mod tests {
         let req = request("tools.effect({}); text('frontend done');", &["effect"]);
         let host_for_execute = host.clone();
         let task = tokio::spawn(async move {
-            execute_with_termination_mode(
+            execute_with_termination_mode_inner(
                 host_for_execute,
                 req,
                 CodeModeTerminationMode::DrainStartedChildren { max_drain_ms: 50 },
+                Arc::new(Semaphore::new(1)),
+                RuntimeStartupConfig::default(),
             )
             .await
         });
@@ -1607,12 +2176,14 @@ mod tests {
         req.timeout_ms = Some(1_000);
         let host_for_execute = host.clone();
         let task = tokio::spawn(async move {
-            execute_with_termination_mode(
+            execute_with_termination_mode_inner(
                 host_for_execute,
                 req,
                 CodeModeTerminationMode::DrainStartedChildren {
                     max_drain_ms: 5_000,
                 },
+                Arc::new(Semaphore::new(1)),
+                RuntimeStartupConfig::default(),
             )
             .await
         });
@@ -1650,7 +2221,16 @@ mod tests {
         );
         req.timeout_ms = Some(1_000);
         let host_for_execute = host.clone();
-        let task = tokio::spawn(async move { execute(host_for_execute, req).await });
+        let task = tokio::spawn(async move {
+            execute_with_termination_mode_inner(
+                host_for_execute,
+                req,
+                CodeModeTerminationMode::ReturnAtFrontendDeadline,
+                Arc::new(Semaphore::new(1)),
+                RuntimeStartupConfig::default(),
+            )
+            .await
+        });
 
         host.wait_for_started(1).await;
         let result = tokio::time::timeout(Duration::from_secs(5), task)

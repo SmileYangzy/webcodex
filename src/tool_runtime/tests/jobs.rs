@@ -1213,24 +1213,6 @@ async fn run_job_rejects_server_configured_project_without_local_spawn() {
 }
 
 #[tokio::test]
-async fn stop_job_rejects_unsafe_job_id() {
-    let runtime = test_runtime();
-    let result = runtime.stop_job("../escape".to_string(), None).await;
-    assert!(!result.success);
-    assert!(result.error.unwrap().contains("invalid job id"));
-}
-
-#[tokio::test]
-async fn stop_job_unknown_job_returns_error() {
-    let runtime = test_runtime();
-    let result = runtime
-        .stop_job("55555555-6666-7777-8888-999999999999".to_string(), None)
-        .await;
-    assert!(!result.success);
-    assert!(result.error.unwrap().contains("unknown job"));
-}
-
-#[tokio::test]
 async fn model_facing_stop_job_requires_confirm_without_stopping_or_approving() {
     let runtime = test_runtime();
     let auth = open_auth_context();

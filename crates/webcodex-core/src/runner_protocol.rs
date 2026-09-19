@@ -185,11 +185,6 @@ pub const RUNNER_CAPABILITY_APPLY_PATCH_MATCH_METADATA: &str = "apply_patch_matc
 /// requested mode. Missing on older Runners is false; current Servers fail
 /// closed instead of silently falling back to legacy permissive positioning.
 pub const RUNNER_CAPABILITY_APPLY_PATCH_MATCHING_MODE: &str = "apply_patch_matching_mode";
-/// The Runner understands `strict_matching=true` for apply_patch and rejects
-/// any update chunk whose positioning is not exact and unique before writing.
-/// This legacy wire capability is retained only so older Servers can roll
-/// against a current Runner; current model-facing contracts use matching_mode.
-pub const RUNNER_CAPABILITY_APPLY_PATCH_STRICT_MATCHING: &str = "apply_patch_strict_matching";
 pub const RUNNER_CAPABILITY_GIT: &str = "git";
 pub const RUNNER_CAPABILITY_JOBS: &str = "jobs";
 pub const RUNNER_CAPABILITY_ASYNC_JOBS: &str = "async_jobs";
@@ -453,7 +448,6 @@ pub const RUNNER_CAPABILITY_NAMES: &[&str] = &[
     RUNNER_CAPABILITY_APPLY_PATCH,
     RUNNER_CAPABILITY_APPLY_PATCH_MATCH_METADATA,
     RUNNER_CAPABILITY_APPLY_PATCH_MATCHING_MODE,
-    RUNNER_CAPABILITY_APPLY_PATCH_STRICT_MATCHING,
     RUNNER_CAPABILITY_GIT,
     RUNNER_CAPABILITY_JOBS,
     RUNNER_CAPABILITY_ASYNC_JOBS,
@@ -570,11 +564,6 @@ pub struct RunnerCapabilities {
     /// Runners is false and must fail closed for current model-facing requests.
     #[serde(default, skip_serializing_if = "is_false")]
     pub apply_patch_matching_mode: bool,
-    /// Fail-closed exact-and-unique positioning for apply_patch requests that
-    /// arrive from a legacy Server as strict_matching=true. New Servers do not
-    /// use this bool as model-facing authority.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub apply_patch_strict_matching: bool,
     #[serde(default)]
     pub git: bool,
     #[serde(default)]
@@ -1022,7 +1011,6 @@ impl Default for RunnerCapabilities {
             apply_patch: false,
             apply_patch_match_metadata: false,
             apply_patch_matching_mode: false,
-            apply_patch_strict_matching: false,
             git: false,
             jobs: false,
             async_jobs: false,
@@ -2571,7 +2559,6 @@ mod envelope_tests {
                 apply_patch: false,
                 apply_patch_match_metadata: false,
                 apply_patch_matching_mode: false,
-                apply_patch_strict_matching: false,
                 git: false,
                 jobs: true,
                 async_jobs: true,
@@ -3829,7 +3816,6 @@ mod envelope_tests {
                 "apply_patch",
                 "apply_patch_match_metadata",
                 "apply_patch_matching_mode",
-                "apply_patch_strict_matching",
                 "git",
                 "jobs",
                 "async_jobs",

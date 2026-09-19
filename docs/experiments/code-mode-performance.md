@@ -161,13 +161,53 @@ Code-Mode-only exposure a default.
 
 ### P1: eliminate attributable queue/startup and payload costs
 
-`spawn_runtime` currently waits synchronously on `handle_rx.recv()` inside an async
-execution path. Move startup readiness toward an async, deadline-aware handshake,
-while retaining an owner that terminates and joins a late-started isolate after
-cancellation. A plain timeout around an abandoned thread is not sufficient.
-Use deterministic delayed-start/fence tests, including cancellation before a handle
-is delivered. Treat this as scheduler/tail-latency work, not a promise of large
-single-cell acceleration from the present two-millisecond baseline.
+`spawn_runtime` no longer waits on a synchronous handle receiver inside the async
+execution path. Runtime startup now has an owned two-phase lifecycle: the V8 thread
+performs the process-wide `OnceLock` initialization and creates a fresh isolate,
+publishes readiness through a Tokio oneshot, then waits for an explicit activation
+fence before evaluating user JavaScript. The existing absolute Code Mode deadline
+covers slot acquisition, V8 initialization, and isolate readiness. Dropping the
+startup owner before activation closes that fence and transfers the thread join to a
+blocking reaper; a late handle is terminated and user JavaScript never starts.
+Startup failure before readiness is reported as a Runtime error rather than a child
+failure.
+
+The deterministic startup tests use per-execution private gates rather than sleeps or
+process-global configuration. They cover normal activation, a startup gate held past
+the deadline on a single-thread Tokio runtime, task cancellation before readiness,
+cancellation immediately after readiness publication but before activation,
+cancellation after activation while V8 is executing CPU-bound JavaScript, and thread
+exit before readiness. Ownership transfers from the startup guard to `SpawnedRuntime`,
+whose drop path terminates and reaps an activated isolate if the outer future is
+cancelled. The execution-slot permit remains attached to that same join owner until
+normal decision-phase code explicitly releases it or cancellation cleanup has actually
+joined the runtime thread. Timeout/cancellation therefore cannot expose spare V8
+capacity while a late or terminated runtime thread is still alive; the tests observe
+the reap before verifying the slot becomes available again. A separate panic-before-
+readiness case proves channel-close cleanup also remains bounded.
+
+The final comparison used process order baseline / candidate / candidate / baseline
+on the same host, `dogfood` profile, benchmark source, and 21 measured samples per
+case. The table shows the range of the two per-process percentiles in microseconds:
+
+| Case | Before p50 (us) | After p50 (us) | Before p95 (us) | After p95 (us) |
+| --- | ---: | ---: | ---: | ---: |
+| `noop` | 1,817..2,040 | 1,828..2,138 | 2,512..2,703 | 1,928..2,580 |
+| `eight_immediate_sequential` | 2,270..2,373 | 2,096..2,550 | 2,972..3,928 | 2,237..2,987 |
+| `eight_immediate_parallel` | 2,009..2,018 | 1,952..2,242 | 2,440..2,862 | 2,928..3,533 |
+| `eight_20ms_sequential` | 171,829..171,965 | 172,047..172,377 | 172,438..172,850 | 173,170..174,051 |
+| `eight_20ms_parallel` | 23,238..23,570 | 23,361..24,095 | 24,052..25,177 | 23,538..25,279 |
+| `numeric_array_16384` | 2,439..2,652 | 2,589..2,697 | 2,872..4,260 | 3,279..3,331 |
+| `search_rows_2048` | 6,575..6,623 | 7,298..7,460 | 8,940..9,247 | 8,885..11,821 |
+
+The tiny-case p50 ranges overlap substantially and their direction changes across
+processes; p95 is even noisier. The activation handshake therefore is **not cleanly
+separable from process-level microbenchmark noise** at this scale. The 20 ms child
+cases remain dominated by child latency, and the larger payload cases likewise do not
+isolate startup cost. This patch is scheduler-hygiene and lifecycle-correctness work,
+not a measured single-cell speedup and not evidence of model-level throughput
+improvement. A Direct-vs-Code Mode E4 rebaseline belongs after merge/deployment, not
+in this local runtime measurement.
 
 Tune capacity using `slot_wait_ms`, queue tails, CPU, RSS, and actual Runner limits.
 A cell waiting for child I/O still holds its V8 slot. Conversely eight `read_files`
@@ -266,13 +306,25 @@ canonical permission/effect checks; shorter code is not improved correctness.
 ```bash
 cargo test --locked --profile dogfood -p webcodex-code-mode --features v8-runtime
 cargo test --locked --profile dogfood -p webcodex-code-mode --no-default-features
-cargo fmt -p webcodex-code-mode -- --check
+cargo test --locked --profile dogfood --features experimental-code-mode \
+  code_mode_binds_exact_project_and_session_through_real_canonical_reads -- \
+  --nocapture --test-threads=1
+cargo check --profile dogfood --features experimental-code-mode --all-targets
+cargo fmt --all -- --check
 git diff --check
 ```
 
-The feature-enabled package run executed 21 existing unit tests and two new public
-conversion tests successfully; the timing probe remains ignored unless requested.
-The feature-disabled package run also passed its one configuration unit test, with
-V8-only integration cases correctly excluded.
-No root runtime contract, permission rule, stage allowlist, Server deployment,
-Runner deployment, or default concurrency was changed by this patch.
+The feature-enabled default parallel package command passes all 28 unit tests plus both
+value-conversion integration tests; the latency probe remains ignored unless explicitly
+requested. During review, two effect-aware timeout tests initially stalled only under the
+parallel harness because they shared the process-wide execution slots with unrelated
+runtime tests and could wait forever for a host-start notification after their own call
+had timed out before dispatch. Those lifecycle tests now reuse the private per-test
+semaphore seam already used by the startup tests, so they still exercise the same runtime
+semantics without cross-test capacity contention. The feature-disabled package run passes
+its single configuration test with V8-only cases excluded. Root integration checks pass
+for exact Project/Session binding, E1 read-only orchestration, E2a validation admission,
+and E2c frontend-timeout preservation of the exact validation Job. The all-targets
+experimental feature check also passes. No root runtime contract, permission rule, stage
+allowlist, Server deployment, Runner deployment, or configured concurrency limit is
+changed by this patch.

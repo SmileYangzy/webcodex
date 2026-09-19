@@ -38,7 +38,7 @@ Protocol-only tools such as MCP App presentation, MCP ResourceLink export, or op
 
 ## 3. Canonical operation names and schemas
 
-Direct operation IDs are the canonical snake_case runtime tool names. Do not introduce camelCase aliases such as `getRuntimeStatus` or `runProjectShellCommand`.
+Direct operation IDs are the canonical snake_case runtime tool names. Do not introduce camelCase aliases or alternate operation spellings.
 
 Each direct Action request body starts from the canonical `ToolSpec.input_schema`. A GPT Action projector may alter only presentation/host-transport details that the Action host actually rewrites. It must not change canonical business semantics such as type, required fields, enum values, oneOf/anyOf shape, numeric/string bounds, patterns, or `additionalProperties` policy.
 
@@ -126,9 +126,9 @@ The public ToolSpec must not contain a provenance field. Model JSON must not be 
 
 ## 9. Legacy REST routes
 
-Old REST endpoints such as `/api/runtime/status`, `/api/tools/call`, `/api/projects/run_shell`, `/api/jobs/tail`, and similar operational compatibility routes may remain mounted when they still serve CLI, tests, or external REST users.
+Dedicated REST adapters may remain only when they serve a real current CLI, product, or external REST consumer. Tests by themselves are not compatibility consumers.
 
-They are not generic GPT Action operations and stay `Hidden` from the new `/openapi.json`. Route metadata describes HTTP security/surface facts; it no longer owns a generic `PublicAction` operation registry.
+Current retained compatibility surfaces include `/api/runtime/status` and the Project lifecycle REST routes such as `/api/projects/list`; generic runtime execution uses canonical `/api/tools/call`. These compatibility routes are not generic GPT Action operations and stay `Hidden` from `/openapi.json`. Route metadata describes HTTP security/surface facts; it no longer owns a generic `PublicAction` operation registry.
 
 ## 10. Project-scoped runtime boundary
 

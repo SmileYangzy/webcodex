@@ -128,9 +128,6 @@ pub(crate) enum RouteId {
     ToolsCall,
     GptActionsInvoke,
     ArtifactsImport,
-    JobsStop,
-    JobsList,
-    JobsTail,
     RunnerConfigCheck,
     RunnerConfigReload,
     ProjectsList,
@@ -138,13 +135,6 @@ pub(crate) enum RouteId {
     ProjectsCreate,
     ProjectsUnregister,
     ProjectsResolveOrRegister,
-    ProjectsGitStatus,
-    ProjectsListFiles,
-    ProjectsApplyUnifiedDiff,
-    ProjectsRunShell,
-    ProjectsGitRestorePaths,
-    ProjectsDiscardUntracked,
-    ProjectsRunJob,
     RuntimeStatus,
     OAuthClientsCreate,
     OAuthClientsList,
@@ -704,13 +694,9 @@ mod tests {
     #[test]
     fn audit_class_preserves_existing_http_stats_semantics() {
         for (path, class) in [
-            ("/api/projects/apply_unified_diff", Edit),
-            ("/api/projects/run_job", Job),
             ("/api/tools/call", Command),
             ("/api/runtime/status", Report),
             ("/api/artifacts/import", Artifact),
-            ("/api/projects/git_status", Git),
-            ("/api/projects/run_shell", Shell),
             ("/api/actions/{tool_name}", Other),
         ] {
             assert_eq!(audit_class_for_path(path), Some(class), "{path}");

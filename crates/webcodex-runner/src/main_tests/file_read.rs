@@ -49,18 +49,20 @@ fn file_read_json(result: CommandResult) -> serde_json::Value {
 }
 
 #[test]
-fn runner_file_read_without_range_preserves_plain_text_output() {
+fn runner_file_read_rejects_missing_or_incomplete_range() {
     let tmp = tempfile::tempdir().unwrap();
     let policy = project_policy(tmp.path());
     std::fs::write(tmp.path().join("small.txt"), "one\ntwo\n").unwrap();
 
-    let out = handle_file_request(
-        &policy,
-        &file_read_request(tmp.path(), "small.txt", None, None, Some(1024)),
-    );
-
-    assert_eq!(out.exit_code, Some(0), "unexpected result: {out:?}");
-    assert_eq!(out.stdout.as_deref(), Some("one\ntwo\n"));
+    for (start_line, end_line) in [(None, None), (Some(1), None), (None, Some(1))] {
+        let out = handle_file_request(
+            &policy,
+            &file_read_request(tmp.path(), "small.txt", start_line, end_line, Some(1024)),
+        );
+        assert_eq!(out.exit_code, None, "unexpected success: {out:?}");
+        assert_eq!(out.error.as_deref(), Some("invalid file request"));
+        assert!(out.stdout.is_none());
+    }
 }
 
 #[cfg(unix)]
@@ -76,7 +78,7 @@ fn runner_file_read_rejects_symlink_escape_even_when_policy_allows_target() {
     policy.allowed_roots.push(outside.path().to_path_buf());
     let out = handle_file_request(
         &policy,
-        &file_read_request(project.path(), "leak.txt", None, None, Some(1024)),
+        &file_read_request(project.path(), "leak.txt", Some(1), Some(1), Some(1024)),
     );
 
     assert_eq!(out.exit_code, None);
@@ -219,10 +221,11 @@ fn runner_file_read_allows_exact_generated_files_but_protects_secrets_and_git() 
         std::fs::write(&target, "fixture").unwrap();
         let out = handle_file_request(
             &policy,
-            &file_read_request(tmp.path(), path, None, None, Some(1024)),
+            &file_read_request(tmp.path(), path, Some(1), Some(1), Some(1024)),
         );
         if allowed {
-            assert_eq!(out.stdout.as_deref(), Some("fixture"));
+            let out = file_read_json(out);
+            assert_eq!(out["content"], "fixture");
         } else {
             assert_eq!(
                 out.error.as_deref(),
@@ -240,7 +243,7 @@ fn runner_file_read_rejects_alias_to_secret_inside_project() {
     std::os::unix::fs::symlink(".env", tmp.path().join("alias.txt")).unwrap();
     let out = handle_file_request(
         &project_policy(tmp.path()),
-        &file_read_request(tmp.path(), "alias.txt", None, None, Some(1024)),
+        &file_read_request(tmp.path(), "alias.txt", Some(1), Some(1), Some(1024)),
     );
     assert_eq!(
         out.error.as_deref(),

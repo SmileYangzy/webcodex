@@ -336,7 +336,6 @@ mod tests {
                 SCOPE_SESSION_COLLABORATE,
             ),
             ("POST", "/api/tools/list", SCOPE_RUNTIME_READ),
-            ("POST", "/api/projects/git_status", SCOPE_PROJECT_READ),
             ("POST", "/api/runtime-console/projects", SCOPE_PROJECT_READ),
             (
                 "POST",
@@ -348,7 +347,7 @@ mod tests {
                 "/api/runtime-console/workflow-session",
                 SCOPE_PROJECT_READ,
             ),
-            ("POST", "/api/projects/run_job", SCOPE_JOB_RUN),
+            ("POST", "/api/shell/job", SCOPE_JOB_RUN),
             ("POST", "/api/users/me", SCOPE_ACCOUNT_MANAGE),
             ("POST", "/api/tokens/list", SCOPE_ACCOUNT_MANAGE),
             ("POST", "/api/audit/stats", SCOPE_ACCOUNT_MANAGE),
@@ -411,16 +410,6 @@ mod tests {
         }
         for (label, auth) in [("pat", &pat), ("oauth", &oauth)] {
             assert_eq!(
-                enforce_route_scope(auth, "POST", "/api/projects/git_status"),
-                Err((
-                    Some(SCOPE_PROJECT_READ),
-                    "missing required scope: project:read".to_string()
-                )),
-                "{label} must not bypass missing project:read"
-            );
-        }
-        for (label, auth) in [("pat", &pat), ("oauth", &oauth)] {
-            assert_eq!(
                 enforce_route_scope(auth, "POST", "/api/runtime-console/projects"),
                 Err((
                     Some(SCOPE_PROJECT_READ),
@@ -429,10 +418,6 @@ mod tests {
                 "{label} must not use Runtime Console without project:read"
             );
         }
-        assert!(
-            enforce_route_scope(&shared, "POST", "/api/projects/git_status").is_ok(),
-            "direct shared key should use its declared project:read scope"
-        );
         assert!(
             enforce_route_scope(&shared, "POST", "/api/runtime-console/projects").is_ok(),
             "direct shared key should retain its existing project:read Runtime Console access"

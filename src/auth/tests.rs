@@ -80,7 +80,6 @@ fn is_runner_transport_path_allows_only_the_seven_exact_paths() {
     assert!(!is_runner_transport_path("/api/tools/list"));
     assert!(!is_runner_transport_path("/api/tools/call"));
     assert!(!is_runner_transport_path("/api/projects/list"));
-    assert!(!is_runner_transport_path("/api/jobs/list"));
     assert!(!is_runner_transport_path("/mcp"));
     assert!(!is_runner_transport_path("/api/audit/sessions"));
     assert!(!is_runner_transport_path("/api/users/list"));
@@ -285,9 +284,7 @@ fn gate_router(config: Arc<crate::Config>, db: Arc<crate::Database>) -> Router {
                 .push(Router::with_path("tools/call").post(echo_ok))
                 .push(Router::with_path("future/authenticated-route").post(echo_ok))
                 .push(Router::with_path("projects/list").post(echo_ok))
-                .push(Router::with_path("projects/git_status").post(echo_ok))
-                .push(Router::with_path("projects/run_job").post(echo_ok))
-                .push(Router::with_path("jobs/list").post(echo_ok))
+                .push(Router::with_path("shell/job").post(echo_ok))
                 .push(Router::with_path("audit/sessions").post(echo_ok))
                 .push(Router::with_path("audit/session").post(echo_ok))
                 .push(Router::with_path("audit/stats").post(echo_ok))
@@ -1302,7 +1299,7 @@ fn enforce_token_surface_matrix() {
                 "/api/runtime/status",
                 "/api/projects/list",
                 "/api/tools/list",
-                "/api/jobs/list",
+                "/api/tools/call",
                 "/mcp",
             ],
             runner_transport.to_vec(),
@@ -1968,8 +1965,8 @@ async fn oauth2_scope_gate_matrix() {
     // A granted scope opens exactly its own surface…
     for (scopes, path) in [
         ("runtime:read", "/api/runtime/status"),
-        ("project:read", "/api/projects/git_status"),
-        ("job:run", "/api/projects/run_job"),
+        ("project:read", "/api/projects/list"),
+        ("job:run", "/api/shell/job"),
     ] {
         let (_tmp, service, token) = gate_oauth2_token_with_scopes(scopes).await;
         let (status, body) = gate_send(&service, path, Some(&token)).await;
@@ -1986,14 +1983,10 @@ async fn oauth2_scope_gate_matrix() {
         ),
         (
             "runtime:read",
-            "/api/projects/git_status",
+            "/api/projects/list",
             Some(SCOPE_PROJECT_READ),
         ),
-        (
-            "project:write",
-            "/api/projects/run_job",
-            Some(SCOPE_JOB_RUN),
-        ),
+        ("project:write", "/api/shell/job", Some(SCOPE_JOB_RUN)),
         ("runtime:read", "/oauth/authorize", None),
         ("runtime:read", "/api/shell/agent/register", None),
         ("runtime:read", "/api/future/authenticated-route", None),
@@ -2044,19 +2037,14 @@ async fn api_token_obeys_declared_scope_and_unknown_route_policy() {
 
     for path in [
         "/api/runtime/status",
-        "/api/projects/git_status",
-        "/api/projects/run_job",
+        "/api/projects/list",
+        "/api/shell/job",
     ] {
         let (status, body) = gate_send(&service, path, Some(&user_token)).await;
         assert_eq!(status, StatusCode::OK, "{} body: {:?}", path, body);
     }
 
-    let (status, body) = gate_send(
-        &service,
-        "/api/projects/git_status",
-        Some(&runtime_only_token),
-    )
-    .await;
+    let (status, body) = gate_send(&service, "/api/projects/list", Some(&runtime_only_token)).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "body: {body:?}");
     assert_ne!(body["error"], "insufficient_scope");
     assert!(body["error"]

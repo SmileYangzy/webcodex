@@ -254,14 +254,6 @@ impl RunnerRegistry {
                 "apply_patch_match_metadata capability requires apply_patch capability".to_string(),
             );
         }
-        if runner_features.supports(RunnerFeature::ApplyPatchStrictMatching)
-            && !runner_features.supports(RunnerFeature::ApplyPatchMatchMetadata)
-        {
-            return Err(
-                "apply_patch_strict_matching capability requires apply_patch_match_metadata capability"
-                    .to_string(),
-            );
-        }
         if runner_features.supports(RunnerFeature::ApplyPatchMatchingMode)
             && !runner_features.supports(RunnerFeature::ApplyPatchMatchMetadata)
         {

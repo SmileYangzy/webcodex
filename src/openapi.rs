@@ -463,12 +463,6 @@ mod tests {
             "listRuntimeTools",
             "listProjects",
             "getRuntimeStatus",
-            "getProjectGitStatus",
-            "listProjectFiles",
-            "applyUnifiedDiff",
-            "runProjectShellCommand",
-            "startProjectShellJob",
-            "getRuntimeJobTail",
             "callRuntimeTool",
         ] {
             assert!(!ids.contains(legacy));

@@ -258,8 +258,8 @@ KEY_B_AGENTS="$(post "$SHARED_KEY_B" /api/runtime/status '{}')"
 [ "$(printf '%s' "$KEY_B_AGENTS" | json_field output.agents.count)" = "0" ] \
     || die "Key B discovered Key A Runner"
 
-GUESSED_RESPONSE="$(post "$SHARED_KEY_B" /api/projects/git_status \
-    '{"project":"agent:shared-runner:project-a"}')"
+GUESSED_RESPONSE="$(post "$SHARED_KEY_B" /api/tools/call \
+    '{"tool":"git_status","params":{"project":"agent:shared-runner:project-a"}}')"
 [ "$(printf '%s' "$GUESSED_RESPONSE" | json_field success)" = "False" ] \
     || die "Key B operated on guessed Key A project id"
 [ "$(printf '%s' "$GUESSED_RESPONSE" | json_field output.error_kind)" = "unknown_project" ] \

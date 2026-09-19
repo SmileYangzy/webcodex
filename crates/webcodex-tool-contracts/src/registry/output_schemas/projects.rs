@@ -72,13 +72,6 @@ fn register_project_fields() -> Vec<(&'static str, Value)> {
             ),
         ),
         (
-            "projects_config_path",
-            schema_type(
-                "string",
-                "Deprecated compatibility alias of project_record_path. Project onboarding result metadata path for one Runner project registration record TOML file; not file content.",
-            ),
-        ),
-        (
             "created_config",
             schema_type(
                 "boolean",

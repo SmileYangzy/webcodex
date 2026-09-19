@@ -526,7 +526,6 @@ fn path_resolution_success(
         "changed": registered,
         "recovered": !registered,
         "project_record_path": project_record_path.map(|path| path.to_string_lossy().to_string()),
-        "projects_config_path": project_record_path.map(|path| path.to_string_lossy().to_string()),
     })
 }
 
