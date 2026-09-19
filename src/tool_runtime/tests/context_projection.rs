@@ -162,6 +162,7 @@ async fn context_projection_is_explicit_deduped_open_ended_and_nonfatal() {
             vec![
                 "webcodex.workflow".to_string(),
                 "future.material".to_string(),
+                "workflow.resume".to_string(),
                 "webcodex.workflow".to_string(),
                 "project.instructions".to_string(),
             ],
@@ -176,7 +177,7 @@ async fn context_projection_is_explicit_deduped_open_ended_and_nonfatal() {
     let materials = result.output["context_projection"]["materials"]
         .as_array()
         .unwrap();
-    assert_eq!(materials.len(), 3, "duplicates must be projected once");
+    assert_eq!(materials.len(), 4, "duplicates must be projected once");
     assert_eq!(materials[0]["key"], "webcodex.workflow");
     assert_eq!(
         materials[0]["projection"],
@@ -190,9 +191,12 @@ async fn context_projection_is_explicit_deduped_open_ended_and_nonfatal() {
     );
     assert_eq!(materials[1]["key"], "future.material");
     assert_eq!(materials[1]["status"], "unsupported");
-    assert_eq!(materials[2]["key"], "project.instructions");
+    assert_eq!(materials[2]["key"], "workflow.resume");
     assert_eq!(materials[2]["status"], "unavailable");
-    assert_eq!(materials[2]["reason_code"], "project_target_unavailable");
+    assert_eq!(materials[2]["reason_code"], "client_window_unavailable");
+    assert_eq!(materials[3]["key"], "project.instructions");
+    assert_eq!(materials[3]["status"], "unavailable");
+    assert_eq!(materials[3]["reason_code"], "project_target_unavailable");
     assert!(
         serde_json::to_vec(&result.output["context_projection"])
             .unwrap()

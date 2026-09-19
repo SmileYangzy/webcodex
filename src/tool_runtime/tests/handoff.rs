@@ -4456,6 +4456,341 @@ async fn handoff_marks_basis_incomplete_when_session_changes_during_workspace_re
             .unwrap()
             .contains(&json!("session_changed_during_snapshot")));
         assert!(serde_json::to_vec(brief).unwrap().len() <= 8192);
+        assert_eq!(
+            result.output["workspace_continuity"]["status"], "unproven",
+            "a Session revision race must invalidate continuity attribution"
+        );
         assert!(result.output.get("session_context_revision").is_none());
     }
+}
+
+#[test]
+fn workspace_continuity_classifies_exact_session_path_evidence_without_ownership_claims() {
+    use crate::tool_runtime::handoff::workspace_continuity_projection_for_test;
+
+    let project = |files: Value, total: usize, returned: usize, truncated: bool| {
+        json!({
+            "git_available": true,
+            "clean": total == 0,
+            "files": files,
+            "files_total": total,
+            "files_returned": returned,
+            "files_truncated": truncated
+        })
+    };
+
+    let clean = workspace_continuity_projection_for_test(
+        &project(json!([]), 0, 0, false),
+        &[json!("src/lib.rs")],
+        true,
+    );
+    assert_eq!(clean["status"], "clean");
+
+    let inconsistent_clean_flag = workspace_continuity_projection_for_test(
+        &json!({
+            "git_available": true,
+            "clean": false,
+            "files": [],
+            "files_total": 0,
+            "files_returned": 0,
+            "files_truncated": false
+        }),
+        &[],
+        true,
+    );
+    assert_eq!(inconsistent_clean_flag["status"], "unproven");
+
+    let fully = workspace_continuity_projection_for_test(
+        &project(
+            json!([{"path":"src/lib.rs"}, {"path":"src/main.rs"}]),
+            2,
+            2,
+            false,
+        ),
+        &[
+            json!("src/lib.rs"),
+            json!("src/main.rs"),
+            json!("README.md"),
+        ],
+        true,
+    );
+    assert_eq!(fully["status"], "consistent_with_session_history");
+    assert_eq!(fully["overlap_count"], 2);
+    assert_eq!(fully["unattributed_paths_count"], 0);
+
+    let partial = workspace_continuity_projection_for_test(
+        &project(
+            json!([{"path":"src/lib.rs"}, {"path":"notes.txt"}]),
+            2,
+            2,
+            false,
+        ),
+        &[json!("src/lib.rs")],
+        true,
+    );
+    assert_eq!(partial["status"], "partially_attributed");
+    assert_eq!(partial["unattributed_paths_count"], 1);
+
+    let unattributed = workspace_continuity_projection_for_test(
+        &project(json!([{"path":"notes.txt"}]), 1, 1, false),
+        &[json!("src/lib.rs")],
+        true,
+    );
+    assert_eq!(unattributed["status"], "unattributed");
+    assert!(!serde_json::to_string(&unattributed)
+        .unwrap()
+        .contains("external"));
+
+    let incomplete_workspace = workspace_continuity_projection_for_test(
+        &project(json!([{"path":"src/lib.rs"}]), 2, 1, true),
+        &[json!("src/lib.rs")],
+        true,
+    );
+    assert_eq!(incomplete_workspace["status"], "unproven");
+
+    let evicted_history = workspace_continuity_projection_for_test(
+        &project(json!([{"path":"src/lib.rs"}]), 1, 1, false),
+        &[json!("src/lib.rs")],
+        false,
+    );
+    assert_eq!(evicted_history["status"], "unproven");
+}
+
+#[tokio::test]
+async fn session_handoff_workspace_continuity_uses_only_exact_session_history() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_git_repo(tmp.path());
+    commit_file(tmp.path(), "README.md", "before\n", "initial");
+
+    let runtime = test_runtime();
+    let client_id = "handoff-workspace-continuity";
+    let project = register_runner_project_at_path(&runtime, client_id, "demo", tmp.path()).await;
+    let session = runtime.sessions.start_session(
+        Some(project.clone()),
+        Some("implementation session".to_string()),
+    );
+    let unrelated = runtime.sessions.start_session(
+        Some(project.clone()),
+        Some("unrelated reviewer session".to_string()),
+    );
+
+    record_handoff_tool_event(
+        &runtime,
+        &session.session_id,
+        "apply_text_edits",
+        json!({
+            "project": project,
+            "changes": [{
+                "kind": "edit",
+                "path": "README.md",
+                "edits": [{
+                    "kind": "replace_exact",
+                    "old_text": "before",
+                    "new_text": "after"
+                }]
+            }]
+        }),
+        true,
+        json!({"state_changed": true, "changed_paths": ["README.md"]}),
+    );
+    record_handoff_tool_event(
+        &runtime,
+        &unrelated.session_id,
+        "apply_text_edits",
+        json!({
+            "project": project,
+            "changes": [{
+                "kind": "edit",
+                "path": "unrelated-secret.txt",
+                "edits": [{
+                    "kind": "replace_exact",
+                    "old_text": "x",
+                    "new_text": "y"
+                }]
+            }]
+        }),
+        true,
+        json!({"state_changed": true, "changed_paths": ["unrelated-secret.txt"]}),
+    );
+    std::fs::write(tmp.path().join("README.md"), "after\n").unwrap();
+
+    let runtime_for_task = runtime.clone();
+    let session_id = session.session_id.clone();
+    let project_for_task = project.clone();
+    let task = tokio::spawn(async move {
+        runtime_for_task
+            .dispatch(ToolCall::SessionHandoffSummary {
+                session_id,
+                project: Some(project_for_task),
+                include_workspace: Some(true),
+                include_checkpoints: Some(false),
+                include_validation: Some(false),
+                diagnostic: false,
+                limit: None,
+            })
+            .await
+    });
+    let request = wait_for_patch_agent_request(&runtime, client_id).await;
+    complete_agent_request_by_running_locally(&runtime, client_id, request).await;
+    let result = task.await.unwrap();
+
+    assert!(result.success, "{result:?}");
+    assert_eq!(
+        result.output["workspace_continuity"]["status"],
+        "consistent_with_session_history"
+    );
+    assert_eq!(
+        result.output["workspace_continuity"]["current_dirty_paths_count"],
+        1
+    );
+    assert_eq!(
+        result.output["workspace_continuity"]["session_changed_paths_count"],
+        1
+    );
+    let projected = serde_json::to_string(&result.output).unwrap();
+    assert!(!projected.contains("unrelated-secret.txt"));
+    assert!(result.output.get("workspace").is_none());
+}
+
+#[tokio::test]
+async fn session_handoff_workspace_continuity_uses_full_retained_history_not_summary_tail() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_git_repo(tmp.path());
+    commit_file(tmp.path(), "README.md", "before\n", "initial");
+
+    let runtime = test_runtime();
+    let client_id = "handoff-workspace-continuity-long";
+    let project = register_runner_project_at_path(&runtime, client_id, "demo", tmp.path()).await;
+    let session = runtime.sessions.start_session(
+        Some(project.clone()),
+        Some("long implementation session".to_string()),
+    );
+
+    record_handoff_tool_event(
+        &runtime,
+        &session.session_id,
+        "apply_text_edits",
+        json!({
+            "project": project,
+            "changes": [{
+                "kind": "edit",
+                "path": "README.md",
+                "edits": [{
+                    "kind": "replace_exact",
+                    "old_text": "before",
+                    "new_text": "after"
+                }]
+            }]
+        }),
+        true,
+        json!({"state_changed": true, "changed_paths": ["README.md"]}),
+    );
+    for _ in 0..110 {
+        record_handoff_tool_event(
+            &runtime,
+            &session.session_id,
+            "read_files",
+            json!({"project": project, "items": [{"path": "README.md"}]}),
+            true,
+            json!({"files": []}),
+        );
+    }
+    let display_tail = runtime
+        .sessions
+        .summary(&session.session_id, Some(200))
+        .unwrap();
+    assert!(display_tail.events_truncated);
+    assert!(!display_tail.retention_truncated);
+    std::fs::write(tmp.path().join("README.md"), "after\n").unwrap();
+
+    let runtime_for_task = runtime.clone();
+    let session_id = session.session_id.clone();
+    let project_for_task = project.clone();
+    let task = tokio::spawn(async move {
+        runtime_for_task
+            .dispatch(ToolCall::SessionHandoffSummary {
+                session_id,
+                project: Some(project_for_task),
+                include_workspace: Some(true),
+                include_checkpoints: Some(false),
+                include_validation: Some(false),
+                diagnostic: false,
+                limit: None,
+            })
+            .await
+    });
+    let request = wait_for_patch_agent_request(&runtime, client_id).await;
+    complete_agent_request_by_running_locally(&runtime, client_id, request).await;
+    let result = task.await.unwrap();
+
+    assert!(result.success, "{result:?}");
+    assert_eq!(
+        result.output["workspace_continuity"]["status"], "consistent_with_session_history",
+        "model-facing Session tail truncation must not erase complete durable path evidence"
+    );
+    assert_eq!(
+        result.output["workspace_continuity"]["session_changed_paths_count"],
+        1
+    );
+}
+
+#[tokio::test]
+async fn session_handoff_workspace_continuity_is_unproven_when_changed_path_evidence_hits_bound() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_git_repo(tmp.path());
+    std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+    commit_file(tmp.path(), "src/file-000.rs", "baseline\n", "initial");
+
+    let runtime = test_runtime();
+    let client_id = "handoff-workspace-continuity-bound";
+    let project = register_runner_project_at_path(&runtime, client_id, "demo", tmp.path()).await;
+    let session = runtime.sessions.start_session(
+        Some(project.clone()),
+        Some("bounded change evidence".to_string()),
+    );
+
+    let changed_paths = (0..202)
+        .map(|index| format!("src/file-{index:03}.rs"))
+        .collect::<Vec<_>>();
+    record_handoff_tool_event(
+        &runtime,
+        &session.session_id,
+        "apply_patch",
+        json!({"project": project, "patch": "*** Begin Patch\n*** End Patch"}),
+        true,
+        json!({"state_changed": true, "changed_paths": changed_paths}),
+    );
+
+    std::fs::write(tmp.path().join("src/file-000.rs"), "dirty\n").unwrap();
+
+    let runtime_for_task = runtime.clone();
+    let session_id = session.session_id.clone();
+    let project_for_task = project.clone();
+    let task = tokio::spawn(async move {
+        runtime_for_task
+            .dispatch(ToolCall::SessionHandoffSummary {
+                session_id,
+                project: Some(project_for_task),
+                include_workspace: Some(true),
+                include_checkpoints: Some(false),
+                include_validation: Some(false),
+                diagnostic: false,
+                limit: None,
+            })
+            .await
+    });
+    let request = wait_for_patch_agent_request(&runtime, client_id).await;
+    complete_agent_request_by_running_locally(&runtime, client_id, request).await;
+    let result = task.await.unwrap();
+
+    assert!(result.success, "{result:?}");
+    assert_eq!(result.output["workspace_continuity"]["status"], "unproven");
+    assert_eq!(
+        result.output["workspace_continuity"]["current_dirty_paths_count"],
+        1
+    );
+    assert_eq!(
+        result.output["workspace_continuity"]["overlap_count"], 1,
+        "path overlap remains observable but cannot certify incomplete Session evidence"
+    );
 }

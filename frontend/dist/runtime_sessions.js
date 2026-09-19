@@ -1,6 +1,9 @@
 import { productNode, productButton, productName, productTime } from "./runtime_product_view.js";
 import { translate } from "./runtime_i18n.js";
 import { formatLivenessPresentation } from "./runtime_activity.js";
+export function isExactRuntimeSessionId(value) {
+    return /^wc_sess_(?:[A-Za-z0-9_-]{16}|[0-9a-f]{32})$/.test(value.trim());
+}
 export function runtimeSessionIsWorking(row) { return row.running_call === true || Number(row.running_jobs) > 0; }
 export function runtimeSessionIdentity(row) { return String(row.project_id || "") + ":" + String(row.session_id || ""); }
 export function runtimeSessionInventory(recent, projectRows = []) {
@@ -66,6 +69,10 @@ export class RuntimeSessionNavigation {
         this.language = null;
         this.optionsSignature = "";
         this.projectRequest = null;
+        this.locatorRequest = null;
+        this.locatedRow = null;
+        this.locatedSessionId = "";
+        this.locatorState = "idle";
         this.scopedProject = "";
         this.scopedRows = [];
         this.scopedState = "loading";
@@ -75,6 +82,11 @@ export class RuntimeSessionNavigation {
     reset() {
         this.projectRequest?.abort();
         this.projectRequest = null;
+        this.locatorRequest?.abort();
+        this.locatorRequest = null;
+        this.locatedRow = null;
+        this.locatedSessionId = "";
+        this.locatorState = "idle";
         this.scopedProject = "";
         this.scopedRows = [];
         this.scopedState = "loading";
@@ -84,6 +96,48 @@ export class RuntimeSessionNavigation {
         this.signature = this.optionsSignature = "";
         this.language = null;
         Object.assign(this.filters, { runner: "", project: "", query: "" });
+    }
+    async refreshLocator() {
+        const sessionId = this.filters.query.trim();
+        this.locatorRequest?.abort();
+        this.locatorRequest = null;
+        if (!this.services.locateSession || !isExactRuntimeSessionId(sessionId) || this.filters.project) {
+            this.locatedRow = null;
+            this.locatedSessionId = "";
+            this.locatorState = "idle";
+            this.render();
+            return;
+        }
+        const sameLocatedSession = this.locatedSessionId === sessionId;
+        if (!sameLocatedSession)
+            this.locatedRow = null;
+        this.locatedSessionId = sessionId;
+        this.locatorState = "loading";
+        const request = new AbortController();
+        this.locatorRequest = request;
+        this.render();
+        const response = await this.services.locateSession(sessionId, request.signal);
+        if (request !== this.locatorRequest || request.signal.aborted || sessionId !== this.filters.query.trim())
+            return;
+        this.locatorRequest = null;
+        if (response?.status === 401) {
+            this.services.unauthorized();
+            return;
+        }
+        if (response?.status === 403 || response?.status === 404) {
+            this.locatedRow = null;
+            this.locatorState = "not_found";
+        }
+        else if (!response?.ok || response.data?.session_id !== sessionId || !response.data?.project_id || !response.data?.client_id) {
+            if (!sameLocatedSession)
+                this.locatedRow = null;
+            this.locatorState = "stale";
+        }
+        else {
+            this.locatedRow = response.data;
+            this.locatorState = "available";
+        }
+        this.render();
     }
     async refreshProject() {
         const project = this.filters.project;
@@ -140,6 +194,20 @@ export class RuntimeSessionNavigation {
             context.stale = this.scopedState === "stale";
             context.truncated = this.scopedTruncated;
         }
+        else if (this.locatedRow) {
+            context.rows = runtimeSessionInventory(context.rows, [this.locatedRow]);
+            context.loading = false;
+            context.available = true;
+            if (this.locatorState === "available" && isExactRuntimeSessionId(this.filters.query))
+                context.truncated = false;
+        }
+        else if ((this.locatorState === "not_found") && isExactRuntimeSessionId(this.filters.query)) {
+            const exactSessionId = this.filters.query.trim();
+            context.rows = context.rows.filter(row => String(row.session_id || "") !== exactSessionId);
+            context.loading = false;
+            context.available = true;
+            context.truncated = false;
+        }
         if (this.root !== root || this.language !== context.language || !this.list) {
             this.root = root;
             this.language = context.language;
@@ -155,7 +223,7 @@ export class RuntimeSessionNavigation {
                 select.id = id;
                 select.setAttribute("aria-label", tr(label));
                 select.addEventListener("change", () => { this.filters[key] = select.value; if (key === "runner")
-                    this.filters.project = ""; this.render(); });
+                    this.filters.project = ""; this.render(); void this.refreshLocator(); });
                 field.appendChild(select);
                 filters.appendChild(field);
             };
@@ -168,7 +236,7 @@ export class RuntimeSessionNavigation {
             search.type = "search";
             search.maxLength = 200;
             search.value = this.filters.query;
-            search.addEventListener("input", () => { this.filters.query = search.value; this.render(); });
+            search.addEventListener("input", () => { this.filters.query = search.value; this.render(); void this.refreshLocator(); });
             label.appendChild(search);
             filters.appendChild(label);
             root.appendChild(filters);
@@ -196,9 +264,12 @@ export class RuntimeSessionNavigation {
         }
         const rows = filterRuntimeSessions(context.rows, this.filters);
         const status = document.getElementById("runtime-global-session-status");
+        const exactLocator = !this.scopedProject && isExactRuntimeSessionId(this.filters.query);
         if (status)
-            status.textContent = context.loading ? tr("Loading Sessions…") : !context.available ? tr(this.scopedProject ? "Session list unavailable. Check access to this Project." : "Runtime-wide Sessions require runtime:read. Open an authorized Project to inspect its Sessions.")
-                : (context.stale ? tr("Refresh failed · showing previous data") + " · " : "") + rows.length + " / " + context.rows.length + (context.truncated ? " · " + tr("Recent results are bounded; filter a Project for its Sessions.") : "");
+            status.textContent = exactLocator && this.locatorState === "loading" && !rows.length ? tr("Locating Session…")
+                : exactLocator && this.locatorState === "stale" ? tr("Exact Session lookup failed · showing previous data") + " · " + rows.length + " / " + context.rows.length
+                    : context.loading ? tr("Loading Sessions…") : !context.available ? tr(this.scopedProject ? "Session list unavailable. Check access to this Project." : "Runtime-wide Sessions require runtime:read. Open an authorized Project to inspect its Sessions.")
+                        : (context.stale ? tr("Refresh failed · showing previous data") + " · " : "") + rows.length + " / " + context.rows.length + (context.truncated ? " · " + tr("The Runtime inventory is incomplete; some retained Sessions may not be shown.") : "");
         const signature = JSON.stringify([context.language, rows, context.selected, context.available]);
         if (signature === this.signature)
             return;

@@ -1,7 +1,7 @@
 import { translate, type RuntimeLanguage } from "./runtime_i18n.js";
 
 export type ProductProject = {
-  id: string; client_id: string; name?: string; path?: string; connected?: boolean;
+  id: string; client_id: string; project_ref?: string; name?: string; path?: string; connected?: boolean;
   sessions?: { active_sessions?: number; latest_updated_at?: number; sessions_truncated?: boolean };
 };
 export type ProductGit = { branch?: string; non_git_project?: boolean; clean?: boolean; files?: { path: string; status?: string }[]; files_truncated?: boolean };

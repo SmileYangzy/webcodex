@@ -642,12 +642,21 @@ test("project-scoped window activity contracts maintain separation, fencing, and
     readFile(new URL("../src/runtime_navigation.ts", import.meta.url), "utf8"),
   ]);
 
+  // Product Projects must use the complete fetched inventory, not the Home recent-project snapshot.
+  const productServicesStart = source.indexOf("const productServices");
+  const productServicesEnd = source.indexOf("const productWorkspace", productServicesStart);
+  const productServices = source.slice(productServicesStart, productServicesEnd);
+  assert.match(productServices, /projects:\s*effectiveProjects\(projectRows\)/);
+  assert.doesNotMatch(productServices, /projects:\s*homeProjectRows/);
+  const productSource = await readFile(new URL("../src/runtime_product.ts", import.meta.url), "utf8");
+  assert.match(productSource, /project\.id, project\.project_ref, project\.name, productName\(project\), project\.path, project\.client_id/);
+
   // Project is a Window filter, never a prerequisite or a duplicate Session sidebar.
   assert.match(html, /id="runtime-window-project-filter"/);
   assert.match(html, /id="runtime-window-empty-title"/);
   assert.doesNotMatch(html, /id="runtime-project-window-activity-panel"/);
 
-  // Source contract: fetchProjectWindows fences by project and limits to 10
+  // Source contract: fetchProjectWindows fences by project and requests the retained inventory.
   const fetchProjWindowsStart = source.indexOf("async function fetchProjectWindows");
   const fetchProjWindowsEnd = source.indexOf("function hideDetail", fetchProjWindowsStart);
   const fetchProjWindows = source.slice(fetchProjWindowsStart, fetchProjWindowsEnd);
@@ -661,7 +670,7 @@ test("project-scoped window activity contracts maintain separation, fencing, and
 
   // Global windows are fetched independently; the controller owns refresh fences.
   const windowStateSource = await readFile(new URL("../src/runtime_window_state.ts", import.meta.url), "utf8");
-  assert.match(windowStateSource, /post\("windows", \{ limit: 100 \}/);
+  assert.match(windowStateSource, /post\("windows", \{ limit: 2_000 \}/);
   assert.match(windowStateSource, /ownsWindowResponse\(this.detailRequest, request\)/);
   assert.match(source, /windowController.refresh\(refreshSelected\)/);
 

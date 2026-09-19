@@ -71,7 +71,7 @@ export class RuntimeWindowController {
     const request = new AbortController(); this.globalRequest = request;
     const revision = ++this.globalRevision;
     if (this.snapshot.globalAvailability === "idle") { this.snapshot.globalAvailability = "loading"; this.publish(); }
-    const response = await this.services.post("windows", { limit: 100 }, request.signal);
+    const response = await this.services.post("windows", { limit: 2_000 }, request.signal);
     if (!ownsWindowResponse(this.globalRequest, request) || revision !== this.globalRevision) return;
     this.globalRequest = null;
     if (!response) return;
@@ -99,7 +99,7 @@ export class RuntimeWindowController {
     const project = this.snapshot.project;
     const globalRevision = project ? this.globalRevision : ++this.globalRevision;
     if (!project) { this.globalRequest?.abort(); this.globalRequest = null; }
-    const response = await this.services.post("windows", { limit: 100, ...(project ? { project } : {}) }, request.signal);
+    const response = await this.services.post("windows", { limit: 2_000, ...(project ? { project } : {}) }, request.signal);
     if (!ownsWindowResponse(this.listRequest, request)) return;
     this.listRequest = null;
     if (!response) return;
@@ -165,7 +165,7 @@ export class RuntimeWindowController {
     this.detailRequest?.abort();
     const request = new AbortController(); this.detailRequest = request;
     if (!this.snapshot.detail) { this.snapshot.detailAvailability = "loading"; this.publish(); }
-    const response = await this.services.post("window", { client_window_key: key, activity_limit: 100, session_limit: 50 }, request.signal);
+    const response = await this.services.post("window", { client_window_key: key, activity_limit: 2_000, session_limit: 100 }, request.signal);
     if (!ownsWindowResponse(this.detailRequest, request) || key !== this.snapshot.selectedKey) return;
     this.detailRequest = null;
     if (!response) return;

@@ -1273,6 +1273,7 @@ impl ToolRuntime {
                 auth,
                 material_capabilities,
                 context_guidance_profile,
+                window,
             )
             .await;
         }
@@ -1917,6 +1918,7 @@ impl ToolRuntime {
             auth,
             material_capabilities,
             context_guidance_profile,
+            window,
         )
         .await;
         sparsify_terminal_structured_execution_success(tool_name, &mut result);

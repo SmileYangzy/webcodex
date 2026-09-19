@@ -53,7 +53,7 @@ export class RuntimeWindowController {
             this.snapshot.globalAvailability = "loading";
             this.publish();
         }
-        const response = await this.services.post("windows", { limit: 100 }, request.signal);
+        const response = await this.services.post("windows", { limit: 2000 }, request.signal);
         if (!ownsWindowResponse(this.globalRequest, request) || revision !== this.globalRevision)
             return;
         this.globalRequest = null;
@@ -99,7 +99,7 @@ export class RuntimeWindowController {
             this.globalRequest?.abort();
             this.globalRequest = null;
         }
-        const response = await this.services.post("windows", { limit: 100, ...(project ? { project } : {}) }, request.signal);
+        const response = await this.services.post("windows", { limit: 2000, ...(project ? { project } : {}) }, request.signal);
         if (!ownsWindowResponse(this.listRequest, request))
             return;
         this.listRequest = null;
@@ -191,7 +191,7 @@ export class RuntimeWindowController {
             this.snapshot.detailAvailability = "loading";
             this.publish();
         }
-        const response = await this.services.post("window", { client_window_key: key, activity_limit: 100, session_limit: 50 }, request.signal);
+        const response = await this.services.post("window", { client_window_key: key, activity_limit: 2000, session_limit: 100 }, request.signal);
         if (!ownsWindowResponse(this.detailRequest, request) || key !== this.snapshot.selectedKey)
             return;
         this.detailRequest = null;

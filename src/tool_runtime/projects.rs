@@ -30,6 +30,7 @@ const AUTO_REGISTERED_PROJECT_SOURCE: &str = "auto_registered";
 
 const LIST_PROJECTS_MAX_QUERY_CHARS: usize = 200;
 const LIST_PROJECTS_MAX_RESULTS: usize = 100;
+const RUNTIME_CONSOLE_LIST_PROJECTS_MAX_RESULTS: usize = 2_000;
 
 #[derive(Debug, Default)]
 pub(crate) struct ListProjectsOptions {
@@ -49,6 +50,7 @@ pub(super) struct ProjectCandidate {
 
 fn validate_list_projects_options(
     options: &ListProjectsOptions,
+    max_results: usize,
 ) -> Result<(Option<String>, Option<usize>), ToolResult> {
     if options
         .client_id
@@ -95,8 +97,8 @@ fn validate_list_projects_options(
         options.client_id.is_some() || options.project.is_some() || options.query.is_some();
     let limit = options
         .limit
-        .map(|limit| limit.clamp(1, LIST_PROJECTS_MAX_RESULTS))
-        .or_else(|| filtered.then_some(LIST_PROJECTS_MAX_RESULTS));
+        .map(|limit| limit.clamp(1, max_results))
+        .or_else(|| filtered.then_some(max_results));
     Ok((query, limit))
 }
 
@@ -225,7 +227,39 @@ impl ToolRuntime {
         auth: Option<&AuthContext>,
         options: ListProjectsOptions,
     ) -> ToolResult {
-        let (query, limit) = match validate_list_projects_options(&options) {
+        self.list_projects_with_options_cap(auth, options, LIST_PROJECTS_MAX_RESULTS)
+            .await
+    }
+
+    pub(crate) async fn list_projects_for_runtime_console(
+        &self,
+        auth: Option<&AuthContext>,
+        client_id: Option<String>,
+        project: Option<String>,
+        query: Option<String>,
+        limit: usize,
+    ) -> ToolResult {
+        self.list_projects_with_options_cap(
+            auth,
+            ListProjectsOptions {
+                client_id,
+                project,
+                query,
+                limit: Some(limit),
+                summary_only: false,
+            },
+            RUNTIME_CONSOLE_LIST_PROJECTS_MAX_RESULTS,
+        )
+        .await
+    }
+
+    async fn list_projects_with_options_cap(
+        &self,
+        auth: Option<&AuthContext>,
+        options: ListProjectsOptions,
+        max_results: usize,
+    ) -> ToolResult {
+        let (query, limit) = match validate_list_projects_options(&options, max_results) {
             Ok(validated) => validated,
             Err(result) => return result,
         };
@@ -280,10 +314,11 @@ impl ToolRuntime {
         options: ListProjectsOptions,
         clients: &[crate::runner_protocol::RunnerView],
     ) -> ToolResult {
-        let (query, limit) = match validate_list_projects_options(&options) {
-            Ok(validated) => validated,
-            Err(result) => return result,
-        };
+        let (query, limit) =
+            match validate_list_projects_options(&options, LIST_PROJECTS_MAX_RESULTS) {
+                Ok(validated) => validated,
+                Err(result) => return result,
+            };
         let semantic_clients = clients
             .iter()
             .cloned()

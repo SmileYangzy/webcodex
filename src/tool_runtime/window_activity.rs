@@ -510,6 +510,13 @@ fn principal_visible(request: &ActiveWindowRequest, principal: Option<(&str, &st
     }
 }
 
+pub(crate) fn active_window_request_matches_principal(
+    request: &ActiveWindowRequest,
+    principal: (&str, &str),
+) -> bool {
+    principal_visible(request, Some(principal))
+}
+
 pub(crate) async fn window_project_visible_cached(
     runtime: &super::ToolRuntime,
     auth: &AuthContext,

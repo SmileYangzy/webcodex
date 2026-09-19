@@ -174,6 +174,16 @@ pub(super) const ROUTES: &[RouteSpec] = &[
         AuthMiddleware,
     ),
     route(
+        RuntimeConsoleWorkflowSessionLocate,
+        Post,
+        "/api/runtime-console/workflow-session-locate",
+        Require(SCOPE_PROJECT_READ),
+        RuntimeConsole,
+        Hidden,
+        Other,
+        AuthMiddleware,
+    ),
+    route(
         RuntimeConsoleWorkflowSession,
         Post,
         "/api/runtime-console/workflow-session",

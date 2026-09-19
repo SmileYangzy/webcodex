@@ -4,6 +4,9 @@ import { formatLivenessPresentation } from "./runtime_activity.js";
 import type { RuntimeApiResponse } from "./runtime_api.js";
 
 export interface RuntimeSessionFilters { runner: string; project: string; query: string }
+export function isExactRuntimeSessionId(value: string): boolean {
+  return /^wc_sess_(?:[A-Za-z0-9_-]{16}|[0-9a-f]{32})$/.test(value.trim());
+}
 export function runtimeSessionIsWorking(row: any): boolean { return row.running_call === true || Number(row.running_jobs) > 0; }
 export function runtimeSessionIdentity(row: any): string { return String(row.project_id || "") + ":" + String(row.session_id || ""); }
 export function runtimeSessionInventory(recent: any[], projectRows: any[] = []): any[] {
@@ -56,6 +59,10 @@ export class RuntimeSessionNavigation {
   private language: RuntimeLanguage | null = null;
   private optionsSignature = "";
   private projectRequest: AbortController | null = null;
+  private locatorRequest: AbortController | null = null;
+  private locatedRow: any | null = null;
+  private locatedSessionId = "";
+  private locatorState: "idle" | "loading" | "available" | "not_found" | "stale" = "idle";
   private scopedProject = "";
   private scopedRows: any[] = [];
   private scopedState: "loading" | "available" | "stale" | "unavailable" = "loading";
@@ -65,13 +72,39 @@ export class RuntimeSessionNavigation {
     context: () => { language: RuntimeLanguage; rows: any[]; projects: any[]; runners: any[]; selected: string; available: boolean; stale: boolean; loading: boolean; truncated: boolean };
     select: (row: any) => void;
     projectSessions: (project: string, signal: AbortSignal) => Promise<RuntimeApiResponse>;
+    locateSession?: (sessionId: string, signal: AbortSignal) => Promise<RuntimeApiResponse>;
     unauthorized: () => void;
   }) {}
   reset(): void {
     this.projectRequest?.abort(); this.projectRequest = null;
+    this.locatorRequest?.abort(); this.locatorRequest = null;
+    this.locatedRow = null; this.locatedSessionId = ""; this.locatorState = "idle";
     this.scopedProject = ""; this.scopedRows = []; this.scopedState = "loading"; this.rowButtons.clear();
     this.root?.replaceChildren(); this.root = this.list = null; this.signature = this.optionsSignature = ""; this.language = null;
     Object.assign(this.filters, { runner: "", project: "", query: "" });
+  }
+  async refreshLocator(): Promise<void> {
+    const sessionId = this.filters.query.trim();
+    this.locatorRequest?.abort(); this.locatorRequest = null;
+    if (!this.services.locateSession || !isExactRuntimeSessionId(sessionId) || this.filters.project) {
+      this.locatedRow = null; this.locatedSessionId = ""; this.locatorState = "idle"; this.render(); return;
+    }
+    const sameLocatedSession = this.locatedSessionId === sessionId;
+    if (!sameLocatedSession) this.locatedRow = null;
+    this.locatedSessionId = sessionId; this.locatorState = "loading";
+    const request = new AbortController(); this.locatorRequest = request; this.render();
+    const response = await this.services.locateSession(sessionId, request.signal);
+    if (request !== this.locatorRequest || request.signal.aborted || sessionId !== this.filters.query.trim()) return;
+    this.locatorRequest = null;
+    if (response?.status === 401) { this.services.unauthorized(); return; }
+    if (response?.status === 403 || response?.status === 404) { this.locatedRow = null; this.locatorState = "not_found"; }
+    else if (!response?.ok || response.data?.session_id !== sessionId || !response.data?.project_id || !response.data?.client_id) {
+      if (!sameLocatedSession) this.locatedRow = null;
+      this.locatorState = "stale";
+    } else {
+      this.locatedRow = response.data; this.locatorState = "available";
+    }
+    this.render();
   }
   async refreshProject(): Promise<void> {
     const project = this.filters.project;
@@ -104,6 +137,14 @@ export class RuntimeSessionNavigation {
       context.available = this.scopedState !== "unavailable";
       context.stale = this.scopedState === "stale";
       context.truncated = this.scopedTruncated;
+    } else if (this.locatedRow) {
+      context.rows = runtimeSessionInventory(context.rows, [this.locatedRow]);
+      context.loading = false; context.available = true;
+      if (this.locatorState === "available" && isExactRuntimeSessionId(this.filters.query)) context.truncated = false;
+    } else if ((this.locatorState === "not_found") && isExactRuntimeSessionId(this.filters.query)) {
+      const exactSessionId = this.filters.query.trim();
+      context.rows = context.rows.filter(row => String(row.session_id || "") !== exactSessionId);
+      context.loading = false; context.available = true; context.truncated = false;
     }
     if (this.root !== root || this.language !== context.language || !this.list) {
       this.root = root; this.language = context.language; this.signature = this.optionsSignature = ""; root.replaceChildren();
@@ -112,14 +153,14 @@ export class RuntimeSessionNavigation {
       const addSelect = (id: string, label: string, key: "runner" | "project") => {
         const field = productNode("label", tr(label)); field.htmlFor = id;
         const select = productNode("select"); select.id = id; select.setAttribute("aria-label", tr(label));
-        select.addEventListener("change", () => { this.filters[key] = select.value; if (key === "runner") this.filters.project = ""; this.render(); });
+        select.addEventListener("change", () => { this.filters[key] = select.value; if (key === "runner") this.filters.project = ""; this.render(); void this.refreshLocator(); });
         field.appendChild(select); filters.appendChild(field);
       };
       addSelect("runtime-session-runner-filter", "Filter Sessions by Runner", "runner");
       addSelect("runtime-session-project-filter", "Filter Sessions by Project", "project");
       const label = productNode("label", tr("Search Sessions")); label.htmlFor = "runtime-global-session-query";
       const search = productNode("input"); search.id = "runtime-global-session-query"; search.type = "search"; search.maxLength = 200; search.value = this.filters.query;
-      search.addEventListener("input", () => { this.filters.query = search.value; this.render(); }); label.appendChild(search); filters.appendChild(label); root.appendChild(filters);
+      search.addEventListener("input", () => { this.filters.query = search.value; this.render(); void this.refreshLocator(); }); label.appendChild(search); filters.appendChild(label); root.appendChild(filters);
       const status = productNode("p", "", "muted small"); status.id = "runtime-global-session-status"; status.setAttribute("role", "status"); root.appendChild(status);
       this.list = productNode("div", "", "runtime-session-inventory"); this.list.setAttribute("aria-label", tr("Workflow Sessions")); root.appendChild(this.list);
     }
@@ -135,8 +176,11 @@ export class RuntimeSessionNavigation {
     }
     const rows = filterRuntimeSessions(context.rows, this.filters);
     const status = document.getElementById("runtime-global-session-status");
-    if (status) status.textContent = context.loading ? tr("Loading Sessions…") : !context.available ? tr(this.scopedProject ? "Session list unavailable. Check access to this Project." : "Runtime-wide Sessions require runtime:read. Open an authorized Project to inspect its Sessions.")
-      : (context.stale ? tr("Refresh failed · showing previous data") + " · " : "") + rows.length + " / " + context.rows.length + (context.truncated ? " · " + tr("Recent results are bounded; filter a Project for its Sessions.") : "");
+    const exactLocator = !this.scopedProject && isExactRuntimeSessionId(this.filters.query);
+    if (status) status.textContent = exactLocator && this.locatorState === "loading" && !rows.length ? tr("Locating Session…")
+      : exactLocator && this.locatorState === "stale" ? tr("Exact Session lookup failed · showing previous data") + " · " + rows.length + " / " + context.rows.length
+      : context.loading ? tr("Loading Sessions…") : !context.available ? tr(this.scopedProject ? "Session list unavailable. Check access to this Project." : "Runtime-wide Sessions require runtime:read. Open an authorized Project to inspect its Sessions.")
+      : (context.stale ? tr("Refresh failed · showing previous data") + " · " : "") + rows.length + " / " + context.rows.length + (context.truncated ? " · " + tr("The Runtime inventory is incomplete; some retained Sessions may not be shown.") : "");
     const signature = JSON.stringify([context.language, rows, context.selected, context.available]);
     if (signature === this.signature) return; this.signature = signature;
     const focused = this.list!.contains(document.activeElement) ? (document.activeElement as HTMLElement).dataset.sessionId : null;

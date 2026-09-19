@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { RuntimeWindowController, preferredWindowKey } from "../dist/runtime_window_state.js";
 import { renderWindowCards, renderWindowLinkedSessions } from "../dist/runtime_window.js";
-import { RuntimeSessionNavigation, runtimeSessionInventory, runtimeSessionIdentity, filterRuntimeSessions, preferredRuntimeSession, createRuntimeSessionRow } from "../dist/runtime_sessions.js";
+import { RuntimeSessionNavigation, runtimeSessionInventory, runtimeSessionIdentity, filterRuntimeSessions, preferredRuntimeSession, createRuntimeSessionRow, isExactRuntimeSessionId } from "../dist/runtime_sessions.js";
 
 const windowA = "a".repeat(64), windowB = "b".repeat(64);
 const project = "agent:runner:project";
@@ -60,9 +60,9 @@ async function withDom(run) {
 
 test("real /windows shape loads without a Project, selects first Window and renders linked Session controls", async () => withDom(async () => {
   const h = harness(); await load(h);
-  assert.deepEqual(h.calls[0].payload, { limit: 100 });
+  assert.deepEqual(h.calls[0].payload, { limit: 2000 });
   assert.equal(h.controller.snapshot.selectedKey, windowA);
-  assert.equal(h.calls[1].payload.client_window_key, windowA);
+  assert.deepEqual(h.calls[1].payload, { client_window_key: windowA, activity_limit: 2000, session_limit: 100 });
   const rows = new Element(), links = new Element(), selected = [], sessions = [];
   renderWindowCards(rows, h.controller.snapshot.rows, windowA, key => selected.push(key), 4000, "en");
   assert.equal(rows.children.length, 2); assert.equal(rows.children[0].dataset.windowKey, windowA);
@@ -182,6 +182,39 @@ test("Session rows show progress and attention safely, do not manufacture missin
   assert.equal(row.querySelectorAll("script").length, 0); row.click(); assert.equal(clicks[0].session_id, session.session_id);
   const unknown = createRuntimeSessionRow({ ...session, running_jobs: undefined, overview: {} }, "", "en", () => {});
   assert.match(unknown.textContent, /Running Jobs —/); assert.doesNotMatch(unknown.textContent, /Todos 0/);
+}));
+
+test("exact Session id lookup supplements bounded runtime inventory without requiring a Project filter", async () => withDom(async root => {
+  let rows = []; const locatorCalls = [];
+  const context = () => ({ language: "en", rows, projects: [{ id: project, client_id: "runner", name: "Project" }], runners: [{ client_id: "runner" }], selected: "", available: true, loading: false, stale: false, truncated: true });
+  const nav = new RuntimeSessionNavigation({
+    context, select() {}, unauthorized() {},
+    projectSessions: async () => ok({ sessions: [], truncated: false }),
+    locateSession: (sessionId, signal) => new Promise(resolve => locatorCalls.push({ sessionId, signal, resolve })),
+  });
+  nav.render();
+  assert.equal(isExactRuntimeSessionId(session.session_id), true);
+  const search = document.getElementById("runtime-global-session-query");
+  search.value = session.session_id; search.listeners.input?.({}); await tick();
+  assert.equal(locatorCalls.length, 1); assert.equal(locatorCalls[0].sessionId, session.session_id);
+  locatorCalls[0].resolve(ok({ ...session, activity: [], activity_total: 0, activity_returned: 0, activity_truncated: false })); await tick();
+  assert.match(root.textContent, /Realistic workflow/); assert.doesNotMatch(root.textContent, /inventory is incomplete/);
+
+  rows = [session];
+  const transient = nav.refreshLocator(); await tick();
+  assert.equal(locatorCalls.length, 2); locatorCalls.at(-1).resolve(failed(503)); await transient;
+  assert.match(root.textContent, /Realistic workflow/); assert.match(root.textContent, /lookup failed/);
+
+  const revalidate = nav.refreshLocator(); await tick();
+  assert.equal(locatorCalls.length, 3); assert.equal(locatorCalls.at(-1).sessionId, session.session_id);
+  locatorCalls.at(-1).resolve(failed(404)); await revalidate;
+  assert.doesNotMatch(root.textContent, /Realistic workflow/); assert.match(root.textContent, /No matching Sessions/);
+
+  const missing = "wc_sess_bbbbbbbbbbbbbbbb";
+  search.value = missing; search.listeners.input?.({}); await tick();
+  assert.equal(locatorCalls.at(-1).sessionId, missing);
+  locatorCalls.at(-1).resolve(failed(404)); await tick();
+  assert.doesNotMatch(root.textContent, /Realistic workflow/); assert.match(root.textContent, /No matching Sessions/);
 }));
 
 test("Session list preserves semantic buttons across polling and Project filters load authorized inventory independently", async () => withDom(async root => {

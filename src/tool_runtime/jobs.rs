@@ -743,6 +743,47 @@ pub(crate) fn agent_job_summary_value(job: &ShellJobInfo) -> Value {
     })
 }
 
+impl ToolRuntime {
+    /// Runtime-only model projection for Job inventory. The base summary remains
+    /// the canonical compact execution metadata used by internal reconciliation.
+    fn model_job_summary_value(&self, job: &ShellJobInfo) -> Value {
+        let mut summary = agent_job_summary_value(job);
+        let generic_validation = job
+            .structured_execution
+            .as_ref()
+            .and_then(|metadata| metadata.validation_identity.as_deref())
+            .is_some()
+            && job
+                .purpose
+                .as_deref()
+                .is_some_and(is_validation_like_execution_purpose);
+        if job.validation.is_none() && !generic_validation {
+            return summary;
+        }
+        let source_state = match job.project_id.as_deref().filter(|value| !value.is_empty()) {
+            Some(project) => self.validation_sources.observe(
+                project,
+                job.validation
+                    .as_ref()
+                    .and_then(|metadata| metadata.source_fence.as_ref()),
+            ),
+            None => webcodex_core::validation_source::ValidationSourceState::default(),
+        };
+        summary["validation"] = json!({
+            "source_state": {
+                "freshness": source_state.freshness,
+                "observed_mutation_fence": source_state.observed_mutation_fence,
+            }
+        });
+        summary
+    }
+
+    #[cfg(test)]
+    pub(crate) fn model_job_summary_value_for_test(&self, job: &ShellJobInfo) -> Value {
+        self.model_job_summary_value(job)
+    }
+}
+
 pub(crate) fn job_observation_continuation_semantics() -> Value {
     super::ContinuationSemantics::new(
         super::ContinuationKind::Observe,
@@ -1068,7 +1109,7 @@ fn stop_job_output(
 }
 
 fn active_job_brief(summary: &Value) -> Value {
-    json!({
+    let mut brief = json!({
         "job_id": summary.get("job_id").cloned().unwrap_or(Value::Null),
         "kind": summary.get("kind").cloned().unwrap_or_else(|| json!("shell")),
         "status": summary.get("status").cloned().unwrap_or(Value::Null),
@@ -1076,15 +1117,23 @@ fn active_job_brief(summary: &Value) -> Value {
         "started_at": summary.get("started_at").cloned().unwrap_or(Value::Null),
         "created_at": summary.get("created_at").cloned().unwrap_or(Value::Null),
         "executor": summary.get("executor").cloned().unwrap_or(Value::Null),
-    })
+    });
+    if let Some(validation) = summary.get("validation") {
+        brief["validation"] = validation.clone();
+    }
+    brief
 }
 
 fn active_job_continuation_brief(summary: &Value) -> Value {
-    json!({
+    let mut brief = json!({
         "job_id": summary.get("job_id").cloned().unwrap_or(Value::Null),
         "status": summary.get("status").cloned().unwrap_or(Value::Null),
         "kind": summary.get("kind").cloned().unwrap_or_else(|| json!("shell")),
-    })
+    });
+    if let Some(validation) = summary.get("validation") {
+        brief["validation"] = validation.clone();
+    }
+    brief
 }
 
 impl ToolRuntime {
@@ -1681,7 +1730,7 @@ impl ToolRuntime {
                     .map(|status| status == &job.status)
                     .unwrap_or(true)
             })
-            .map(agent_job_summary_value)
+            .map(|job| self.model_job_summary_value(job))
             .collect();
 
         summaries.sort_by(|a, b| {
@@ -1940,7 +1989,7 @@ impl ToolRuntime {
             if !webcodex_runner_registry::job_status_is_active(&job.status) {
                 continue;
             }
-            let summary = agent_job_summary_value(&job);
+            let summary = self.model_job_summary_value(&job);
             if continuation_session_id.is_some()
                 && job.session_id.as_deref() == continuation_session_id
             {

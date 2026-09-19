@@ -1,3 +1,4 @@
+use crate::model::MAX_INPUT_ARRAY_ITEMS;
 use crate::*;
 use serde_json::{json, Value};
 
@@ -151,6 +152,62 @@ fn dry_run_project_edits_do_not_record_session_changed_paths() {
     assert!(finished[1].changed_paths.is_empty());
     assert_eq!(finished[2].changed_paths, vec!["src/live.rs"]);
     assert!(summary.repository_edit_observed);
+}
+
+#[test]
+fn retained_changed_path_evidence_uses_proven_effects_and_fails_closed_at_durable_bound() {
+    let store = SessionStore::new(10, 100);
+    let session = store.start_session(Some("proj".to_string()), Some("path evidence".to_string()));
+    let contract = project_edit_contract(SessionPathHint::PathList);
+
+    let record = |paths: Vec<String>, success: bool, state_changed: bool| {
+        let changes = paths
+            .iter()
+            .map(|path| json!({"kind": "create", "path": path, "content": "x"}))
+            .collect::<Vec<_>>();
+        let start = store
+            .record_tool_call_started(
+                Some(&session.session_id),
+                SessionTransport::Mcp,
+                "apply_text_edits",
+                &json!({"project": "proj", "changes": changes}),
+                contract,
+            )
+            .expect("tool start");
+        store
+            .record_tool_call_finished(
+                Some(start),
+                success,
+                &json!({"state_changed": state_changed}),
+                (!success).then_some("failed"),
+                None,
+            )
+            .expect("tool finish");
+    };
+
+    record(vec!["src/noop.rs".to_string()], true, false);
+    record(vec!["src/failed.rs".to_string()], false, false);
+    record(vec!["src/live.rs".to_string()], true, true);
+    let (paths, complete) = store
+        .retained_changed_path_evidence(&session.session_id)
+        .unwrap();
+    assert_eq!(paths, vec!["src/live.rs"]);
+    assert!(complete);
+
+    record(
+        (0..MAX_INPUT_ARRAY_ITEMS)
+            .map(|index| format!("src/bound-{index}.rs"))
+            .collect(),
+        true,
+        true,
+    );
+    let (_, complete) = store
+        .retained_changed_path_evidence(&session.session_id)
+        .unwrap();
+    assert!(
+        !complete,
+        "hitting the durable path bound cannot certify completeness"
+    );
 }
 
 #[test]

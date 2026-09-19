@@ -100,6 +100,7 @@ pub(crate) enum RouteId {
     RuntimeConsoleProjectGit,
     RuntimeConsolePluginReload,
     RuntimeConsoleWorkflowSessions,
+    RuntimeConsoleWorkflowSessionLocate,
     RuntimeConsoleWorkflowSession,
     RuntimeConsoleWorkflowSessionMessages,
     RuntimeConsoleWorkflowSessionObserve,

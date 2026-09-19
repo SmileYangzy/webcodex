@@ -844,11 +844,13 @@ const RUNTIME_ZH_TEXT = {
     "Filter Sessions by Project": "按项目筛选会话",
     "Project filter": "项目筛选",
     "Loading Sessions…": "正在加载会话…",
+    "Locating Session…": "正在定位会话…",
+    "Exact Session lookup failed · showing previous data": "精确会话查询失败 · 正在显示之前的数据",
     "Open Session": "打开会话",
     "No matching Sessions": "没有匹配的会话",
     "No active or recent Workflow Sessions.": "暂无活动中或最近的工作会话。",
     "Runtime-wide Sessions require runtime:read. Open an authorized Project to inspect its Sessions.": "查看运行时会话总览需要 runtime:read 权限。仍可从有权访问的项目查看其会话。",
-    "Recent results are bounded; filter a Project for its Sessions.": "最近结果有数量限制，可筛选项目查看其会话。",
+    "The Runtime inventory is incomplete; some retained Sessions may not be shown.": "运行时清单不完整，部分已保留会话可能暂未显示。",
     "Select an active or recent Session from the list. Runner and Project are filters, not prerequisites.": "从列表选择活动中或最近的会话。运行器和项目仅用于筛选，无需先打开项目。",
     "No Window activity observed yet.": "尚未观察到窗口活动",
     "Window activity unavailable": "窗口活动不可用",
@@ -856,7 +858,7 @@ const RUNTIME_ZH_TEXT = {
     "Check runtime:read and access to the selected Project.": "请检查 runtime:read 权限以及所选项目的访问权限。",
     "This Window is no longer visible to the current credential. Refresh to check available activity.": "当前凭证已无法查看此窗口。请刷新以检查可用活动。",
     "No observed activity matches this Project filter.": "当前项目筛选范围内尚未观察到窗口活动。",
-    "This credential sees only its own principal's Windows in authorized Projects. Other principals are not included; global observation requires an administrator Runtime credential.": "当前凭证仅能查看其所属身份在授权项目内的窗口，不包含其他身份的活动。全局观察需要管理员运行时凭证。",
+    "This project-scoped credential can only observe Windows within its own Project authority. Use a Runtime Console management credential for the authorized management view.": "当前项目范围凭证只能观察其项目权限内的窗口。请使用运行时控制台管理凭证查看已授权的管理视图。",
     "Global Runtime scope. Only observed WebCodex requests appear here; no Project selection is required.": "当前为运行时全局范围。这里仅显示已观察到的 WebCodex 请求，无需先选择项目。",
     "One Server coordinates connected Runners and their Projects.": "一个服务器协调已连接的运行器及其项目。",
     "Runner unavailable": "运行器不可用",
@@ -1370,7 +1372,7 @@ const RUNTIME_ZH_TEXT = {
     "Hashed identity": "哈希标识",
     "Select a Window": "选择一个窗口",
     "Window axis": "窗口维度",
-    "Choose a hashed Window identity from the sidebar to inspect active requests, linked Workflow Sessions, and bounded recent activity.": "从侧边栏选择哈希窗口标识，以检查活跃请求、关联的工作流会话及有界近期活动。",
+    "Choose a hashed Window identity from the sidebar to inspect active requests, linked Workflow Sessions, and retained activity.": "从侧边栏选择哈希窗口标识，以检查活跃请求、关联的工作流会话及已保留活动。",
     "Shows WebCodex calls and correlations only. It cannot observe model reasoning or determine whether the ChatGPT frontend is frozen.": "仅反映 WebCodex 调用与关联关系。它无法观察模型推理，也无法判断 ChatGPT 前端是否卡顿。",
     "3s activity refresh": "3秒活动刷新",
     "3s window refresh": "3秒窗口刷新",
@@ -3840,8 +3842,14 @@ class ProductWorkspace {
         this.projectSignature = signature;
         const activeName = this.projectList.contains(document.activeElement) ? document.activeElement?.getAttribute("aria-label") : null;
         this.projectList.replaceChildren();
-        const rows = context.projects.filter(project => (!this.runner || this.runner === project.client_id) && `${productName(project)} ${project.path || ""}`.toLocaleLowerCase().includes(this.query.trim().toLocaleLowerCase()))
-            .sort((a, b) => a.client_id.localeCompare(b.client_id) || (b.sessions?.latest_updated_at || 0) - (a.sessions?.latest_updated_at || 0));
+        const query = this.query.trim().toLocaleLowerCase();
+        const rows = context.projects.filter(project => {
+            if (this.runner && this.runner !== project.client_id)
+                return false;
+            const searchable = [project.id, project.project_ref, project.name, productName(project), project.path, project.client_id]
+                .filter(Boolean).map(String).join(" ").toLocaleLowerCase();
+            return searchable.includes(query);
+        }).sort((a, b) => a.client_id.localeCompare(b.client_id) || (b.sessions?.latest_updated_at || 0) - (a.sessions?.latest_updated_at || 0));
         let lastRunner = "";
         for (const project of rows) {
             if (context.runners.length > 1 && project.client_id !== lastRunner) {
@@ -4022,7 +4030,7 @@ class RuntimeWindowController {
             this.snapshot.globalAvailability = "loading";
             this.publish();
         }
-        const response = await this.services.post("windows", { limit: 100 }, request.signal);
+        const response = await this.services.post("windows", { limit: 2000 }, request.signal);
         if (!ownsWindowResponse(this.globalRequest, request) || revision !== this.globalRevision)
             return;
         this.globalRequest = null;
@@ -4068,7 +4076,7 @@ class RuntimeWindowController {
             this.globalRequest?.abort();
             this.globalRequest = null;
         }
-        const response = await this.services.post("windows", { limit: 100, ...(project ? { project } : {}) }, request.signal);
+        const response = await this.services.post("windows", { limit: 2000, ...(project ? { project } : {}) }, request.signal);
         if (!ownsWindowResponse(this.listRequest, request))
             return;
         this.listRequest = null;
@@ -4160,7 +4168,7 @@ class RuntimeWindowController {
             this.snapshot.detailAvailability = "loading";
             this.publish();
         }
-        const response = await this.services.post("window", { client_window_key: key, activity_limit: 100, session_limit: 50 }, request.signal);
+        const response = await this.services.post("window", { client_window_key: key, activity_limit: 2000, session_limit: 100 }, request.signal);
         if (!ownsWindowResponse(this.detailRequest, request) || key !== this.snapshot.selectedKey)
             return;
         this.detailRequest = null;
@@ -4206,6 +4214,9 @@ class RuntimeWindowController {
     }
 }
 
+function isExactRuntimeSessionId(value) {
+    return /^wc_sess_(?:[A-Za-z0-9_-]{16}|[0-9a-f]{32})$/.test(value.trim());
+}
 function runtimeSessionIsWorking(row) { return row.running_call === true || Number(row.running_jobs) > 0; }
 function runtimeSessionIdentity(row) { return String(row.project_id || "") + ":" + String(row.session_id || ""); }
 function runtimeSessionInventory(recent, projectRows = []) {
@@ -4271,6 +4282,10 @@ class RuntimeSessionNavigation {
         this.language = null;
         this.optionsSignature = "";
         this.projectRequest = null;
+        this.locatorRequest = null;
+        this.locatedRow = null;
+        this.locatedSessionId = "";
+        this.locatorState = "idle";
         this.scopedProject = "";
         this.scopedRows = [];
         this.scopedState = "loading";
@@ -4280,6 +4295,11 @@ class RuntimeSessionNavigation {
     reset() {
         this.projectRequest?.abort();
         this.projectRequest = null;
+        this.locatorRequest?.abort();
+        this.locatorRequest = null;
+        this.locatedRow = null;
+        this.locatedSessionId = "";
+        this.locatorState = "idle";
         this.scopedProject = "";
         this.scopedRows = [];
         this.scopedState = "loading";
@@ -4289,6 +4309,48 @@ class RuntimeSessionNavigation {
         this.signature = this.optionsSignature = "";
         this.language = null;
         Object.assign(this.filters, { runner: "", project: "", query: "" });
+    }
+    async refreshLocator() {
+        const sessionId = this.filters.query.trim();
+        this.locatorRequest?.abort();
+        this.locatorRequest = null;
+        if (!this.services.locateSession || !isExactRuntimeSessionId(sessionId) || this.filters.project) {
+            this.locatedRow = null;
+            this.locatedSessionId = "";
+            this.locatorState = "idle";
+            this.render();
+            return;
+        }
+        const sameLocatedSession = this.locatedSessionId === sessionId;
+        if (!sameLocatedSession)
+            this.locatedRow = null;
+        this.locatedSessionId = sessionId;
+        this.locatorState = "loading";
+        const request = new AbortController();
+        this.locatorRequest = request;
+        this.render();
+        const response = await this.services.locateSession(sessionId, request.signal);
+        if (request !== this.locatorRequest || request.signal.aborted || sessionId !== this.filters.query.trim())
+            return;
+        this.locatorRequest = null;
+        if (response?.status === 401) {
+            this.services.unauthorized();
+            return;
+        }
+        if (response?.status === 403 || response?.status === 404) {
+            this.locatedRow = null;
+            this.locatorState = "not_found";
+        }
+        else if (!response?.ok || response.data?.session_id !== sessionId || !response.data?.project_id || !response.data?.client_id) {
+            if (!sameLocatedSession)
+                this.locatedRow = null;
+            this.locatorState = "stale";
+        }
+        else {
+            this.locatedRow = response.data;
+            this.locatorState = "available";
+        }
+        this.render();
     }
     async refreshProject() {
         const project = this.filters.project;
@@ -4345,6 +4407,20 @@ class RuntimeSessionNavigation {
             context.stale = this.scopedState === "stale";
             context.truncated = this.scopedTruncated;
         }
+        else if (this.locatedRow) {
+            context.rows = runtimeSessionInventory(context.rows, [this.locatedRow]);
+            context.loading = false;
+            context.available = true;
+            if (this.locatorState === "available" && isExactRuntimeSessionId(this.filters.query))
+                context.truncated = false;
+        }
+        else if ((this.locatorState === "not_found") && isExactRuntimeSessionId(this.filters.query)) {
+            const exactSessionId = this.filters.query.trim();
+            context.rows = context.rows.filter(row => String(row.session_id || "") !== exactSessionId);
+            context.loading = false;
+            context.available = true;
+            context.truncated = false;
+        }
         if (this.root !== root || this.language !== context.language || !this.list) {
             this.root = root;
             this.language = context.language;
@@ -4360,7 +4436,7 @@ class RuntimeSessionNavigation {
                 select.id = id;
                 select.setAttribute("aria-label", tr(label));
                 select.addEventListener("change", () => { this.filters[key] = select.value; if (key === "runner")
-                    this.filters.project = ""; this.render(); });
+                    this.filters.project = ""; this.render(); void this.refreshLocator(); });
                 field.appendChild(select);
                 filters.appendChild(field);
             };
@@ -4373,7 +4449,7 @@ class RuntimeSessionNavigation {
             search.type = "search";
             search.maxLength = 200;
             search.value = this.filters.query;
-            search.addEventListener("input", () => { this.filters.query = search.value; this.render(); });
+            search.addEventListener("input", () => { this.filters.query = search.value; this.render(); void this.refreshLocator(); });
             label.appendChild(search);
             filters.appendChild(label);
             root.appendChild(filters);
@@ -4401,9 +4477,12 @@ class RuntimeSessionNavigation {
         }
         const rows = filterRuntimeSessions(context.rows, this.filters);
         const status = document.getElementById("runtime-global-session-status");
+        const exactLocator = !this.scopedProject && isExactRuntimeSessionId(this.filters.query);
         if (status)
-            status.textContent = context.loading ? tr("Loading Sessions…") : !context.available ? tr(this.scopedProject ? "Session list unavailable. Check access to this Project." : "Runtime-wide Sessions require runtime:read. Open an authorized Project to inspect its Sessions.")
-                : (context.stale ? tr("Refresh failed · showing previous data") + " · " : "") + rows.length + " / " + context.rows.length + (context.truncated ? " · " + tr("Recent results are bounded; filter a Project for its Sessions.") : "");
+            status.textContent = exactLocator && this.locatorState === "loading" && !rows.length ? tr("Locating Session…")
+                : exactLocator && this.locatorState === "stale" ? tr("Exact Session lookup failed · showing previous data") + " · " + rows.length + " / " + context.rows.length
+                    : context.loading ? tr("Loading Sessions…") : !context.available ? tr(this.scopedProject ? "Session list unavailable. Check access to this Project." : "Runtime-wide Sessions require runtime:read. Open an authorized Project to inspect its Sessions.")
+                        : (context.stale ? tr("Refresh failed · showing previous data") + " · " : "") + rows.length + " / " + context.rows.length + (context.truncated ? " · " + tr("The Runtime inventory is incomplete; some retained Sessions may not be shown.") : "");
         const signature = JSON.stringify([context.language, rows, context.selected, context.available]);
         if (signature === this.signature)
             return;
@@ -4744,7 +4823,7 @@ let windowAvailability = "idle";
 let windowVisibilityScope = "principal";
 let selectedWindowKey = "";
 let selectedWindowDetail = null;
-const PROJECT_WINDOW_LIMIT = 10;
+const PROJECT_WINDOW_LIMIT = 2000;
 let projectWindowsAbort = null;
 let projectWindowRows = [];
 let projectWindowAvailability = "idle";
@@ -4800,7 +4879,7 @@ let pendingConversationMessage = null;
 const pageAttachmentId = "runtime-console-" + operationKey("page");
 const productProjectApi = new RuntimeApiClient("/api/projects/");
 const productServices = {
-    context: () => ({ language: runtimeLanguage, projects: homeProjectRows, runners: runnerRows,
+    context: () => ({ language: runtimeLanguage, projects: effectiveProjects(projectRows), runners: runnerRows,
         sessions: recentSessionRows, windows: windowController.snapshot.globalRows,
         selectedProject: state.selectedProject || "", available: Boolean(runtimeOverviewSnapshot),
     }),
@@ -4842,6 +4921,7 @@ const sessionNavigation = new RuntimeSessionNavigation({
         truncated: !!recentSessionMetaSnapshot?.truncated || !!recentSessionMetaSnapshot?.scan_truncated }),
     select: row => selectRecentSession(row),
     projectSessions: (project, signal) => api("workflow-sessions", { project, limit: 100 }, signal),
+    locateSession: (sessionId, signal) => api("workflow-session-locate", { session_id: sessionId }, signal),
     unauthorized: () => lock("Credential rejected."),
 });
 function rememberedSessionLocation() {
@@ -5449,7 +5529,7 @@ function renderWindowList() {
     setText("runtime-window-empty-copy", tr(unavailable ? (snapshot.project ? "Check runtime:read and access to the selected Project." : "Window activity requires runtime:read.")
         : detailUnavailable ? "This Window is no longer visible to the current credential. Refresh to check available activity."
             : loading ? "Observing the connected Runtime." : snapshot.project ? "No observed activity matches this Project filter."
-                : windowVisibilityScope === "principal" ? "This credential sees only its own principal's Windows in authorized Projects. Other principals are not included; global observation requires an administrator Runtime credential."
+                : windowVisibilityScope === "principal" ? "This project-scoped credential can only observe Windows within its own Project authority. Use a Runtime Console management credential for the authorized management view."
                     : "Global Runtime scope. Only observed WebCodex requests appear here; no Project selection is required."));
     setText("runtime-window-live-badge", tr(stale ? "Refresh failed · showing previous data" : "Updates automatically"));
 }
@@ -5867,7 +5947,7 @@ async function fetchProjects(request, unlocking = false) {
     abort(projectsAbort);
     const controller = new AbortController();
     projectsAbort = controller;
-    const payload = { limit: 100 };
+    const payload = { limit: 2000 };
     const clientId = String(request?.clientId || "");
     const query = String(request?.query || "").trim();
     if (clientId)
@@ -6156,7 +6236,7 @@ async function fetchSessions(request) {
     abort(sessionsAbort);
     const controller = new AbortController();
     sessionsAbort = controller;
-    const response = await api("workflow-sessions", { project: request.project, limit: 50 }, controller.signal);
+    const response = await api("workflow-sessions", { project: request.project, limit: 100 }, controller.signal);
     if (sessionsAbort === controller)
         sessionsAbort = null;
     if (!response || !isCurrentRuntimeSessionListRequest(state, request))
@@ -6261,7 +6341,7 @@ async function fetchSessionDetail(request) {
     abort(detailAbort);
     const controller = new AbortController();
     detailAbort = controller;
-    const response = await api("workflow-session", { project: request.project, session_id: request.sessionId, limit: 100 }, controller.signal);
+    const response = await api("workflow-session", { project: request.project, session_id: request.sessionId, limit: 2000 }, controller.signal);
     if (detailAbort !== controller || controller.signal.aborted)
         return;
     detailAbort = null;
@@ -7752,7 +7832,7 @@ async function refreshAll() {
             refreshCommunication(),
             windowRequest ? fetchProjectWindows(windowRequest) : Promise.resolve(true),
             workspaceView === "windows" ? refreshWindows(true) : windowController.refreshGlobal(),
-            sessionNavigation.filters.project ? sessionNavigation.refreshProject() : Promise.resolve(),
+            sessionNavigation.filters.project ? sessionNavigation.refreshProject() : sessionNavigation.refreshLocator(),
         ]);
         if (!token)
             return;
@@ -7786,8 +7866,12 @@ function refreshAutoSurfaces() {
     void fetchOverview(refreshRuntimeOverview(state));
     if (workspaceView === "home" || workspaceView === "activity")
         void windowController.refreshGlobal();
-    if (workspaceView === "sessions" && sessionNavigation.filters.project)
-        void sessionNavigation.refreshProject();
+    if (workspaceView === "sessions") {
+        if (sessionNavigation.filters.project)
+            void sessionNavigation.refreshProject();
+        else
+            void sessionNavigation.refreshLocator();
+    }
     const request = refreshRuntimeSessionList(state);
     if (request)
         void fetchSessions(request);

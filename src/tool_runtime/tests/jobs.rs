@@ -36,6 +36,123 @@ where
     }
 }
 
+fn compact_validation_job(
+    project: &str,
+    source_fence: Option<webcodex_core::validation_source::ValidationSourceFence>,
+) -> crate::runner_protocol::ShellJobInfo {
+    serde_json::from_value(json!({
+        "job_id": "wc_job_compact-validation",
+        "client_id": "compact-validation-client",
+        "kind": "shell",
+        "project_id": project,
+        "purpose": "validation",
+        "command_preview": "secret validation command",
+        "status": "completed",
+        "created_at": 1,
+        "structured_execution": {
+            "execution_source": "run_process",
+            "arg_count": 3,
+            "stdin_present": false,
+            "validation_identity": "assertion:0123456789abcdef01234567",
+            "assertion_name": "secret assertion label"
+        },
+        "validation": {
+            "tool": "cargo_check",
+            "kind": "check",
+            "steps": [{
+                "name": "check",
+                "program": "cargo",
+                "args": ["check"],
+                "env": []
+            }],
+            "effective_timeout_secs": 600,
+            "sync_wait_secs": 10,
+            "adapter": "cargo_check",
+            "source_fence": source_fence
+        },
+        "recovered_after_server_restart": false,
+        "stdout_log_truncated": false,
+        "stderr_log_truncated": false
+    }))
+    .unwrap()
+}
+
+#[test]
+fn compact_validation_job_summary_reobserves_missing_crossed_and_restart_fences() {
+    let runtime = ToolRuntime::new_for_tests();
+    let project = "agent:compact-validation:demo";
+    let start = runtime.validation_sources.capture(project).unwrap();
+
+    let same = runtime
+        .model_job_summary_value_for_test(&compact_validation_job(project, Some(start.clone())));
+    assert_eq!(same["validation"]["source_state"]["freshness"], "unproven");
+    assert_eq!(
+        same["validation"]["source_state"]["observed_mutation_fence"],
+        "uncrossed"
+    );
+
+    let missing = runtime.model_job_summary_value_for_test(&compact_validation_job(project, None));
+    assert_eq!(
+        missing["validation"]["source_state"]["freshness"],
+        "unproven"
+    );
+    assert_eq!(
+        missing["validation"]["source_state"]["observed_mutation_fence"],
+        "unknown"
+    );
+
+    runtime
+        .validation_sources
+        .begin(project)
+        .unwrap()
+        .finish(&ToolResult::ok(json!({"state_changed": true})));
+    let crossed = runtime
+        .model_job_summary_value_for_test(&compact_validation_job(project, Some(start.clone())));
+    assert_eq!(crossed["validation"]["source_state"]["freshness"], "stale");
+    assert_eq!(
+        crossed["validation"]["source_state"]["observed_mutation_fence"],
+        "crossed"
+    );
+
+    let other_epoch = runtime
+        .validation_sources
+        .capture("agent:other:demo")
+        .unwrap();
+    let mismatch = runtime
+        .model_job_summary_value_for_test(&compact_validation_job(project, Some(other_epoch)));
+    assert_eq!(
+        mismatch["validation"]["source_state"]["freshness"],
+        "unproven"
+    );
+    assert_eq!(
+        mismatch["validation"]["source_state"]["observed_mutation_fence"],
+        "unknown"
+    );
+
+    let restarted = ToolRuntime::new_for_tests();
+    let after_restart =
+        restarted.model_job_summary_value_for_test(&compact_validation_job(project, Some(start)));
+    assert_eq!(
+        after_restart["validation"]["source_state"]["freshness"],
+        "unproven"
+    );
+    assert_eq!(
+        after_restart["validation"]["source_state"]["observed_mutation_fence"],
+        "unknown"
+    );
+
+    for summary in [&same, &missing, &crossed, &mismatch, &after_restart] {
+        let source_state = &summary["validation"]["source_state"];
+        assert!(source_state.get("start_fence").is_none());
+        assert!(source_state.get("epoch").is_none());
+        assert!(source_state.get("generation").is_none());
+        let encoded = serde_json::to_string(summary).unwrap();
+        assert!(!encoded.contains("secret validation command"));
+        assert!(!encoded.contains("secret assertion label"));
+        assert!(!encoded.contains("0123456789abcdef01234567"));
+    }
+}
+
 #[tokio::test]
 async fn run_shell_session_events_record_exit_without_stdio_bodies() {
     let runtime = runtime_with_agent_project("telemetry-shell");

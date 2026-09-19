@@ -2268,6 +2268,214 @@ async fn same_window_recorder_gap_is_visible_without_backfilling_session_ledger(
 }
 
 #[tokio::test]
+async fn workflow_resume_context_is_window_principal_scoped_bounded_and_non_authoritative() {
+    let root = tempfile::tempdir().unwrap();
+    let audit_root = tempfile::tempdir().unwrap();
+    init_git_repo(root.path());
+    let window_db = std::sync::Arc::new(
+        crate::Database::open(&audit_root.path().join("workflow-resume.db")).unwrap(),
+    );
+    let runtime = ToolRuntime::new_for_tests().with_window_activity_database(window_db.clone());
+    let project =
+        register_runner_project_at_path(&runtime, "workflow-resume", "demo", root.path()).await;
+    let auth = auth_context(None, true);
+    let window_id = "workflow-resume-window";
+    let window = crate::client_window::ClientWindow::for_test(window_id);
+
+    assert_eq!(
+        runtime
+            .workflow_resume_context_projection_for_test(None, Some(&auth))
+            .await
+            .unwrap_err(),
+        "client_window_unavailable"
+    );
+
+    let empty = runtime
+        .workflow_resume_context_projection_for_test(Some(&window), Some(&auth))
+        .await
+        .unwrap();
+    assert_eq!(empty["count"], 0);
+    assert!(empty.get("suggested_call").is_none());
+
+    let first = runtime.sessions.start_session(
+        Some(project.clone()),
+        Some("implementation recovery candidate".to_string()),
+    );
+    record_window_activity_fixture(
+        &window_db,
+        &auth,
+        window_id,
+        &project,
+        "work_on_project",
+        Some((
+            &first.session_id,
+            crate::action_audit_sessions::WorkflowSessionRelation::WorkOnProject,
+        )),
+        None,
+        1_000,
+    );
+
+    let single = runtime
+        .workflow_resume_context_projection_for_test(Some(&window), Some(&auth))
+        .await
+        .unwrap();
+    assert_eq!(single["count"], 1);
+    assert_eq!(single["candidates"][0]["session_id"], first.session_id);
+    assert_eq!(
+        single["suggested_call"]["arguments"]["session_id"],
+        first.session_id
+    );
+
+    let other_window = crate::client_window::ClientWindow::for_test("workflow-resume-other");
+    let hidden_by_window = runtime
+        .workflow_resume_context_projection_for_test(Some(&other_window), Some(&auth))
+        .await
+        .unwrap();
+    assert_eq!(hidden_by_window["count"], 0);
+
+    let other_principal = auth_context(Some("different-user"), false);
+    let hidden_by_principal = runtime
+        .workflow_resume_context_projection_for_test(Some(&window), Some(&other_principal))
+        .await
+        .unwrap();
+    assert_eq!(hidden_by_principal["count"], 0);
+
+    let inaccessible_project = "agent:missing:workflow-resume";
+    let inaccessible = runtime.sessions.start_session(
+        Some(inaccessible_project.to_string()),
+        Some("must-not-leak-secret-title".to_string()),
+    );
+    record_window_activity_fixture(
+        &window_db,
+        &auth,
+        window_id,
+        inaccessible_project,
+        "work_on_project",
+        Some((
+            &inaccessible.session_id,
+            crate::action_audit_sessions::WorkflowSessionRelation::WorkOnProject,
+        )),
+        None,
+        1_500,
+    );
+    let hidden_by_project_auth = runtime
+        .workflow_resume_context_projection_for_test(Some(&window), Some(&auth))
+        .await
+        .unwrap();
+    assert_eq!(hidden_by_project_auth["count"], 1);
+    let hidden_json = serde_json::to_string(&hidden_by_project_auth).unwrap();
+    assert!(!hidden_json.contains(&inaccessible.session_id));
+    assert!(!hidden_json.contains("must-not-leak-secret-title"));
+
+    let second = runtime.sessions.start_session(
+        Some(project.clone()),
+        Some("independent review recovery candidate".to_string()),
+    );
+    record_window_activity_fixture(
+        &window_db,
+        &auth,
+        window_id,
+        &project,
+        "work_on_project",
+        Some((
+            &second.session_id,
+            crate::action_audit_sessions::WorkflowSessionRelation::WorkOnProject,
+        )),
+        None,
+        2_000,
+    );
+    let multiple = runtime
+        .workflow_resume_context_projection_for_test(Some(&window), Some(&auth))
+        .await
+        .unwrap();
+    assert_eq!(multiple["count"], 2);
+    assert_eq!(multiple["candidates"][0]["session_id"], second.session_id);
+    assert_eq!(multiple["candidates"][1]["session_id"], first.session_id);
+    assert!(multiple.get("suggested_call").is_none());
+    runtime.sessions.close_session(&first.session_id).unwrap();
+    let active_only = runtime
+        .workflow_resume_context_projection_for_test(Some(&window), Some(&auth))
+        .await
+        .unwrap();
+    assert_eq!(active_only["count"], 1);
+    assert_eq!(
+        active_only["candidates"][0]["session_id"],
+        second.session_id
+    );
+    assert_eq!(
+        active_only["suggested_call"]["arguments"]["session_id"],
+        second.session_id
+    );
+
+    let mut newest_session_id = String::new();
+    for index in 0..8 {
+        let extra = runtime.sessions.start_session(
+            Some(project.clone()),
+            Some(format!("bounded recovery candidate {index}")),
+        );
+        newest_session_id = extra.session_id.clone();
+        record_window_activity_fixture(
+            &window_db,
+            &auth,
+            window_id,
+            &project,
+            "work_on_project",
+            Some((
+                &extra.session_id,
+                crate::action_audit_sessions::WorkflowSessionRelation::WorkOnProject,
+            )),
+            None,
+            3_000 + i64::from(index),
+        );
+    }
+    let bounded = runtime
+        .workflow_resume_context_projection_for_test(Some(&window), Some(&auth))
+        .await
+        .unwrap();
+    assert_eq!(bounded["count"], 8);
+    assert_eq!(bounded["truncated"], true);
+    assert_eq!(
+        bounded["candidates"][0]["session_id"], newest_session_id,
+        "newest active candidate must sort first"
+    );
+    assert!(bounded.get("suggested_call").is_none());
+
+    let scan_bound_window_id = "workflow-resume-scan-bound";
+    let scan_bound_window = crate::client_window::ClientWindow::for_test(scan_bound_window_id);
+    for index in 0..100 {
+        let missing_session = format!("wc_sess_scan{index:012}");
+        record_window_activity_fixture(
+            &window_db,
+            &auth,
+            scan_bound_window_id,
+            &project,
+            "work_on_project",
+            Some((
+                &missing_session,
+                crate::action_audit_sessions::WorkflowSessionRelation::WorkOnProject,
+            )),
+            None,
+            10_000 + i64::from(index),
+        );
+    }
+    let scan_bound = runtime
+        .workflow_resume_context_projection_for_test(Some(&scan_bound_window), Some(&auth))
+        .await
+        .unwrap();
+    assert_eq!(scan_bound["count"], 0);
+    assert_eq!(
+        scan_bound["truncated"], true,
+        "saturating the bounded relation scan must not claim exhaustive recovery"
+    );
+
+    assert_eq!(
+        runtime.sessions.lifecycle_state(&second.session_id),
+        Some(crate::tool_runtime::sessions::SessionLifecycle::Active),
+        "projection must not alter Session lifecycle"
+    );
+}
+
+#[tokio::test]
 async fn managed_worktree_bootstrap_recovers_same_operation_and_binds_session_to_final_project() {
     let root = tempfile::tempdir().unwrap();
     let source = root.path().join("source");

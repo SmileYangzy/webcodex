@@ -148,8 +148,14 @@ export class ProductWorkspace {
         this.projectSignature = signature;
         const activeName = this.projectList.contains(document.activeElement) ? document.activeElement?.getAttribute("aria-label") : null;
         this.projectList.replaceChildren();
-        const rows = context.projects.filter(project => (!this.runner || this.runner === project.client_id) && `${productName(project)} ${project.path || ""}`.toLocaleLowerCase().includes(this.query.trim().toLocaleLowerCase()))
-            .sort((a, b) => a.client_id.localeCompare(b.client_id) || (b.sessions?.latest_updated_at || 0) - (a.sessions?.latest_updated_at || 0));
+        const query = this.query.trim().toLocaleLowerCase();
+        const rows = context.projects.filter(project => {
+            if (this.runner && this.runner !== project.client_id)
+                return false;
+            const searchable = [project.id, project.project_ref, project.name, productName(project), project.path, project.client_id]
+                .filter(Boolean).map(String).join(" ").toLocaleLowerCase();
+            return searchable.includes(query);
+        }).sort((a, b) => a.client_id.localeCompare(b.client_id) || (b.sessions?.latest_updated_at || 0) - (a.sessions?.latest_updated_at || 0));
         let lastRunner = "";
         for (const project of rows) {
             if (context.runners.length > 1 && project.client_id !== lastRunner) {

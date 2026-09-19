@@ -8,7 +8,10 @@ use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 
 use super::events::normalize_observed_project_path;
-use super::model::{SessionEvent, SessionMessageKind, SessionRecord};
+use super::model::{
+    SessionEvent, SessionMessageKind, SessionRecord, DEFAULT_MAX_EVENTS_PER_SESSION,
+    DEFAULT_MAX_SESSIONS,
+};
 use super::query::build_messages_summary;
 use super::util::{bound_chars, looks_like_secret_string};
 use webcodex_core::workflow_session_contract::is_safe_job_id;
@@ -23,10 +26,12 @@ pub struct ConsoleValidationHooks {
     pub validation_summary_from_events: fn(&[SessionEvent], usize) -> serde_json::Value,
 }
 
-pub const DEFAULT_CONSOLE_SESSION_LIST_LIMIT: usize = 20;
-pub const MAX_CONSOLE_SESSION_LIST_LIMIT: usize = 50;
-pub const DEFAULT_CONSOLE_ACTIVITY_LIMIT: usize = 100;
-pub const MAX_CONSOLE_ACTIVITY_LIMIT: usize = 200;
+// The Console is a human-facing view over an already bounded durable ledger.
+// Do not hide retained Sessions/events behind a second, much smaller presentation cap.
+pub const DEFAULT_CONSOLE_SESSION_LIST_LIMIT: usize = DEFAULT_MAX_SESSIONS;
+pub const MAX_CONSOLE_SESSION_LIST_LIMIT: usize = DEFAULT_MAX_SESSIONS;
+pub const DEFAULT_CONSOLE_ACTIVITY_LIMIT: usize = DEFAULT_MAX_EVENTS_PER_SESSION;
+pub const MAX_CONSOLE_ACTIVITY_LIMIT: usize = DEFAULT_MAX_EVENTS_PER_SESSION;
 const MAX_CONSOLE_TEXT_CHARS: usize = 240;
 const MAX_CONSOLE_PATHS_PER_ITEM: usize = 8;
 const MAX_CONSOLE_LIST_TEXT_CHARS: usize = 120;

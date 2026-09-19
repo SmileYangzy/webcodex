@@ -237,7 +237,7 @@ let windowAvailability: "idle" | "loading" | "available" | "stale" | "unavailabl
 let windowVisibilityScope: "global" | "principal" = "principal";
 let selectedWindowKey = "";
 let selectedWindowDetail: any | null = null;
-const PROJECT_WINDOW_LIMIT = 10;
+const PROJECT_WINDOW_LIMIT = 2_000;
 let projectWindowsAbort: AbortController | null = null;
 let projectWindowRows: any[] = [];
 let projectWindowAvailability: "idle" | "loading" | "available" | "stale" | "unavailable" = "idle";
@@ -308,7 +308,7 @@ const pageAttachmentId = "runtime-console-" + operationKey("page");
 
 const productProjectApi = new RuntimeApiClient("/api/projects/");
 const productServices: ProductServices = {
-  context: () => ({ language: runtimeLanguage, projects: homeProjectRows, runners: runnerRows,
+  context: () => ({ language: runtimeLanguage, projects: effectiveProjects(projectRows), runners: runnerRows,
     sessions: recentSessionRows, windows: windowController.snapshot.globalRows,
     selectedProject: state.selectedProject || "", available: Boolean(runtimeOverviewSnapshot),
   }),
@@ -346,6 +346,7 @@ const sessionNavigation = new RuntimeSessionNavigation({
     truncated: !!recentSessionMetaSnapshot?.truncated || !!recentSessionMetaSnapshot?.scan_truncated }),
   select: row => selectRecentSession(row),
   projectSessions: (project, signal) => api("workflow-sessions", { project, limit: 100 }, signal),
+  locateSession: (sessionId, signal) => api("workflow-session-locate", { session_id: sessionId }, signal),
   unauthorized: () => lock("Credential rejected."),
 });
 function rememberedSessionLocation(): string {
@@ -940,7 +941,7 @@ function renderWindowList(): void {
   setText("runtime-window-empty-copy", tr(unavailable ? (snapshot.project ? "Check runtime:read and access to the selected Project." : "Window activity requires runtime:read.")
     : detailUnavailable ? "This Window is no longer visible to the current credential. Refresh to check available activity."
     : loading ? "Observing the connected Runtime." : snapshot.project ? "No observed activity matches this Project filter."
-    : windowVisibilityScope === "principal" ? "This credential sees only its own principal's Windows in authorized Projects. Other principals are not included; global observation requires an administrator Runtime credential."
+    : windowVisibilityScope === "principal" ? "This project-scoped credential can only observe Windows within its own Project authority. Use a Runtime Console management credential for the authorized management view."
     : "Global Runtime scope. Only observed WebCodex requests appear here; no Project selection is required."));
   setText("runtime-window-live-badge", tr(stale ? "Refresh failed · showing previous data" : "Updates automatically"));
 }
@@ -1365,7 +1366,7 @@ async function fetchProjects(request: any, unlocking = false): Promise<boolean> 
   abort(projectsAbort);
   const controller = new AbortController();
   projectsAbort = controller;
-  const payload: any = { limit: 100 };
+  const payload: any = { limit: 2_000 };
   const clientId = String(request?.clientId || "");
   const query = String(request?.query || "").trim();
   if (clientId) payload.client_id = clientId;
@@ -1645,7 +1646,7 @@ async function fetchSessions(request: any): Promise<void> {
   abort(sessionsAbort);
   const controller = new AbortController();
   sessionsAbort = controller;
-  const response = await api("workflow-sessions", { project: request.project, limit: 50 }, controller.signal);
+  const response = await api("workflow-sessions", { project: request.project, limit: 100 }, controller.signal);
   if (sessionsAbort === controller) sessionsAbort = null;
   if (!response || !isCurrentRuntimeSessionListRequest(state, request)) return;
   if (response.status === 401) return lock("Credential rejected.");
@@ -1733,7 +1734,7 @@ function selectSession(sessionId: string): void {
 async function fetchSessionDetail(request: any): Promise<void> {
   abort(detailAbort);
   const controller = new AbortController(); detailAbort = controller;
-  const response = await api("workflow-session", { project: request.project, session_id: request.sessionId, limit: 100 }, controller.signal);
+  const response = await api("workflow-session", { project: request.project, session_id: request.sessionId, limit: 2_000 }, controller.signal);
   if (detailAbort !== controller || controller.signal.aborted) return;
   detailAbort = null;
   if (!response || !isCurrentRuntimeWorkflowSessionRequest(state, request)) return;
@@ -3082,7 +3083,7 @@ async function refreshAll(): Promise<void> {
       refreshCommunication(),
       windowRequest ? fetchProjectWindows(windowRequest) : Promise.resolve(true),
       workspaceView === "windows" ? refreshWindows(true) : windowController.refreshGlobal(),
-      sessionNavigation.filters.project ? sessionNavigation.refreshProject() : Promise.resolve(),
+      sessionNavigation.filters.project ? sessionNavigation.refreshProject() : sessionNavigation.refreshLocator(),
     ]);
     if (!token) return;
     const windowState = windowController.snapshot;
@@ -3111,7 +3112,10 @@ function refreshAutoSurfaces(): void {
   }
   void fetchOverview(refreshRuntimeOverview(state));
   if (workspaceView === "home" || workspaceView === "activity") void windowController.refreshGlobal();
-  if (workspaceView === "sessions" && sessionNavigation.filters.project) void sessionNavigation.refreshProject();
+  if (workspaceView === "sessions") {
+    if (sessionNavigation.filters.project) void sessionNavigation.refreshProject();
+    else void sessionNavigation.refreshLocator();
+  }
   const request = refreshRuntimeSessionList(state);
   if (request) void fetchSessions(request);
   const windowRequest = refreshRuntimeProjectWindows(state);

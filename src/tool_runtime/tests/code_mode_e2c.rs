@@ -487,6 +487,49 @@ async fn e2c_job_handoff_has_exact_continuation_and_later_write_invalidates_term
         probe_patch_agent_request(&runtime, client).await.is_none(),
         "no second validator/redispatch"
     );
+    let listed_active = runtime
+        .list_jobs_for_auth_with_filters(
+            Some(20),
+            None,
+            Some(project.clone()),
+            Some(session.clone()),
+            None,
+        )
+        .await;
+    assert!(listed_active.success, "{listed_active:?}");
+    let listed_job = listed_active.output["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|job| job["job_id"] == job_id)
+        .unwrap();
+    assert_eq!(
+        listed_job["validation"]["source_state"]["freshness"],
+        "unproven"
+    );
+    assert_eq!(
+        listed_job["validation"]["source_state"]["observed_mutation_fence"],
+        "uncrossed"
+    );
+    assert!(listed_job["validation"]["source_state"]
+        .get("start_fence")
+        .is_none());
+    assert!(listed_job.get("command_summary").is_none());
+    assert!(listed_job.get("stdout_tail").is_none());
+    let active = runtime
+        .active_jobs_summary(Some(&project), Some(&session), None, 20)
+        .await;
+    let active_job = active["recent"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|job| job["job_id"] == job_id)
+        .unwrap();
+    assert_eq!(
+        active_job["validation"]["source_state"],
+        listed_job["validation"]["source_state"]
+    );
+
     validation_reply(&runtime, client, &request, Some(0)).await;
     let continuation = &receipt["continuation"];
     let observed = canonical_call(
@@ -519,6 +562,33 @@ async fn e2c_job_handoff_has_exact_continuation_and_later_write_invalidates_term
         terminal.output["validation"]["source_state"]["freshness"], "stale",
         "{terminal:?}"
     );
+    let listed_stale = runtime
+        .list_jobs_for_auth_with_filters(
+            Some(20),
+            None,
+            Some(project.clone()),
+            Some(session.clone()),
+            None,
+        )
+        .await;
+    let stale_job = listed_stale.output["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|job| job["job_id"] == job_id)
+        .unwrap();
+    assert_eq!(
+        stale_job["validation"]["source_state"]["freshness"],
+        "stale"
+    );
+    assert_eq!(
+        stale_job["validation"]["source_state"]["observed_mutation_fence"],
+        "crossed"
+    );
+    assert!(stale_job["validation"]["source_state"]
+        .get("start_fence")
+        .is_none());
+
     let after = runtime
         .validation_summary_for_session_with_jobs(&summary, 20, None)
         .await;

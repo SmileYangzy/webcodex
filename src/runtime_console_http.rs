@@ -11,7 +11,7 @@ use crate::auth::{
 use crate::tool_runtime::sessions::{
     aggregate_console_list, is_valid_session_id, SessionMessageKind, SessionMessagePriority,
     WorkflowSessionConsoleAggregate, WorkflowSessionConsoleAttentionOverview,
-    WorkflowSessionConsoleList, WorkflowSessionConsoleListItem,
+    WorkflowSessionConsoleList, WorkflowSessionConsoleListItem, DEFAULT_MAX_SESSIONS,
 };
 use crate::tool_runtime::{ToolCall, ToolRuntime};
 use salvo::prelude::*;
@@ -30,28 +30,31 @@ use communication::{
     communication_inbox, communication_inbox_consume, communication_message_post,
 };
 
-const DEFAULT_PROJECT_LIMIT: usize = 50;
-const MAX_PROJECT_LIMIT: usize = 100;
+// Runtime Console inventories are operator-facing and the underlying stores are
+// already bounded. Avoid arbitrary 10/20/50/100-row presentation cliffs that make
+// existing Projects and Sessions impossible to find in the WebUI.
+const DEFAULT_PROJECT_LIMIT: usize = 2_000;
+const MAX_PROJECT_LIMIT: usize = 2_000;
 const MAX_PROJECT_ID_CHARS: usize = 512;
 const MAX_PROJECT_NAME_CHARS: usize = 160;
 const MAX_PROJECT_PATH_BYTES: usize = 4096;
 const MAX_CLIENT_ID_CHARS: usize = 160;
 const MAX_STATUS_CHARS: usize = 64;
-const DEFAULT_RUNNER_PROJECT_LIMIT: usize = 24;
-const MAX_RUNNER_PROJECT_LIMIT: usize = 32;
-const CONSOLE_AGGREGATE_SESSION_LIMIT: usize = 50;
+const DEFAULT_RUNNER_PROJECT_LIMIT: usize = MAX_PROJECT_LIMIT;
+const MAX_RUNNER_PROJECT_LIMIT: usize = MAX_PROJECT_LIMIT;
+const CONSOLE_AGGREGATE_SESSION_LIMIT: usize = DEFAULT_MAX_SESSIONS;
 const HOME_PROJECT_SCAN_LIMIT: usize = MAX_PROJECT_LIMIT;
-const HOME_SESSIONS_PER_PROJECT_LIMIT: usize = CONSOLE_AGGREGATE_SESSION_LIMIT;
-const HOME_RECENT_SESSION_LIMIT: usize = 10;
+const HOME_SESSIONS_PER_PROJECT_LIMIT: usize = DEFAULT_MAX_SESSIONS;
+const HOME_RECENT_SESSION_LIMIT: usize = DEFAULT_MAX_SESSIONS;
 const DEFAULT_MESSAGE_LIMIT: usize = 100;
 const MAX_MESSAGE_LIMIT: usize = 100;
 const MAX_OBSERVATION_TOKEN_CHARS: usize = 192;
-const DEFAULT_WINDOW_LIMIT: usize = 100;
-const MAX_WINDOW_LIMIT: usize = 100;
-const DEFAULT_WINDOW_ACTIVITY_LIMIT: usize = 100;
-const MAX_WINDOW_ACTIVITY_LIMIT: usize = 500;
-const DEFAULT_WINDOW_SESSION_LIMIT: usize = 50;
-const MAX_WINDOW_SESSION_LIMIT: usize = 100;
+const DEFAULT_WINDOW_LIMIT: usize = 2_000;
+const MAX_WINDOW_LIMIT: usize = 2_000;
+const DEFAULT_WINDOW_ACTIVITY_LIMIT: usize = 2_000;
+const MAX_WINDOW_ACTIVITY_LIMIT: usize = 2_000;
+const DEFAULT_WINDOW_SESSION_LIMIT: usize = DEFAULT_MAX_SESSIONS;
+const MAX_WINDOW_SESSION_LIMIT: usize = DEFAULT_MAX_SESSIONS;
 const MAX_WINDOW_KEY_CHARS: usize = 128;
 
 pub(crate) fn routes() -> Router {
@@ -81,6 +84,10 @@ pub(crate) fn routes() -> Router {
         .push(
             Router::with_path(api_path(RouteId::RuntimeConsoleWorkflowSessions))
                 .post(workflow_sessions),
+        )
+        .push(
+            Router::with_path(api_path(RouteId::RuntimeConsoleWorkflowSessionLocate))
+                .post(workflow_session_locate),
         )
         .push(
             Router::with_path(api_path(RouteId::RuntimeConsoleWorkflowSession))
@@ -179,6 +186,12 @@ struct WorkflowSessionsInput {
     project: String,
     #[serde(default)]
     limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkflowSessionLocateInput {
+    session_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -541,6 +554,16 @@ struct RuntimeConsoleRecentSession {
 }
 
 #[derive(Debug, Serialize)]
+struct RuntimeConsoleLocatedSession {
+    client_id: String,
+    project_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project_name: Option<String>,
+    #[serde(flatten)]
+    session: crate::tool_runtime::sessions::WorkflowSessionConsoleDetail,
+}
+
+#[derive(Debug, Serialize)]
 struct RuntimeConsoleRunnerSummary {
     client_id: String,
     connected: bool,
@@ -668,6 +691,8 @@ struct RuntimeConsoleProjects {
 struct RuntimeConsoleProject {
     id: String,
     client_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project_ref: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1241,16 +1266,7 @@ async fn listed_projects_for_auth(
 ) -> Result<(Vec<Value>, usize, bool), RuntimeConsoleError> {
     require_project_read(auth)?;
     let result = runtime
-        .dispatch_with_auth(
-            ToolCall::ListProjects {
-                client_id,
-                project,
-                query,
-                limit: Some(limit),
-                summary_only: false,
-            },
-            Some(auth),
-        )
+        .list_projects_for_runtime_console(Some(auth), client_id, project, query, limit)
         .await;
     if !result.success {
         return Err(
@@ -1283,6 +1299,19 @@ async fn listed_projects_for_auth(
     Ok((values, total, truncated))
 }
 
+async fn exact_console_project_for_auth(
+    runtime: &ToolRuntime,
+    auth: &AuthContext,
+    project: &str,
+) -> Result<RuntimeConsoleProject, RuntimeConsoleError> {
+    let (values, _, _) =
+        listed_projects_for_auth(runtime, auth, None, Some(project.to_string()), None, 1).await?;
+    values
+        .into_iter()
+        .find_map(|value| project_selector_row(&value))
+        .ok_or(RuntimeConsoleError::NotFound)
+}
+
 fn project_selector_row(value: &Value) -> Option<RuntimeConsoleProject> {
     let id = bounded_text(value.get("id")?, MAX_PROJECT_ID_CHARS)?;
     if !valid_project_id(&id) {
@@ -1292,6 +1321,9 @@ fn project_selector_row(value: &Value) -> Option<RuntimeConsoleProject> {
     Some(RuntimeConsoleProject {
         id,
         client_id,
+        project_ref: value
+            .get("project_ref")
+            .and_then(|value| bounded_text(value, MAX_PROJECT_ID_CHARS)),
         name: value
             .get("name")
             .and_then(|value| bounded_text(value, MAX_PROJECT_NAME_CHARS)),
@@ -1470,6 +1502,30 @@ async fn workflow_sessions_for_auth(
     Ok(list)
 }
 
+async fn workflow_session_locate_for_auth(
+    runtime: &ToolRuntime,
+    auth: &AuthContext,
+    session_id: &str,
+) -> Result<RuntimeConsoleLocatedSession, RuntimeConsoleError> {
+    if !is_valid_session_id(session_id) {
+        return Err(RuntimeConsoleError::Invalid);
+    }
+    let summary = runtime
+        .sessions
+        .summary(session_id, Some(1))
+        .ok_or(RuntimeConsoleError::NotFound)?;
+    let project_id = summary.project.ok_or(RuntimeConsoleError::NotFound)?;
+    let project = exact_console_project_for_auth(runtime, auth, &project_id).await?;
+    let session =
+        workflow_session_for_auth(runtime, auth, &project_id, session_id, Some(1)).await?;
+    Ok(RuntimeConsoleLocatedSession {
+        client_id: project.client_id,
+        project_id,
+        project_name: project.name,
+        session,
+    })
+}
+
 async fn workflow_session_for_auth(
     runtime: &ToolRuntime,
     auth: &AuthContext,
@@ -1504,7 +1560,12 @@ async fn workflow_session_for_auth(
 fn window_principal_filter(
     auth: &AuthContext,
 ) -> Result<Option<(String, String)>, RuntimeConsoleError> {
-    if auth.is_admin_caller() {
+    // Runtime Console is an operator surface. A caller with runtime:read should
+    // discover Window candidates across credentials and then have every projected
+    // event re-authorized through current Project visibility. Restrict only an
+    // explicitly Project-scoped model credential to its own durable principal;
+    // that narrow credential must never become a cross-Project observation key.
+    if !auth.is_project_scoped_model_subject() {
         return Ok(None);
     }
     crate::tool_runtime::runtime_observation_principal(Some(auth))
@@ -1542,6 +1603,71 @@ async fn active_window_request_visible_cached(
         runtime, auth, cache, request,
     )
     .await
+}
+
+async fn console_window_event_visible_cached(
+    runtime: &ToolRuntime,
+    auth: &AuthContext,
+    discovery_principal: Option<(&str, &str)>,
+    caller_principal: Option<(&str, &str)>,
+    cache: &mut HashMap<String, bool>,
+    event: &webcodex_store::models::WindowActivityEventRecord,
+) -> bool {
+    if discovery_principal.is_none() && !auth.is_admin_caller() {
+        if let Some(project) = event.project.as_deref() {
+            return window_project_visible_cached(runtime, auth, cache, Some(project)).await;
+        }
+        let mut has_project_anchor = false;
+        for link in &event.workflow_links {
+            if let Some(project) = link.project.as_deref() {
+                has_project_anchor = true;
+                if window_project_visible_cached(runtime, auth, cache, Some(project)).await {
+                    return true;
+                }
+            }
+        }
+        if has_project_anchor {
+            return false;
+        }
+        return caller_principal.is_some_and(|(kind, id)| {
+            event.principal_correlation_kind.as_deref() == Some(kind)
+                && event.principal_correlation_id.as_deref() == Some(id)
+        });
+    }
+    window_event_visible_cached(runtime, auth, cache, event).await
+}
+
+async fn console_active_window_request_visible_cached(
+    runtime: &ToolRuntime,
+    auth: &AuthContext,
+    discovery_principal: Option<(&str, &str)>,
+    caller_principal: Option<(&str, &str)>,
+    cache: &mut HashMap<String, bool>,
+    request: &crate::tool_runtime::ActiveWindowRequest,
+) -> bool {
+    if discovery_principal.is_none() && !auth.is_admin_caller() && request.project.is_none() {
+        if !caller_principal.is_some_and(|principal| {
+            crate::tool_runtime::window_activity::active_window_request_matches_principal(
+                request, principal,
+            )
+        }) {
+            return false;
+        }
+    }
+    active_window_request_visible_cached(runtime, auth, cache, request).await
+}
+
+async fn console_window_project_visible_cached(
+    runtime: &ToolRuntime,
+    auth: &AuthContext,
+    principal: Option<(&str, &str)>,
+    cache: &mut HashMap<String, bool>,
+    project: Option<&str>,
+) -> bool {
+    if principal.is_none() && !auth.is_admin_caller() && project.is_none() {
+        return false;
+    }
+    window_project_visible_cached(runtime, auth, cache, project).await
 }
 
 fn project_window_loop_timings(
@@ -1731,6 +1857,12 @@ async fn visible_window_summary_for_auth(
     #[cfg(not(feature = "experimental-code-mode"))]
     let events = db.list_window_activity_events(window_key, principal, MAX_WINDOW_ACTIVITY_LIMIT);
     let events = events.map_err(|_| RuntimeConsoleError::Internal)?;
+    let caller_principal = if principal.is_none() && !auth.is_admin_caller() {
+        crate::tool_runtime::runtime_observation_principal(Some(auth)).ok()
+    } else {
+        None
+    };
+    let caller_principal_ref = window_principal_ref(&caller_principal);
     let mut source = None;
     let mut last_seen_at_ms = None;
     let mut last_tool_call_at_ms = None;
@@ -1739,7 +1871,15 @@ async fn visible_window_summary_for_auth(
     let mut last_project = None;
     let mut project_observed_at = i64::MIN;
     for event in events {
-        if !window_event_visible_cached(runtime, auth, visibility_cache, &event).await
+        if !console_window_event_visible_cached(
+            runtime,
+            auth,
+            principal,
+            caller_principal_ref,
+            visibility_cache,
+            &event,
+        )
+        .await
             || project_filter.is_some_and(|project| event.project.as_deref() != Some(project))
         {
             continue;
@@ -1781,8 +1921,14 @@ async fn visible_window_summary_for_auth(
         if project_filter.is_some_and(|project| link.project.as_deref() != Some(project)) {
             continue;
         }
-        if window_project_visible_cached(runtime, auth, visibility_cache, link.project.as_deref())
-            .await
+        if console_window_project_visible_cached(
+            runtime,
+            auth,
+            principal,
+            visibility_cache,
+            link.project.as_deref(),
+        )
+        .await
         {
             linked_session_count = linked_session_count.saturating_add(1);
         }
@@ -1793,7 +1939,15 @@ async fn visible_window_summary_for_auth(
         .window_activity
         .list_for_window(window_key, principal)
     {
-        if !active_window_request_visible_cached(runtime, auth, visibility_cache, &request).await
+        if !console_active_window_request_visible_cached(
+            runtime,
+            auth,
+            principal,
+            caller_principal_ref,
+            visibility_cache,
+            &request,
+        )
+        .await
             || project_filter.is_some_and(|project| request.project.as_deref() != Some(project))
         {
             continue;
@@ -1982,7 +2136,7 @@ async fn windows_for_auth(
         }
     }
     let visibility = RuntimeConsoleWindowVisibility {
-        scope: if auth.is_admin_caller() {
+        scope: if principal.is_none() {
             RuntimeConsoleWindowVisibilityScope::Global
         } else {
             RuntimeConsoleWindowVisibilityScope::Principal
@@ -2014,6 +2168,12 @@ async fn window_for_auth(
         .ok_or(RuntimeConsoleError::Internal)?;
     let principal = window_principal_filter(auth)?;
     let principal_ref = window_principal_ref(&principal);
+    let caller_principal = if principal.is_none() && !auth.is_admin_caller() {
+        crate::tool_runtime::runtime_observation_principal(Some(auth)).ok()
+    } else {
+        None
+    };
+    let caller_principal_ref = window_principal_ref(&caller_principal);
     let activity_limit = input
         .activity_limit
         .unwrap_or(DEFAULT_WINDOW_ACTIVITY_LIMIT)
@@ -2039,8 +2199,15 @@ async fn window_for_auth(
         .window_activity
         .list_for_window(&input.client_window_key, principal_ref)
     {
-        if !active_window_request_visible_cached(runtime, auth, &mut visibility_cache, &request)
-            .await
+        if !console_active_window_request_visible_cached(
+            runtime,
+            auth,
+            principal_ref,
+            caller_principal_ref,
+            &mut visibility_cache,
+            &request,
+        )
+        .await
         {
             continue;
         }
@@ -2080,8 +2247,17 @@ async fn window_for_auth(
     let raw_activity_at_cap = raw_activity.len() == activity_scan_limit;
     let mut activity_visible = Vec::with_capacity(raw_activity.len());
     for event in &raw_activity {
-        activity_visible
-            .push(window_event_visible_cached(runtime, auth, &mut visibility_cache, event).await);
+        activity_visible.push(
+            console_window_event_visible_cached(
+                runtime,
+                auth,
+                principal_ref,
+                caller_principal_ref,
+                &mut visibility_cache,
+                event,
+            )
+            .await,
+        );
     }
     let timing = project_window_loop_timings(&raw_activity, &activity_visible);
     let mut activity = Vec::new();
@@ -2181,7 +2357,7 @@ async fn window_for_auth(
         activity_truncated,
         activity,
         visibility: RuntimeConsoleWindowVisibility {
-            scope: if auth.is_admin_caller() {
+            scope: if principal.is_none() {
                 RuntimeConsoleWindowVisibilityScope::Global
             } else {
                 RuntimeConsoleWindowVisibilityScope::Principal
@@ -2495,7 +2671,7 @@ async fn runner_for_auth(
     let projects_returned = project_summaries.len();
     recent_sessions.sort_by(|a, b| b.session.updated_at.cmp(&a.session.updated_at));
     let candidate_count = recent_sessions.len();
-    recent_sessions.truncate(50);
+    recent_sessions.truncate(DEFAULT_MAX_SESSIONS);
     let recent_sessions = RuntimeConsoleRecentSessions {
         returned: recent_sessions.len(),
         candidate_count,
@@ -2847,6 +3023,22 @@ async fn workflow_sessions(req: &mut Request, depot: &mut Depot, res: &mut Respo
         Err(_) => return render_error(res, RuntimeConsoleError::Invalid),
     };
     match workflow_sessions_for_auth(&runtime, &auth, &input.project, input.limit).await {
+        Ok(output) => res.render(Json(output)),
+        Err(error) => render_error(res, error),
+    }
+}
+
+#[handler]
+async fn workflow_session_locate(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    let (runtime, auth) = match prepared(req, depot).await {
+        Ok(value) => value,
+        Err(error) => return render_error(res, error),
+    };
+    let input = match req.parse_json::<WorkflowSessionLocateInput>().await {
+        Ok(input) => input,
+        Err(_) => return render_error(res, RuntimeConsoleError::Invalid),
+    };
+    match workflow_session_locate_for_auth(&runtime, &auth, &input.session_id).await {
         Ok(output) => res.render(Json(output)),
         Err(error) => render_error(res, error),
     }
@@ -3486,6 +3678,7 @@ mod tests {
                 .map(|index| RuntimeConsoleProject {
                     id: format!("agent:runner:project-{index}"),
                     client_id: "runner".to_string(),
+                    project_ref: None,
                     name: Some(format!("Project {index}")),
                     path: None,
                     connected: true,
@@ -3518,10 +3711,10 @@ mod tests {
     }
 
     #[test]
-    fn runtime_home_project_session_bound_propagates_partial_to_runner() {
+    fn runtime_home_projects_all_retained_sessions_without_extra_presentation_truncation() {
         let runtime = test_runtime();
         let project_id = "agent:runner:busy";
-        for index in 0..HOME_SESSIONS_PER_PROJECT_LIMIT + 3 {
+        for index in 0..HOME_SESSIONS_PER_PROJECT_LIMIT {
             runtime.sessions.start_session(
                 Some(project_id.to_string()),
                 Some(format!("Session {index}")),
@@ -3531,6 +3724,7 @@ mod tests {
             projects: vec![RuntimeConsoleProject {
                 id: project_id.to_string(),
                 client_id: "runner".to_string(),
+                project_ref: None,
                 name: Some("Busy".to_string()),
                 path: Some("/root/git/busy".to_string()),
                 connected: true,
@@ -3544,13 +3738,13 @@ mod tests {
         let project_sessions = scan.projects[0].sessions.as_ref().unwrap();
         assert_eq!(
             project_sessions.retained_sessions,
-            HOME_SESSIONS_PER_PROJECT_LIMIT + 3
+            HOME_SESSIONS_PER_PROJECT_LIMIT
         );
         assert_eq!(
             project_sessions.returned_sessions,
             HOME_SESSIONS_PER_PROJECT_LIMIT
         );
-        assert!(project_sessions.sessions_truncated);
+        assert!(!project_sessions.sessions_truncated);
 
         let rows = runner_fleet_rows(
             &serde_json::json!({"agents": [{"client_id": "runner", "connected": true}]}),
@@ -3560,7 +3754,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].projects_scanned, 1);
         assert!(!rows[0].projects_scan_partial);
-        assert!(rows[0].sessions.sessions_truncated);
+        assert!(!rows[0].sessions.sessions_truncated);
     }
 
     #[test]
@@ -4083,6 +4277,24 @@ mod tests {
         assert_eq!(retarget.status_code, Some(StatusCode::BAD_REQUEST));
     }
 
+    #[test]
+    fn runtime_console_project_projection_preserves_short_project_ref() {
+        let row = project_selector_row(&serde_json::json!({
+            "id": "agent:special:webcodex",
+            "client_id": "special",
+            "project_ref": "~p118",
+            "name": "WebCodex",
+            "path": "/root/git/webcodex",
+            "connected": true,
+            "agent_status": "online"
+        }))
+        .unwrap();
+        assert_eq!(row.project_ref.as_deref(), Some("~p118"));
+        assert!(serde_json::to_string(&row)
+            .unwrap()
+            .contains("\"project_ref\":\"~p118\""));
+    }
+
     #[tokio::test]
     async fn project_filters_apply_before_bounded_runtime_console_limit() {
         let runtime = test_runtime();
@@ -4111,6 +4323,17 @@ mod tests {
         assert_eq!(global.projects.len(), 100);
         assert!(global.truncated);
         assert!(!global
+            .projects
+            .iter()
+            .any(|project| project.id == "agent:special:webcodex"));
+
+        let full = projects_for_auth(&runtime, &auth, Some(MAX_PROJECT_LIMIT))
+            .await
+            .unwrap();
+        assert_eq!(full.total, 101);
+        assert_eq!(full.projects.len(), 101);
+        assert!(!full.truncated);
+        assert!(full
             .projects
             .iter()
             .any(|project| project.id == "agent:special:webcodex"));
@@ -4236,6 +4459,30 @@ mod tests {
             .await
             .unwrap_err(),
             RuntimeConsoleError::NotFound
+        );
+
+        let local = runtime.sessions.start_session(
+            Some("agent:client-a:proj-a".to_string()),
+            Some("locatable".to_string()),
+        );
+        let located = workflow_session_locate_for_auth(&runtime, &auth_a, &local.session_id)
+            .await
+            .unwrap();
+        assert_eq!(located.project_id, "agent:client-a:proj-a");
+        assert_eq!(located.client_id, "client-a");
+        assert_eq!(located.session.session_id, local.session_id);
+        assert_eq!(located.session.title, "locatable");
+        assert_eq!(
+            workflow_session_locate_for_auth(&runtime, &auth_b, &local.session_id)
+                .await
+                .unwrap_err(),
+            RuntimeConsoleError::NotFound
+        );
+        assert_eq!(
+            workflow_session_locate_for_auth(&runtime, &auth_a, "wc_sess_invalid")
+                .await
+                .unwrap_err(),
+            RuntimeConsoleError::Invalid
         );
     }
 
@@ -4530,7 +4777,7 @@ mod tests {
     }
 
     #[test]
-    fn window_activity_lookup_is_principal_and_current_project_authority_bounded() {
+    fn window_activity_lookup_is_runtime_management_and_current_project_authority_bounded() {
         // This multi-principal integration fixture overflows the default libtest
         // stack in workspace builds, even when selected alone with one test thread.
         // Match the bounded stack isolation used by the large MCP fixtures without
@@ -4544,7 +4791,7 @@ mod tests {
                     .build()
                     .expect("build window authority test runtime")
                     .block_on(
-                        window_activity_lookup_is_principal_and_current_project_authority_bounded_body(),
+                        window_activity_lookup_is_runtime_management_and_current_project_authority_bounded_body(),
                     );
             })
             .expect("spawn window authority test thread")
@@ -4552,7 +4799,8 @@ mod tests {
             .expect("window authority test thread panicked");
     }
 
-    async fn window_activity_lookup_is_principal_and_current_project_authority_bounded_body() {
+    async fn window_activity_lookup_is_runtime_management_and_current_project_authority_bounded_body(
+    ) {
         let (_tmp, db, runtime) = test_runtime_with_window_db();
         let auth_a = crate::auth::shared_key_context("window-group-a");
         let auth_b = crate::auth::shared_key_context("window-group-b");
@@ -4579,6 +4827,7 @@ mod tests {
         let window_b = "b".repeat(64);
         let revoked_project_window = "c".repeat(64);
         let revoked_session_window = "d".repeat(64);
+        let foreign_unscoped_window = "e".repeat(64);
         record_window_event(&db, &auth_a, &window_a, Some(project_a), None, 1_000);
         record_window_event(&db, &auth_b, &window_b, Some(project_b), None, 2_000);
         // Model a historical event that was legitimate for this principal before
@@ -4603,6 +4852,9 @@ mod tests {
             Some(("wc_sess_hidden", project_b)),
             4_000,
         );
+        // Cross-credential management discovery must not turn a projectless
+        // historical event from another principal into shared runtime evidence.
+        record_window_event(&db, &auth_b, &foreign_unscoped_window, None, None, 4_500);
 
         // A meaningful tools/call is not exposed to a non-admin during the
         // tiny pre-resolution interval where its exact Project is not known yet.
@@ -4676,17 +4928,18 @@ mod tests {
         );
         assert_eq!(
             visible.visibility.scope,
-            RuntimeConsoleWindowVisibilityScope::Principal
+            RuntimeConsoleWindowVisibilityScope::Global
         );
         let serialized = serde_json::to_string(&visible).unwrap();
         assert!(!serialized.contains(&window_b));
         assert!(!serialized.contains(&revoked_project_window));
         assert!(!serialized.contains(&revoked_session_window));
+        assert!(!serialized.contains(&foreign_unscoped_window));
         assert!(!serialized.contains(&pre_resolution_key));
         assert!(!serialized.contains(&transport_key));
         assert!(serialized.contains(&diagnostic_key));
         assert!(!serialized.contains(project_b));
-        assert!(serialized.contains("\"scope\":\"principal\""));
+        assert!(serialized.contains("\"scope\":\"global\""));
 
         let own = window_for_auth(
             &runtime,
@@ -4703,13 +4956,14 @@ mod tests {
         assert_eq!(own.last_seen_at_ms, 1_001);
         assert_eq!(
             own.visibility.scope,
-            RuntimeConsoleWindowVisibilityScope::Principal
+            RuntimeConsoleWindowVisibilityScope::Global
         );
 
         for hidden_key in [
             &window_b,
             &revoked_project_window,
             &revoked_session_window,
+            &foreign_unscoped_window,
             &pre_resolution_key,
             &transport_key,
         ] {
@@ -4751,6 +5005,7 @@ mod tests {
                 window_b.as_str(),
                 revoked_project_window.as_str(),
                 revoked_session_window.as_str(),
+                foreign_unscoped_window.as_str(),
                 pre_resolution_key.as_str(),
                 transport_key.as_str(),
                 diagnostic_key.as_str(),
@@ -4759,32 +5014,95 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn window_visibility_scope_distinguishes_global_and_principal_without_leaking_identity() {
+    async fn window_visibility_scope_distinguishes_management_and_project_scoped_credentials() {
         let (_tmp, _db, runtime) = test_runtime_with_window_db();
         let admin = test_bootstrap_auth();
         let ordinary = crate::auth::shared_key_context("window-vis-test");
+        let mut project_scoped = AuthContext::new(AuthKind::ProjectCredential);
+        project_scoped.project_grant_id = Some("window-project-grant".to_string());
+        project_scoped.scopes = vec![
+            SCOPE_RUNTIME_READ.to_string(),
+            SCOPE_PROJECT_READ.to_string(),
+        ];
 
-        let admin_list = windows_for_auth(&runtime, &admin, Some(10), None)
+        for management in [&admin, &ordinary] {
+            let list = windows_for_auth(&runtime, management, Some(10), None)
+                .await
+                .unwrap();
+            assert_eq!(
+                list.visibility.scope,
+                RuntimeConsoleWindowVisibilityScope::Global
+            );
+            let encoded = serde_json::to_string(&list).unwrap();
+            assert!(encoded.contains("\"visibility\":{\"scope\":\"global\"}"));
+            assert!(!encoded.contains("window-vis-test"));
+        }
+
+        let project_list = windows_for_auth(&runtime, &project_scoped, Some(10), None)
             .await
             .unwrap();
         assert_eq!(
-            admin_list.visibility.scope,
-            RuntimeConsoleWindowVisibilityScope::Global
-        );
-        let admin_json = serde_json::to_string(&admin_list).unwrap();
-        assert!(admin_json.contains("\"visibility\":{\"scope\":\"global\"}"));
-        assert!(!admin_json.contains("bootstrap"));
-
-        let ordinary_list = windows_for_auth(&runtime, &ordinary, Some(10), None)
-            .await
-            .unwrap();
-        assert_eq!(
-            ordinary_list.visibility.scope,
+            project_list.visibility.scope,
             RuntimeConsoleWindowVisibilityScope::Principal
         );
-        let ordinary_json = serde_json::to_string(&ordinary_list).unwrap();
-        assert!(ordinary_json.contains("\"visibility\":{\"scope\":\"principal\"}"));
-        assert!(!ordinary_json.contains("window-vis-test"));
+        assert!(serde_json::to_string(&project_list)
+            .unwrap()
+            .contains("\"visibility\":{\"scope\":\"principal\"}"));
+    }
+
+    #[tokio::test]
+    async fn window_management_view_survives_oauth_access_token_rotation() {
+        let (_tmp, db, runtime) = test_runtime_with_window_db();
+        let mut writer = scoped_oauth(&[SCOPE_RUNTIME_READ, SCOPE_PROJECT_READ]);
+        writer.api_key_id = Some("oauth-window-token-a".to_string());
+        let mut reader = writer.clone();
+        reader.api_key_id = Some("oauth-window-token-b".to_string());
+        assert_ne!(
+            crate::tool_runtime::runtime_observation_principal(Some(&writer)).unwrap(),
+            crate::tool_runtime::runtime_observation_principal(Some(&reader)).unwrap(),
+            "fixture must model the historical token-specific observation principal"
+        );
+
+        let project = "agent:window-user:shared-project";
+        register_project(
+            &runtime,
+            "window-user",
+            "shared-project",
+            "/private/window-user",
+            Some(&writer),
+        )
+        .await;
+        let window_key = "9".repeat(64);
+        record_window_event(&db, &writer, &window_key, Some(project), None, 5_000);
+
+        let list = windows_for_auth(&runtime, &reader, Some(10), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            list.visibility.scope,
+            RuntimeConsoleWindowVisibilityScope::Global
+        );
+        assert_eq!(list.total, 1);
+        assert_eq!(list.windows[0].client_window_key, window_key);
+        assert_eq!(list.windows[0].last_project.as_deref(), Some(project));
+
+        let detail = window_for_auth(
+            &runtime,
+            &reader,
+            WindowInput {
+                client_window_key: window_key,
+                activity_limit: Some(20),
+                session_limit: Some(20),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            detail.visibility.scope,
+            RuntimeConsoleWindowVisibilityScope::Global
+        );
+        assert_eq!(detail.activity.len(), 1);
+        assert_eq!(detail.activity[0].project.as_deref(), Some(project));
     }
 
     #[tokio::test]

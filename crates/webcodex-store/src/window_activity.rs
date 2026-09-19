@@ -6,8 +6,10 @@ use crate::Database;
 use rusqlite::{params, Connection};
 use std::collections::BTreeSet;
 
-pub const MAX_WINDOW_ACTIVITY_LIMIT: usize = 500;
-pub const MAX_WINDOW_LINK_LIMIT: usize = 100;
+// Window history is already bounded by ActionAudit retention. Keep the human
+// console able to inspect the retained set instead of imposing tiny UI-only caps.
+pub const MAX_WINDOW_ACTIVITY_LIMIT: usize = 2_000;
+pub const MAX_WINDOW_LINK_LIMIT: usize = 2_000;
 
 fn bounded_limit(limit: usize, max: usize) -> i64 {
     limit.clamp(1, max) as i64
