@@ -330,6 +330,9 @@ pub enum ToolAuditSessionInputPolicy {
     OmitTopLevel(&'static [&'static str]),
     /// Remove nested search patterns while retaining bounded query metadata.
     SearchProjectTexts,
+    /// Preserve the historical single-query omission while redacting nested
+    /// patterns from batched compound search queries.
+    SearchAndRead,
     /// Remove opaque Job observation tokens from nested items.
     ObserveJobs,
 }

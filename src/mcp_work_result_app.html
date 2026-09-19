@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>WebCodex Work</title>
+<title>WebCodex Progress</title>
 <style>
 :root { color-scheme: light dark; font: 13px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
 * { box-sizing: border-box; }
@@ -34,7 +34,11 @@ h2 { margin: 0; font-size: 12px; font-weight: 650; }
 </head>
 <body>
 <main class="card" aria-live="polite">
-  <div class="header"><h1>WebCodex Work</h1><div class="actions"><button id="refresh" class="refresh" type="button" disabled>Refresh</button><span id="badge" class="badge">Loading</span></div></div>
+  <div class="header"><h1>WebCodex Progress</h1><div class="actions"><button id="refresh" class="refresh" type="button" disabled>Refresh</button><span id="badge" class="badge">Loading</span></div></div>
+  <section class="section">
+    <div class="section-head"><h2>Progress</h2><span id="progressMeta" class="secondary"></span></div>
+    <div id="progressStatus" class="primary">Waiting for Session activity…</div>
+  </section>
   <section class="section">
     <div class="section-head"><h2>Workspace</h2><span id="changesStats" class="secondary"></span></div>
     <div id="changesTitle" class="primary">Waiting for Work state…</div>
@@ -64,6 +68,12 @@ h2 { margin: 0; font-size: 12px; font-weight: 650; }
   const SESSION_ID = /^wc_sess_([A-Za-z0-9_-]{16}|[0-9a-f]{32})$/;
   const STATE_VERSION = /^wr1_[0-9a-f]{64}$/;
   const CALL_TIMEOUT_MS = 10000;
+  const VISIBLE_REFRESH_MS = 2500;
+  const HIDDEN_REFRESH_MS = 12000;
+  const VISIBLE_IDLE_REFRESH_MS = 10000;
+  const HIDDEN_IDLE_REFRESH_MS = 30000;
+  const IDLE_BACKOFF_AFTER_MS = 60000;
+  const AUTO_REFRESH_IDLE_PAUSE_MS = 30 * 60 * 1000;
   const MAX_PROJECT = 512;
   const MAX_PATH = 512;
   const MAX_FILES = 8;
@@ -83,6 +93,9 @@ h2 { margin: 0; font-size: 12px; font-weight: 650; }
   let lastStateVersion = null;
   let hostInitialized = false;
   let refreshInFlight = false;
+  let refreshTimer = null;
+  let sessionLifecycle = null;
+  let lastStateChangeAt = null;
   let tornDown = false;
   const pending = new Map();
   const el = id => document.getElementById(id);
@@ -183,11 +196,27 @@ h2 { margin: 0; font-size: 12px; font-weight: 650; }
     return value.tools.every(tool => typeof tool === "string" && tool.length > 0 && tool.length <= 64);
   }
 
+  function validSessionState(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+    if (!["active", "closed"].includes(value.lifecycle)) return false;
+    if (!safeCount(value.events_total) || !safeCount(value.events_returned) || typeof value.history_partial !== "boolean") return false;
+    if (!Number.isSafeInteger(value.updated_at)) return false;
+    if (value.title !== undefined && (typeof value.title !== "string" || value.title.length > 160)) return false;
+    const latest = value.latest_activity;
+    if (latest === undefined) return true;
+    if (!latest || typeof latest !== "object" || Array.isArray(latest)) return false;
+    if (typeof latest.tool !== "string" || latest.tool.length < 1 || latest.tool.length > 64) return false;
+    if (typeof latest.kind !== "string" || latest.kind.length < 1 || latest.kind.length > 64) return false;
+    if (!Number.isSafeInteger(latest.timestamp)) return false;
+    if (latest.status !== undefined && (typeof latest.status !== "string" || latest.status.length > 32)) return false;
+    return latest.duration_ms === undefined || safeCount(latest.duration_ms);
+  }
+
   function validState(value) {
     if (!value || typeof value !== "object" || Array.isArray(value) || value.version !== 1) return null;
     const candidate = pair(value.project, value.session_id);
     if (!candidate || typeof value.state_version !== "string" || !STATE_VERSION.test(value.state_version)) return null;
-    if (!validWorkspace(value.workspace) || !validValidation(value.validation) || !validReview(value.review)) return null;
+    if (!validWorkspace(value.workspace) || !validValidation(value.validation) || !validReview(value.review) || !validSessionState(value.session)) return null;
     if (value.final_changes !== undefined && !validFrozen(value.final_changes)) return null;
     return value;
   }
@@ -426,8 +455,23 @@ h2 { margin: 0; font-size: 12px; font-weight: 650; }
     el("reviewMeta").textContent = `${review.total} review ${review.total === 1 ? "event" : "events"}${review.history_partial ? " · history partial" : ""}`;
   }
 
+  function renderProgress(session) {
+    const latest = session.latest_activity;
+    if (latest) {
+      const status = latest.status ? ` · ${latest.status}` : "";
+      el("progressStatus").textContent = `${latest.tool}${status}`;
+    } else {
+      el("progressStatus").textContent = session.lifecycle === "closed" ? "Session closed" : "Session active";
+    }
+    const pieces = [`${session.events_total} session events`];
+    if (session.history_partial) pieces.push("history partial");
+    pieces.push(session.lifecycle === "closed" ? "closed" : "live");
+    el("progressMeta").textContent = pieces.join(" · ");
+  }
+
   function render(state) {
     if (tornDown) return;
+    renderProgress(state.session);
     renderChanges(state.workspace);
     renderValidation(state.validation);
     renderReview(state.review);
@@ -439,17 +483,37 @@ h2 { margin: 0; font-size: 12px; font-weight: 650; }
     button.textContent = refreshInFlight ? "Refreshing…" : "Refresh";
   }
 
-  async function refresh() {
+  function automaticRefreshDelay() {
+    const idleMs = lastStateChangeAt === null ? 0 : Math.max(0, Date.now() - lastStateChangeAt);
+    if (idleMs < IDLE_BACKOFF_AFTER_MS) return document.hidden ? HIDDEN_REFRESH_MS : VISIBLE_REFRESH_MS;
+    return document.hidden ? HIDDEN_IDLE_REFRESH_MS : VISIBLE_IDLE_REFRESH_MS;
+  }
+
+  function scheduleRefresh(delay) {
+    if (refreshTimer !== null) clearTimeout(refreshTimer);
+    refreshTimer = null;
+    if (tornDown || !hostInitialized || !identity || lastStateVersion === null || sessionLifecycle === "closed") return;
+    if (lastStateChangeAt !== null && Date.now() - lastStateChangeAt >= AUTO_REFRESH_IDLE_PAUSE_MS) {
+      if (!refreshInFlight) el("status").textContent = "Live · auto refresh paused";
+      return;
+    }
+    refreshTimer = setTimeout(() => {
+      refreshTimer = null;
+      void refresh(true);
+    }, delay ?? automaticRefreshDelay());
+  }
+
+  async function refresh(automatic = false) {
     if (tornDown || !hostInitialized || !identity || refreshInFlight) return;
     const hadSnapshot = lastStateVersion !== null;
     refreshInFlight = true;
     updateRefreshControl();
-    el("status").textContent = "Refreshing…";
+    if (!automatic) el("status").textContent = "Refreshing…";
     try {
       const response = await send("tools/call", { name: "work_result_state", arguments: { project: identity.project, session_id: identity.session_id } });
       if (tornDown) return;
       if (toolSuccess(response) === false) {
-        el("status").textContent = hadSnapshot ? "Refresh unavailable · showing last snapshot" : "Refresh unavailable · retry";
+        if (!automatic) el("status").textContent = hadSnapshot ? "Refresh unavailable · showing last snapshot" : "Refresh unavailable · retry";
         return;
       }
       const state = extractState(response);
@@ -458,18 +522,26 @@ h2 { margin: 0; font-size: 12px; font-weight: 650; }
         return;
       }
       hasRefreshed = true;
+      sessionLifecycle = state.session.lifecycle;
       if (state.state_version !== lastStateVersion) {
         lastStateVersion = state.state_version;
+        lastStateChangeAt = Date.now();
         render(state);
-        el("status").textContent = "Updated";
+        el("status").textContent = sessionLifecycle === "closed"
+          ? (automatic ? "Closed · updated" : "Updated · closed")
+          : (automatic ? "Live · updated" : "Updated");
       } else {
-        el("status").textContent = "Up to date";
+        if (!automatic) lastStateChangeAt = Date.now();
+        el("status").textContent = sessionLifecycle === "closed"
+          ? (automatic ? "Closed" : "Up to date · closed")
+          : (automatic ? "Live" : "Up to date");
       }
     } catch (_) {
-      if (!tornDown) el("status").textContent = hadSnapshot ? "Refresh unavailable · showing last snapshot" : "Refresh unavailable · retry";
+      if (!tornDown && !automatic) el("status").textContent = hadSnapshot ? "Refresh unavailable · showing last snapshot" : "Refresh unavailable · retry";
     } finally {
       refreshInFlight = false;
       updateRefreshControl();
+      scheduleRefresh();
     }
   }
 
@@ -486,17 +558,22 @@ h2 { margin: 0; font-size: 12px; font-weight: 650; }
       return;
     }
     if (!acceptInitialFrozen(state.final_changes)) return;
+    sessionLifecycle = state.session.lifecycle;
     if (!hasRefreshed && state.state_version !== lastStateVersion) {
       lastStateVersion = state.state_version;
+      lastStateChangeAt = Date.now();
       render(state);
     }
-    el("status").textContent = "Snapshot ready";
+    el("status").textContent = sessionLifecycle === "closed" ? "Closed · manual Refresh available" : "Live";
     updateRefreshControl();
+    scheduleRefresh(500);
   }
 
   function teardown() {
     if (tornDown) return;
     tornDown = true;
+    if (refreshTimer !== null) clearTimeout(refreshTimer);
+    refreshTimer = null;
     refreshInFlight = false;
     updateRefreshControl();
     for (const entry of pending.values()) {
@@ -532,19 +609,27 @@ h2 { margin: 0; font-size: 12px; font-weight: 650; }
     }
   });
 
-  el("refresh").onclick = () => { void refresh(); };
+  el("refresh").onclick = () => { void refresh(false); };
   el("frozenMore").onclick = () => { if (snapshot) appendFrozenFiles(snapshot.files.length); };
+  addEventListener("visibilitychange", () => {
+    if (!tornDown && hostInitialized && identity && lastStateVersion !== null) {
+      scheduleRefresh(document.hidden ? HIDDEN_REFRESH_MS : 250);
+    }
+  });
   updateRefreshControl();
   addEventListener("pagehide", teardown, { once: true });
   addEventListener("beforeunload", teardown, { once: true });
 
-  send("ui/initialize", { protocolVersion: APP_PROTOCOL, appInfo: { name: "webcodex-work-result-app", title: "WebCodex Work", version: "1.0.0" }, appCapabilities: {} })
+  send("ui/initialize", { protocolVersion: APP_PROTOCOL, appInfo: { name: "webcodex-work-result-app", title: "WebCodex Progress", version: "1.1.0" }, appCapabilities: {} })
     .then(() => {
       if (tornDown) return;
       hostInitialized = true;
-      el("status").textContent = lastStateVersion !== null ? "Snapshot ready" : identity ? "Waiting for Work snapshot · Refresh available" : "Host initialized · waiting for exact tool identity";
+      el("status").textContent = lastStateVersion !== null
+        ? (sessionLifecycle === "closed" ? "Closed · manual Refresh available" : "Live")
+        : identity ? "Waiting for Work snapshot" : "Host initialized · waiting for exact tool identity";
       notify("ui/notifications/initialized", {});
       updateRefreshControl();
+      scheduleRefresh();
     })
     .catch(() => { if (!tornDown) el("status").textContent = "Host initialization unavailable"; });
 })();

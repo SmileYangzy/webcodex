@@ -203,8 +203,8 @@ async fn work_result_resource_is_canonical_while_changes_resources_are_hidden_co
         .find(|resource| resource["uri"] == MCP_WORK_RESULT_UI_RESOURCE_URI)
         .expect("canonical Work Result resource");
     let work_description = work_resource["description"].as_str().unwrap();
-    assert!(work_description.contains("user explicitly refreshes"));
-    assert!(!work_description.contains("poll"));
+    assert!(work_description.contains("progress card"));
+    assert!(work_description.contains("app-only live reads"));
     assert!(!resources
         .iter()
         .any(|resource| resource["uri"] == MCP_RESULT_UI_RESOURCE_URI));
@@ -337,7 +337,7 @@ async fn work_result_state_discards_unadvertised_recording_session_wrapper() {
 }
 
 #[test]
-fn work_result_html_is_bounded_display_only_manual_refresh_ui() {
+fn work_result_html_is_bounded_live_progress_ui() {
     for required in [
         "work_result_state",
         "changes_file_diff",
@@ -351,7 +351,10 @@ fn work_result_html_is_bounded_display_only_manual_refresh_ui() {
         "state_version",
         "pagehide",
         "beforeunload",
-        "WebCodex Work",
+        "WebCodex Progress",
+        "visibilitychange",
+        "VISIBLE_REFRESH_MS",
+        "HIDDEN_REFRESH_MS",
     ] {
         assert!(
             MCP_WORK_RESULT_APP_HTML.contains(required),
@@ -361,7 +364,6 @@ fn work_result_html_is_bounded_display_only_manual_refresh_ui() {
     for forbidden in [
         "setInterval",
         "clearInterval",
-        "visibilitychange",
         "POLL_MS",
         "pollTimer",
         "localStorage",

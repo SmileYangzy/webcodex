@@ -116,7 +116,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 super::ToolActivityPresentation::Transport,
                 super::ToolActivityInteraction::NonMeaningful,
             ),
-            "Optionally present one exact coding Workflow Session as a persistent read-only Work Result MCP App card when a user-visible work summary is genuinely useful. Requires explicit project + session_id, creates no work, runs no validation/review, changes no Session lifecycle, and grants no authority. The initial Work Result includes eligible frozen final changes for lazy in-card diff reads; do not call merely to acknowledge a clean worktree and do not call repeatedly to refresh. User-driven app-only refresh updates live workspace, validation, and review without replacing the card's frozen snapshot. Presentation is UX only, never a correctness requirement; repeated explicit presentation may create another Host card.",
+            "Present one exact coding Workflow Session as a persistent read-only WebCodex Progress MCP App card when a long-running task benefits from visible progress. Requires explicit project + session_id, creates no work, runs no validation/review, changes no Session lifecycle, and grants no authority. Call at most once per long-running Session: the mounted App performs bounded app-only live reads of Session activity, workspace, validation, and review, so model-visible polling calls are unnecessary for presentation. Eligible frozen final changes remain available for lazy in-card diff reads. Presentation is UX only, never a correctness requirement; repeated explicit presentation may create another Host card.",
         ))
         .with_gpt_action_unsupported(),
         155,

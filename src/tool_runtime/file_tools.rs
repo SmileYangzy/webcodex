@@ -71,38 +71,51 @@ impl ToolRuntime {
             ToolCall::SearchAndRead {
                 project,
                 query,
+                queries,
                 session_id,
                 read_before,
                 read_after,
                 max_reads,
                 with_line_numbers,
-            } => match project_resolution {
-                Some(Ok(resolved)) => {
-                    self.search_and_read_resolved(
-                        &resolved,
-                        query,
-                        session_id,
-                        read_before,
-                        read_after,
-                        max_reads,
-                        with_line_numbers,
-                    )
-                    .await
+            } => {
+                let queries = match (query, queries) {
+                    (Some(query), None) => vec![query],
+                    (None, Some(queries)) if !queries.is_empty() && queries.len() <= 8 => queries,
+                    (Some(_), Some(_)) => {
+                        return ToolResult::err(
+                            "search_and_read accepts query or queries, not both",
+                        )
+                    }
+                    _ => return ToolResult::err("search_and_read requires query or 1..8 queries"),
+                };
+                match project_resolution {
+                    Some(Ok(resolved)) => {
+                        self.search_and_read_resolved(
+                            &resolved,
+                            queries,
+                            session_id,
+                            read_before,
+                            read_after,
+                            max_reads,
+                            with_line_numbers,
+                        )
+                        .await
+                    }
+                    Some(Err(error)) => error.into_tool_result(),
+                    None => {
+                        self.search_and_read(
+                            project,
+                            queries,
+                            session_id,
+                            read_before,
+                            read_after,
+                            max_reads,
+                            with_line_numbers,
+                        )
+                        .await
+                    }
                 }
-                Some(Err(error)) => error.into_tool_result(),
-                None => {
-                    self.search_and_read(
-                        project,
-                        query,
-                        session_id,
-                        read_before,
-                        read_after,
-                        max_reads,
-                        with_line_numbers,
-                    )
-                    .await
-                }
-            },
+            }
             ToolCall::WriteProjectFile {
                 project,
                 path,

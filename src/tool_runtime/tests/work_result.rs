@@ -419,6 +419,83 @@ async fn work_result_state_reauthorizes_exact_identity_and_refresh_does_not_reco
 }
 
 #[tokio::test]
+async fn work_result_progress_uses_latest_meaningful_session_activity() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_git_repo(tmp.path());
+    commit_file(tmp.path(), "README.md", "hello\n", "initial");
+    let runtime = test_runtime();
+    let project = register_runner_project_at_path(
+        &runtime,
+        "work-result-meaningful-progress",
+        "demo",
+        tmp.path(),
+    )
+    .await;
+    let auth = auth_context(None, true);
+    let session = runtime.sessions.start_session(
+        Some(project.clone()),
+        Some("Work Result meaningful progress".to_string()),
+    );
+
+    let meaningful = runtime.sessions.record_tool_call_started_with_options(
+        Some(&session.session_id),
+        crate::tool_runtime::sessions::SessionTransport::Api,
+        "show_changes",
+        &json!({"project": project, "include_diff": false}),
+        Some(project.clone()),
+        crate::tool_runtime::sessions::session_tool_contract("show_changes"),
+    );
+    runtime.sessions.record_tool_call_finished(
+        meaningful,
+        true,
+        &json!({"git_available": true, "clean": true, "files": [], "files_total": 0}),
+        None,
+        None,
+    );
+
+    let presentation = runtime.sessions.record_tool_call_started_with_options(
+        Some(&session.session_id),
+        crate::tool_runtime::sessions::SessionTransport::Mcp,
+        "present_work_result",
+        &json!({"project": project, "session_id": session.session_id}),
+        Some(project.clone()),
+        crate::tool_runtime::sessions::session_tool_contract("present_work_result"),
+    );
+    runtime.sessions.record_tool_call_finished(
+        presentation,
+        true,
+        &json!({"work_result": {"project": project, "session_id": session.session_id}}),
+        None,
+        None,
+    );
+
+    let state = refresh_once(
+        &runtime,
+        "work-result-meaningful-progress",
+        &project,
+        &session.session_id,
+        &auth,
+    )
+    .await;
+    assert!(state.success, "{:?}", state.error);
+    assert_eq!(
+        state.output["work_result"]["session"]["latest_activity"]["tool"], "show_changes",
+        "presentation-only Session events must not masquerade as work progress"
+    );
+    assert_eq!(
+        state.output["work_result"]["session"]["latest_activity"]["kind"],
+        "tool_call_finished"
+    );
+    assert!(
+        state.output["work_result"]["session"]["events_total"]
+            .as_u64()
+            .unwrap()
+            >= 4,
+        "session event count remains an honest total rather than a tool-call count"
+    );
+}
+
+#[tokio::test]
 async fn work_result_refresh_reobserves_validation_source_staleness_without_recording() {
     let tmp = tempfile::tempdir().unwrap();
     init_git_repo(tmp.path());

@@ -71,6 +71,16 @@ pub fn session_input_summary_for_tool(tool_name: &str, arguments: &Value) -> Val
                 }
             }
         }
+        ToolAuditSessionInputPolicy::SearchAndRead => {
+            // Preserve the established single-query privacy contract while the
+            // batch form retains useful bounded query metadata without patterns.
+            object.remove("query");
+            if let Some(queries) = object.get_mut("queries").and_then(Value::as_array_mut) {
+                for query in queries.iter_mut().filter_map(Value::as_object_mut) {
+                    query.remove("pattern");
+                }
+            }
+        }
         ToolAuditSessionInputPolicy::ObserveJobs => {
             // Raw/pre-parse input must not turn this enum into an arbitrary
             // string channel in the Session ledger.
@@ -284,6 +294,45 @@ mod tests {
         assert!(!serialized.contains("PRIVATE_PROMPT"));
         assert!(!serialized.contains("PRIVATE_REASONING"));
         assert!(!serialized.contains("wc_agent_private_secret"));
+    }
+
+    #[test]
+    fn search_and_read_session_audit_redacts_single_and_batched_patterns() {
+        let single = session_input_summary_for_tool(
+            "search_and_read",
+            &json!({
+                "project": "demo",
+                "query": {"pattern": "PRIVATE_SINGLE_PATTERN", "path": "src/lib.rs"},
+                "read_before": 12
+            }),
+        );
+        assert_eq!(single["project"], "demo");
+        assert_eq!(single["read_before"], 12);
+        assert!(single.get("query").is_none());
+        assert!(!single.to_string().contains("PRIVATE_SINGLE_PATTERN"));
+
+        let batched = session_input_summary_for_tool(
+            "search_and_read",
+            &json!({
+                "project": "demo",
+                "queries": [
+                    {"pattern": "PRIVATE_BATCH_A", "path": "src/a.rs", "pattern_mode": "literal"},
+                    {"pattern": "PRIVATE_BATCH_B", "path": "src/b.rs", "limit": 3}
+                ],
+                "max_reads": 4
+            }),
+        );
+        assert_eq!(batched["project"], "demo");
+        assert_eq!(batched["max_reads"], 4);
+        assert_eq!(batched["queries"][0]["path"], "src/a.rs");
+        assert_eq!(batched["queries"][0]["pattern_mode"], "literal");
+        assert_eq!(batched["queries"][1]["path"], "src/b.rs");
+        assert_eq!(batched["queries"][1]["limit"], 3);
+        assert!(batched["queries"][0].get("pattern").is_none());
+        assert!(batched["queries"][1].get("pattern").is_none());
+        let serialized = batched.to_string();
+        assert!(!serialized.contains("PRIVATE_BATCH_A"));
+        assert!(!serialized.contains("PRIVATE_BATCH_B"));
     }
 
     #[test]

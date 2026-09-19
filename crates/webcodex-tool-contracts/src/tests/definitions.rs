@@ -471,6 +471,7 @@ fn every_runtime_tool_has_an_explicit_fail_closed_audit_contract() {
             ),
             ToolAuditSessionInputPolicy::Bounded
             | ToolAuditSessionInputPolicy::SearchProjectTexts
+            | ToolAuditSessionInputPolicy::SearchAndRead
             | ToolAuditSessionInputPolicy::ObserveJobs => {}
         }
         match definition.audit_policy().context {

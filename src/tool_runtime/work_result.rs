@@ -125,6 +125,7 @@ impl ToolRuntime {
             &review,
             history_partial,
         );
+        projection["session"] = work_result_session(&summary);
         // This version covers live domains only. The card keeps the initial
         // frozen identity locally; refresh neither replaces nor re-creates it.
         projection["state_version"] = json!(work_result_state_version(&projection));
@@ -140,6 +141,56 @@ impl ToolRuntime {
         }
         ToolResult::ok(json!({"work_result": projection}))
     }
+}
+
+fn work_result_session(summary: &webcodex_workflow_session::SessionSummary) -> Value {
+    let latest = summary.events.iter().rev().find_map(|event| {
+        if !webcodex_tool_contracts::runtime_tool_activity_interaction(&event.tool_name)
+            .is_meaningful()
+        {
+            return None;
+        }
+        let tool = bounded_token(&event.tool_name, MAX_WORK_RESULT_TOOL_CHARS)?;
+        let kind = bounded_token(&event.kind, 64)?;
+        let mut value = Map::new();
+        value.insert("tool".to_string(), json!(tool));
+        value.insert("kind".to_string(), json!(kind));
+        value.insert("timestamp".to_string(), json!(event.timestamp));
+        if let Some(status) = event
+            .status
+            .as_deref()
+            .and_then(|value| bounded_token(value, 32))
+        {
+            value.insert("status".to_string(), json!(status));
+        }
+        if let Some(duration_ms) = event.duration_ms {
+            value.insert("duration_ms".to_string(), json!(duration_ms));
+        }
+        Some(Value::Object(value))
+    });
+    let mut session = Map::new();
+    session.insert("lifecycle".to_string(), json!(&summary.lifecycle));
+    session.insert("events_total".to_string(), json!(summary.events_total));
+    session.insert(
+        "events_returned".to_string(),
+        json!(summary.events_returned),
+    );
+    session.insert(
+        "history_partial".to_string(),
+        json!(summary.events_truncated),
+    );
+    session.insert("updated_at".to_string(), json!(summary.updated_at));
+    if let Some(title) = summary
+        .title
+        .as_deref()
+        .and_then(|value| bounded_plain_text(value, 160))
+    {
+        session.insert("title".to_string(), json!(title));
+    }
+    if let Some(latest) = latest {
+        session.insert("latest_activity".to_string(), latest);
+    }
+    Value::Object(session)
 }
 
 pub(crate) fn work_result_state_version(projection: &Value) -> String {

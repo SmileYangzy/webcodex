@@ -30,6 +30,34 @@ fn start_inspection(
     })
 }
 
+fn start_batched_inspection_with_one_invalid_query(
+    runtime: &ToolRuntime,
+    project: &str,
+    session_id: &str,
+) -> tokio::task::JoinHandle<ToolResult> {
+    let runtime = runtime.clone();
+    let call = ToolCall::from_tool_name(
+        "search_and_read",
+        json!({
+            "project": project,
+            "session_id": session_id,
+            "queries": [
+                {"pattern": "", "pattern_mode": "literal", "path": "src/lib.rs"},
+                {"pattern": "needle", "pattern_mode": "literal", "path": "src/lib.rs"}
+            ],
+            "read_before": 0,
+            "read_after": 0,
+            "max_reads": 4,
+            "with_line_numbers": true
+        }),
+    )
+    .unwrap();
+    tokio::spawn(async move {
+        let auth = auth_context(None, true);
+        runtime.dispatch_with_auth(call, Some(&auth)).await
+    })
+}
+
 async fn complete_search(runtime: &ToolRuntime, client_id: &str, lines: &[usize]) {
     let request = wait_for_patch_agent_request(runtime, client_id).await;
     let payload: Value = serde_json::from_str(request.stdin.as_deref().unwrap()).unwrap();
@@ -269,6 +297,45 @@ async fn search_and_read_budget_continuation_reindexes_coalesced_groups_without_
     assert!(items[0].expected_read_revision.is_some());
     assert_eq!(items[1].start_line, Some(341));
     assert_eq!(items[1].limit, Some(120));
+    validate_compound_schema(&result);
+}
+
+#[tokio::test]
+async fn batched_search_and_read_preserves_per_query_failure_identity() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = ToolRuntime::new_for_tests();
+    let client_id = "compound-partial-failure";
+    let project = register_runner_project_at_path(&runtime, client_id, "demo", root.path()).await;
+    let session = runtime.sessions.start_session(Some(project.clone()), None);
+    let task =
+        start_batched_inspection_with_one_invalid_query(&runtime, &project, &session.session_id);
+
+    // The empty first pattern fails normalization before reaching the Runner;
+    // only the valid second query is dispatched.
+    complete_search(&runtime, client_id, &[12]).await;
+    let request = wait_for_patch_agent_request(&runtime, client_id).await;
+    assert_eq!(request.start_line, Some(12));
+    assert_eq!(request.end_line, Some(12));
+    let content = (1..=20)
+        .map(|line| format!("source {line}\n"))
+        .collect::<String>();
+    complete_agent_ranged_file_read_request(&runtime, client_id, &request, &content).await;
+
+    let result = task.await.unwrap();
+    assert!(result.success, "{:?}", result.error);
+    assert_eq!(result.output["read_request_count"], 1);
+    let search = &result.output["search"];
+    assert_eq!(search["requested_count"], 2);
+    assert_eq!(search["succeeded_count"], 1);
+    assert_eq!(search["failed_count"], 1);
+    let items = search["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0]["index"], 0);
+    assert_eq!(items[0]["success"], false);
+    assert_eq!(items[0]["output"]["reason_code"], "invalid_pattern");
+    assert_eq!(items[1]["index"], 1);
+    assert_eq!(items[1]["success"], true);
+    assert!(items[1]["output"]["matches"][0].get("read_hint").is_none());
     validate_compound_schema(&result);
 }
 

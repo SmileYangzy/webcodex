@@ -137,8 +137,8 @@ pub(super) fn mcp_app_resources_list(domain: Option<&str>) -> Value {
         .expect("computer App resource list must be an array")
         .push(json!({
             "uri": MCP_WORK_RESULT_UI_RESOURCE_URI,
-            "name": "WebCodex Work",
-            "description": "Persistent read-only coding Work Result for one explicitly presented project-scoped Workflow Session. The initial present_work_result ToolResult is the authoritative snapshot; the mounted App stays static until the user explicitly refreshes, then performs one exact bounded live state read without replacing its initial frozen final changes. File expansion reads only an advertised path from that frozen snapshot. Ordinary work tools keep native Host presentation. Legacy Changes resources remain hidden readable compatibility aliases.",
+            "name": "WebCodex Progress",
+            "description": "Persistent read-only progress card for one explicitly presented project-scoped Workflow Session. The initial present_work_result ToolResult is authoritative, then the mounted App performs bounded app-only live reads while visible at a faster cadence and while hidden at a slower cadence. It shows current Session activity together with workspace, validation, and review state without creating model-visible polling turns. Frozen final changes remain presentation-time snapshots and lazy file expansion reads only advertised paths.",
             "mimeType": MCP_UI_RESOURCE_MIME_TYPE,
             "_meta": mcp_app_resource_meta(domain)
         }));

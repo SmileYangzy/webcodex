@@ -109,6 +109,26 @@ fn tool_specs_describe_default_coding_loop_preferences() {
         );
     }
 
+    let search_and_read_desc = desc("search_and_read");
+    for phrase in [
+        "one bounded project-text query or 1..8 predetermined independent queries",
+        "query xor queries",
+        "max_reads is one global read budget",
+        "shared fairly across the batch",
+        "preserving per-query batch failures",
+        "batch only independent queries",
+        "result-dependent follow-ups sequential",
+    ] {
+        assert!(
+            search_and_read_desc.contains(phrase),
+            "search_and_read description should mention {phrase}: {search_and_read_desc}"
+        );
+    }
+    assert!(
+        !search_and_read_desc.contains("run one bounded project-text search"),
+        "obsolete single-query search_and_read description returned: {search_and_read_desc}"
+    );
+
     let save_artifact_desc = desc("save_project_artifact");
     for phrase in [
         "already holds the bounded binary/base64 content",

@@ -34,6 +34,14 @@ const baseState = {
     diff_review_count: 1, workspace_review_count: 1, hygiene_review_count: 0,
     tools: ["show_changes"],
   },
+  session: {
+    lifecycle: "active", events_total: 7, events_returned: 7, history_partial: false,
+    updated_at: 1789812000, title: "Work Result test",
+    latest_activity: {
+      tool: "show_changes", kind: "tool_call_finished", timestamp: 1789812000,
+      status: "completed", duration_ms: 42,
+    },
+  },
 };
 
 const nextState = {
@@ -60,6 +68,16 @@ const nextState = {
     total: 2,
     read_only_inspection_count: 1,
     tools: ["show_changes", "git_review_summary"],
+  },
+  session: {
+    ...baseState.session,
+    events_total: 9,
+    events_returned: 9,
+    updated_at: 1789812010,
+    latest_activity: {
+      tool: "cargo_test", kind: "tool_call_finished", timestamp: 1789812010,
+      status: "completed", duration_ms: 730,
+    },
   },
 };
 
@@ -109,17 +127,73 @@ test("matching Work input/result identity is idempotent and unchanged initial st
   assert.equal(view.nodes.files.textContent, "sentinel");
 });
 
-test("time and visibility changes produce zero automatic Work state requests", async () => {
+test("live progress performs bounded app-only polling and adapts to visibility", async () => {
   const view = app("mcp_work_result_app.html");
   view.toolInput(input);
   view.toolResult({ work_result: baseState });
   await view.initialize();
-  await view.fireTimers(3000);
-  await view.fireTimers(10000);
-  await view.visibility(true);
-  await view.visibility(false);
   assert.equal(view.calls("work_result_state").length, 0);
+  await view.fireTimers(2500);
+  assert.equal(view.calls("work_result_state").length, 1);
+  assert.deepEqual({ ...view.calls("work_result_state")[0].params.arguments }, input);
+  await view.reply(view.calls("work_result_state")[0], toolResult({ work_result: nextState }));
+  assert.equal(view.nodes.progressStatus.textContent, "cargo_test · completed");
+  assert.match(view.nodes.progressMeta.textContent, /9 session events · live/);
+  await view.fireTimers(2500);
+  assert.equal(view.calls("work_result_state").length, 2);
+  await view.reply(view.calls("work_result_state")[1], toolResult({ work_result: nextState }));
+  await view.visibility(true);
+  assert.equal([...view.timers.values()].some(timer => timer.delay === 12000), true);
+  await view.visibility(false);
+  assert.equal([...view.timers.values()].some(timer => timer.delay === 250), true);
+  assert.equal(view.timers.size, 1);
+});
+
+test("closed Session stops automatic polling but remains manually refreshable", async () => {
+  const closedState = {
+    ...baseState,
+    state_version: `wr1_${"c".repeat(64)}`,
+    session: { ...baseState.session, lifecycle: "closed" },
+  };
+  const view = app("mcp_work_result_app.html");
+  view.toolInput(input);
+  view.toolResult({ work_result: closedState });
+  await view.initialize();
   assert.equal(view.timers.size, 0);
+  assert.match(view.nodes.status.textContent, /Closed/);
+  await view.fireTimers(12000);
+  assert.equal(view.calls("work_result_state").length, 0);
+  await view.visibility(false);
+  assert.equal(view.timers.size, 0);
+
+  view.nodes.refresh.onclick();
+  await flush();
+  assert.equal(view.calls("work_result_state").length, 1);
+  await view.reply(view.calls("work_result_state")[0], toolResult({ work_result: closedState }));
+  assert.equal(view.timers.size, 0);
+  assert.equal(view.nodes.refresh.disabled, false);
+  assert.match(view.nodes.status.textContent, /closed/i);
+});
+
+test("unchanged active Session pauses automatic polling after bounded idle time and manual Refresh resumes it", async () => {
+  const view = app("mcp_work_result_app.html");
+  view.toolInput(input);
+  view.toolResult({ work_result: baseState });
+  await view.initialize();
+  assert.equal(view.timers.size, 1);
+
+  view.advanceTime(30 * 60 * 1000);
+  await view.visibility(false);
+  assert.equal(view.timers.size, 0);
+  assert.match(view.nodes.status.textContent, /auto refresh paused/);
+  assert.equal(view.calls("work_result_state").length, 0);
+
+  view.nodes.refresh.onclick();
+  await flush();
+  assert.equal(view.calls("work_result_state").length, 1);
+  await view.reply(view.calls("work_result_state")[0], toolResult({ work_result: baseState }));
+  assert.equal(view.nodes.status.textContent, "Up to date");
+  assert.equal([...view.timers.values()].some(timer => timer.delay === 2500), true);
 });
 
 test("user Refresh performs one exact state read and updates the snapshot", async () => {
@@ -332,7 +406,7 @@ for (const first of ["input", "result"]) {
     assert.equal(view.nodes.frozenMore.textContent, "Show 2 more files");
     assert.match(frozenNodes(view, 3).button.textContent, /src\/old_name.rs → src\/new_name.rs/);
     assert.match(frozenNodes(view, 4).button.textContent, /binary/);
-    assert.equal(view.timers.size, 0);
+    assert.equal(view.timers.size, 1);
   });
 }
 
@@ -450,7 +524,7 @@ test("expired/unavailable snapshots never fall back to live diff or automaticall
   await view.fireTimers(10000); await view.visibility(false);
   assert.equal(view.calls("changes_file_diff").length, 1);
   assert.equal(view.calls("work_result_state").length, 0);
-  assert.equal(view.timers.size, 0);
+  assert.equal(view.timers.size, 1);
 });
 
 for (const via of ["initial", "refresh"]) {
