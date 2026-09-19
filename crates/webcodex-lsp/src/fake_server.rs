@@ -398,7 +398,7 @@ fn maybe_publish_diagnostics(
             r#"{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"uri":7,"diagnostics":"bad"}}"#,
         )?;
     }
-    if behavior == "diagnostics_stale_then_timeout" {
+    if behavior == "diagnostics_stale_then_timeout" || behavior == "diagnostics_unversioned_once" {
         let already_published = marker
             .and_then(|path| fs::read_to_string(path).ok())
             .is_some_and(|contents| contents.contains("diagnostics-publication"));
@@ -410,6 +410,7 @@ fn maybe_publish_diagnostics(
     let diagnostics = match behavior {
         "diagnostics_empty"
         | "diagnostics_delayed"
+        | "diagnostics_unversioned_once"
         | "diagnostics_wrong_uri"
         | "diagnostics_external_uri"
         | "diagnostics_stale_then_timeout"
@@ -444,6 +445,11 @@ fn maybe_publish_diagnostics(
             format!("[{}]", items.join(","))
         }
         _ => return Ok(()),
+    };
+    let version = if behavior == "diagnostics_unversioned_once" {
+        "null".to_string()
+    } else {
+        version.to_string()
     };
     write_frame(
         writer,

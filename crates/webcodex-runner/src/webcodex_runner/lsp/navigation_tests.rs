@@ -951,7 +951,8 @@ fn document_diagnostics_handles_publication_timing_and_timeouts() {
 
     let stale_fixture = NavFixture::new("diagnostics_stale_then_timeout");
     let first = stale_fixture.diagnostics(100);
-    assert_eq!(first["result"]["status"], "complete", "{first}");
+    assert_eq!(first["result"]["status"], "timeout", "{first}");
+    assert_eq!(first["result"]["clean"], serde_json::Value::Null);
     assert_eq!(first["result"]["published_version"], 0);
     let stale = stale_fixture.diagnostics(100);
     assert_eq!(stale["result"]["status"], "timeout");

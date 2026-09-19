@@ -323,6 +323,11 @@ async fn validate_trusted_mcp_download_url(
         return Err("host-provided download URL resolved to no addresses".to_string());
     }
     if ips.iter().copied().any(|ip| !ip_is_public(ip)) {
+        if let Some(host) = resolver_host.as_deref() {
+            return Err(format!(
+                "host-provided download URL resolves to a non-public address (host: {host}); check DNS or proxy fake-IP settings"
+            ));
+        }
         return Err("host-provided download URL resolves to a non-public address".to_string());
     }
     let mut pinned_addrs = Vec::with_capacity(ips.len());
@@ -1059,16 +1064,34 @@ mod tests {
         ] {
             set_import_test_resolved_ips(Some(ips));
             reset_import_test_dns_resolution_count();
-            let error = validate_trusted_mcp_download_url("https://download.example/file")
-                .await
-                .expect_err("unsafe DNS result must fail closed");
+            let error = validate_trusted_mcp_download_url(
+                "https://download.example/file?signature=private-value",
+            )
+            .await
+            .expect_err("unsafe DNS result must fail closed");
             assert!(
                 error.contains("resolved to no addresses")
                     || error.contains("resolves to a non-public address"),
                 "unexpected error: {error}"
             );
             assert_eq!(import_test_dns_resolution_count(), 1);
+            if error.contains("non-public address") {
+                assert!(error.contains("host: download.example"), "{error}");
+            }
+            assert!(!error.contains("signature"), "{error}");
+            assert!(!error.contains("private-value"), "{error}");
         }
+
+        reset_import_test_dns_resolution_count();
+        let literal_error =
+            validate_trusted_mcp_download_url("https://127.0.0.1/file?signature=private-value")
+                .await
+                .expect_err("private IP literal must fail closed");
+        assert_eq!(
+            literal_error,
+            "host-provided download URL resolves to a non-public address"
+        );
+        assert_eq!(import_test_dns_resolution_count(), 0);
         set_import_test_resolved_ips(None);
         reset_import_test_dns_resolution_count();
     }

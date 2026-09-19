@@ -6,7 +6,7 @@
 
 use super::super::config::RunnerPolicy;
 use super::super::output::CommandResult;
-use super::super::projects::load_runner_project_summaries_from_dir;
+use super::super::projects::find_project_shell_context_by_id;
 use super::super::shell::cwd_allowed;
 #[cfg(test)]
 use crate::lsp_bridge::AGENT_LSP_REQUEST_KIND;
@@ -83,9 +83,7 @@ fn resolve_runner_project(
             "project_id cannot be empty",
         ));
     }
-    load_runner_project_summaries_from_dir(project_registry_dir)
-        .into_iter()
-        .find(|project| project.id == id)
+    find_project_shell_context_by_id(project_registry_dir, id)
         .map(|project| PathBuf::from(project.path))
         .ok_or_else(|| {
             RunnerLspResultEnvelope::err(error_codes::UNKNOWN_PROJECT, "unknown agent project")

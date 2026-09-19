@@ -47,11 +47,13 @@ fn workspace_checkpoints_runner_dispatch_create_restore() {
         let output = std::process::Command::new("git")
             .args(args)
             .current_dir(root.path())
+            .stdin(std::process::Stdio::null())
             .output()
             .unwrap();
         assert!(output.status.success(), "git failed");
     };
     git(&["init", "-q"]);
+    git(&["config", "core.autocrlf", "false"]);
     std::fs::write(root.path().join("file.txt"), "base\n").unwrap();
     git(&["add", "."]);
     git(&[
