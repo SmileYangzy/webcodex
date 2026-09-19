@@ -21,8 +21,6 @@ use super::shutdown::{lock_unpoison, ActivityTracker};
 use super::ssh::{is_transport_failure, SshConnectionPool};
 use super::transport::RunnerSink;
 use std::collections::{HashMap, HashSet, VecDeque};
-#[cfg(all(test, unix))]
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -2680,8 +2678,11 @@ impl JobManager {
                         .map(|(key, value)| (key.as_str(), value.as_str())),
                 );
             }
+            // Raw shell and validation Jobs have no caller-stdin contract.
+            // Give each process EOF instead of inheriting Runner-owned pipes.
             command
                 .current_dir(&cwd_path)
+                .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
             commands.push_back(command);

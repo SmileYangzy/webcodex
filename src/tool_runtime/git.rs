@@ -13,8 +13,8 @@ pub(crate) use self::diff_hunks::{
 };
 #[cfg(test)]
 pub(crate) use self::log::{
-    git_log_command, git_log_command_at_head, git_log_next_skip, normalize_git_log_limit,
-    normalize_git_log_skip, parse_git_log_commits,
+    git_log_args, git_log_next_skip, normalize_git_log_limit, normalize_git_log_skip,
+    parse_git_log_commits,
 };
 #[cfg(test)]
 pub(crate) use self::mutations::{parse_git_commit_marker, GIT_COMMIT_RESULT_PREFIX};

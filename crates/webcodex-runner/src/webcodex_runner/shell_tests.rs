@@ -2235,6 +2235,69 @@ fn isolated_environment_is_explicit_and_does_not_inherit_user_path() {
     assert!(toml::from_str::<ShellConfig>("environment_mode = 'unknown'").is_err());
 }
 
+#[cfg(windows)]
+#[test]
+fn windows_python_stdio_defaults_are_shared_and_explicit_overrides_win() {
+    let _lock = crate::tests::test_env_lock();
+    let _env = crate::tests::EnvGuard::new().remove("PYTHONIOENCODING");
+    for mode in [
+        ShellEnvironmentMode::Inherit,
+        ShellEnvironmentMode::Isolated,
+    ] {
+        let mut shell = ShellConfig {
+            environment_mode: mode,
+            ..ShellConfig::default()
+        };
+        let snapshot = base_shell_env(&shell, &ShellProfileConfig::default()).unwrap();
+        assert_eq!(
+            env_lookup(&snapshot, "PYTHONIOENCODING").map(String::as_str),
+            Some("utf-8")
+        );
+        let mut command = Command::new("unused");
+        apply_shell_environment(&mut command, &shell).unwrap();
+        assert!(command
+            .get_envs()
+            .any(|(key, value)| key == "PYTHONIOENCODING" && value == Some(OsStr::new("utf-8"))));
+
+        shell.env.insert("PythonIoEncoding".into(), "cp1252".into());
+        let snapshot = base_shell_env(&shell, &ShellProfileConfig::default()).unwrap();
+        assert_eq!(
+            env_lookup(&snapshot, "PYTHONIOENCODING").map(String::as_str),
+            Some("cp1252")
+        );
+        let profile = ShellProfileConfig {
+            env: std::collections::BTreeMap::from([(
+                "pythonioencoding".into(),
+                "ascii:replace".into(),
+            )]),
+            ..ShellProfileConfig::default()
+        };
+        let snapshot = base_shell_env(&shell, &profile).unwrap();
+        assert_eq!(
+            env_lookup(&snapshot, "PYTHONIOENCODING").map(String::as_str),
+            Some("ascii:replace")
+        );
+        let mut command = Command::new("unused");
+        apply_env_snapshot(&mut command, &snapshot);
+        assert!(command.get_envs().any(|(key, value)| key
+            .to_string_lossy()
+            .eq_ignore_ascii_case("PYTHONIOENCODING")
+            && value == Some(OsStr::new("ascii:replace"))));
+    }
+    let _explicit = crate::tests::EnvGuard::new().set("PYTHONIOENCODING", "latin-1");
+    let shell = ShellConfig::default();
+    let snapshot = base_shell_env(&shell, &ShellProfileConfig::default()).unwrap();
+    assert_eq!(
+        env_lookup(&snapshot, "PYTHONIOENCODING").map(String::as_str),
+        Some("latin-1")
+    );
+    let mut command = Command::new("unused");
+    apply_shell_environment(&mut command, &shell).unwrap();
+    assert!(!command.get_envs().any(|(key, _)| key
+        .to_string_lossy()
+        .eq_ignore_ascii_case("PYTHONIOENCODING")));
+}
+
 #[cfg(unix)]
 #[test]
 fn default_shell_preserves_non_unicode_environment_without_panicking() {

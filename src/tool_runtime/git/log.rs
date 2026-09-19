@@ -10,8 +10,7 @@ const MAX_GIT_LOG_LIMIT: usize = 100;
 const MAX_GIT_LOG_SKIP: usize = 10_000;
 const GIT_LOG_RECORD_SEP: char = '\u{1e}';
 const GIT_LOG_UNIT_SEP: char = '\u{1f}';
-const GIT_LOG_SNAPSHOT_MARKER: &str = "__WEBCODEX_GIT_LOG_HEAD__=";
-const GIT_LOG_SNAPSHOT_UNAVAILABLE_EXIT: i32 = 42;
+const GIT_LOG_PRETTY_FORMAT: &str = "%H%x1f%h%x1f%D%x1f%an%x1f%ae%x1f%aI%x1f%s%x1e";
 
 pub(crate) fn normalize_git_log_limit(limit: Option<usize>) -> usize {
     limit
@@ -36,53 +35,19 @@ pub(crate) fn git_log_next_skip(
         .filter(|next| *next > skip && *next <= MAX_GIT_LOG_SKIP)
 }
 
-fn git_log_invocation(head: &str, limit: usize, skip: usize) -> String {
-    let limit_plus_one = limit.saturating_add(1);
-    format!(
-        "git log --decorate=short --date=iso-strict --pretty=format:'%H%x1f%h%x1f%D%x1f%an%x1f%ae%x1f%aI%x1f%s%x1e' -n {limit_plus_one} --skip {skip} {head}",
-    )
-}
-
-/// First-page command: resolve movable HEAD exactly once, then traverse only
-/// that exact commit. The snapshot marker is emitted last so retained-tail
-/// truncation cannot silently substitute a different snapshot identity.
-pub(crate) fn git_log_command(limit: usize, skip: usize) -> String {
-    let log = git_log_invocation("\"$wclog_head\"", limit, skip);
-    format!(
-        concat!(
-            "wclog_head=$(git rev-parse --verify 'HEAD^{{commit}}' 2>/dev/null) || {{ ",
-            "wclog_ref=$(git symbolic-ref -q HEAD 2>/dev/null || true); ",
-            "if [ -n \"$wclog_ref\" ] && ! git show-ref --verify --quiet \"$wclog_ref\"; then ",
-            "printf '{marker}unborn\\036'; exit 0; fi; ",
-            "printf 'git log HEAD snapshot unavailable\\n' >&2; exit {snapshot_exit}; ",
-            "}}; ",
-            "{log}; wclog_status=$?; ",
-            "if [ \"$wclog_status\" -ne 0 ]; then exit \"$wclog_status\"; fi; ",
-            "printf '{marker}%s\\036' \"$wclog_head\""
-        ),
-        marker = GIT_LOG_SNAPSHOT_MARKER,
-        snapshot_exit = GIT_LOG_SNAPSHOT_UNAVAILABLE_EXIT,
-        log = log,
-    )
-}
-
-pub(crate) fn git_log_command_at_head(head_commit: &str, limit: usize, skip: usize) -> String {
+pub(crate) fn git_log_args(head_commit: &str, limit: usize, skip: usize) -> Vec<String> {
     debug_assert!(normalize_exact_commit_id(head_commit).is_ok());
-    let log = git_log_invocation(head_commit, limit, skip);
-    format!(
-        concat!(
-            "wclog_type=$(git cat-file -t {head} 2>/dev/null || true); ",
-            "if [ \"$wclog_type\" != commit ]; then ",
-            "printf 'git log snapshot unavailable\\n' >&2; exit {snapshot_exit}; fi; ",
-            "{log}; wclog_status=$?; ",
-            "if [ \"$wclog_status\" -ne 0 ]; then exit \"$wclog_status\"; fi; ",
-            "printf '{marker}{head}\\036'"
-        ),
-        head = head_commit,
-        snapshot_exit = GIT_LOG_SNAPSHOT_UNAVAILABLE_EXIT,
-        log = log,
-        marker = GIT_LOG_SNAPSHOT_MARKER,
-    )
+    vec![
+        "log".to_string(),
+        "--decorate=short".to_string(),
+        "--date=iso-strict".to_string(),
+        format!("--pretty=format:{GIT_LOG_PRETTY_FORMAT}"),
+        "-n".to_string(),
+        limit.saturating_add(1).to_string(),
+        "--skip".to_string(),
+        skip.to_string(),
+        head_commit.to_string(),
+    ]
 }
 
 fn parse_git_log_refs(decorations: &str) -> Vec<String> {
@@ -142,35 +107,62 @@ pub(crate) fn parse_git_log_commits(
     Ok((commits, truncated))
 }
 
-fn parse_git_log_page(
-    stdout: &str,
-    limit: usize,
-) -> Result<(Option<String>, Vec<Value>, bool), &'static str> {
-    let source = stdout.trim_end_matches(['\n', '\r']);
-    let source = source
-        .strip_suffix(GIT_LOG_RECORD_SEP)
-        .ok_or("git log snapshot marker is incomplete or missing")?;
-    let (commit_source, marker) = source
-        .rsplit_once(GIT_LOG_RECORD_SEP)
-        .map_or(("", source), |(commits, marker)| (commits, marker));
-    let snapshot = marker
-        .strip_prefix(GIT_LOG_SNAPSHOT_MARKER)
-        .ok_or("git log snapshot marker is incomplete or missing")?;
-    if snapshot == "unborn" {
-        if !commit_source.trim_matches(['\n', '\r']).is_empty() {
-            return Err("unborn git log snapshot unexpectedly contained commits");
+struct GitProcessOutput {
+    exit_code: i32,
+    stdout: String,
+    stderr: String,
+    stdout_truncated: bool,
+}
+
+fn completed_git_process(result: ToolResult) -> Result<GitProcessOutput, ToolResult> {
+    if result.output["execution_state"] != "completed" {
+        if result.success {
+            return Err(ToolResult::err_with_output(
+                "git process result is incomplete or malformed",
+                json!({
+                    "error_kind": "source_incomplete",
+                    "state_changed": false,
+                }),
+            ));
         }
-        return Ok((None, Vec::new(), false));
+        return Err(result);
     }
-    let head_commit = normalize_exact_commit_id(snapshot)
-        .map_err(|_| "git log snapshot marker contained an invalid commit id")?;
-    let commit_source = if commit_source.is_empty() {
-        String::new()
-    } else {
-        format!("{commit_source}{GIT_LOG_RECORD_SEP}")
+    let Some(exit_code) = result.output["exit_code"]
+        .as_i64()
+        .and_then(|value| i32::try_from(value).ok())
+    else {
+        if result.success {
+            return Err(ToolResult::err_with_output(
+                "git process result is incomplete or malformed",
+                json!({
+                    "error_kind": "source_incomplete",
+                    "state_changed": false,
+                }),
+            ));
+        }
+        return Err(result);
     };
-    let (commits, truncated) = parse_git_log_commits(&commit_source, limit)?;
-    Ok((Some(head_commit), commits, truncated))
+    let Some(stdout) = result.output["stdout_tail"].as_str() else {
+        if result.success {
+            return Err(ToolResult::err_with_output(
+                "git process result is incomplete or malformed",
+                json!({
+                    "error_kind": "source_incomplete",
+                    "state_changed": false,
+                }),
+            ));
+        }
+        return Err(result);
+    };
+    Ok(GitProcessOutput {
+        exit_code,
+        stdout: stdout.to_string(),
+        stderr: result.output["stderr_tail"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+        stdout_truncated: result.output["stdout_truncated"].as_bool().unwrap_or(false),
+    })
 }
 
 fn git_log_suggested_call(
@@ -192,6 +184,17 @@ fn git_log_suggested_call(
 }
 
 impl ToolRuntime {
+    async fn run_git_process(
+        &self,
+        project: &str,
+        args: Vec<String>,
+    ) -> Result<GitProcessOutput, ToolResult> {
+        completed_git_process(
+            self.run_internal_process_sync(project.to_string(), "git".to_string(), args, 30)
+                .await,
+        )
+    }
+
     pub(crate) async fn git_log(
         &self,
         project: String,
@@ -222,18 +225,127 @@ impl ToolRuntime {
         };
         let limit = normalize_git_log_limit(limit);
         let skip = normalize_git_log_skip(skip);
-        let command = head_commit.as_deref().map_or_else(
-            || git_log_command(limit, skip),
-            |head| git_log_command_at_head(head, limit, skip),
-        );
-        let output = match self
-            .run_project_command_capture(&resolved_project, command, 30, None)
-            .await
-        {
-            Ok(output) => output,
-            Err(e) => return ToolResult::err(e),
+        let snapshot_head = if let Some(head) = head_commit.as_deref() {
+            let object_type = match self
+                .run_git_process(
+                    &resolved_project,
+                    vec!["cat-file".to_string(), "-t".to_string(), head.to_string()],
+                )
+                .await
+            {
+                Ok(output) => output,
+                Err(result) => return result,
+            };
+            if object_type.stdout_truncated {
+                return ToolResult::err_with_output(
+                    "git object type result is incomplete",
+                    json!({
+                        "project": project,
+                        "error_kind": "source_incomplete",
+                        "state_changed": false,
+                    }),
+                );
+            }
+            (object_type.exit_code == 0 && object_type.stdout.trim() == "commit")
+                .then(|| head.to_string())
+        } else {
+            let resolved_head = match self
+                .run_git_process(
+                    &resolved_project,
+                    vec![
+                        "rev-parse".to_string(),
+                        "--verify".to_string(),
+                        "HEAD^{commit}".to_string(),
+                    ],
+                )
+                .await
+            {
+                Ok(output) => output,
+                Err(result) => return result,
+            };
+            if resolved_head.stdout_truncated {
+                return ToolResult::err_with_output(
+                    "git HEAD result is incomplete",
+                    json!({
+                        "project": project,
+                        "error_kind": "source_incomplete",
+                        "state_changed": false,
+                    }),
+                );
+            }
+            if resolved_head.exit_code == 0 {
+                normalize_exact_commit_id(resolved_head.stdout.trim()).ok()
+            } else {
+                let symbolic_head = match self
+                    .run_git_process(
+                        &resolved_project,
+                        vec![
+                            "symbolic-ref".to_string(),
+                            "-q".to_string(),
+                            "HEAD".to_string(),
+                        ],
+                    )
+                    .await
+                {
+                    Ok(output) => output,
+                    Err(result) => return result,
+                };
+                if symbolic_head.stdout_truncated {
+                    return ToolResult::err_with_output(
+                        "git symbolic HEAD result is incomplete",
+                        json!({
+                            "project": project,
+                            "error_kind": "source_incomplete",
+                            "state_changed": false,
+                        }),
+                    );
+                }
+                if symbolic_head.exit_code != 0 || symbolic_head.stdout.trim().is_empty() {
+                    None
+                } else {
+                    let reference = symbolic_head.stdout.trim();
+                    let ref_check = match self
+                        .run_git_process(
+                            &resolved_project,
+                            vec![
+                                "show-ref".to_string(),
+                                "--verify".to_string(),
+                                "--quiet".to_string(),
+                                reference.to_string(),
+                            ],
+                        )
+                        .await
+                    {
+                        Ok(output) => output,
+                        Err(result) => return result,
+                    };
+                    if ref_check.stdout_truncated {
+                        return ToolResult::err_with_output(
+                            "git ref verification result is incomplete",
+                            json!({
+                                "project": project,
+                                "error_kind": "source_incomplete",
+                                "state_changed": false,
+                            }),
+                        );
+                    }
+                    if ref_check.exit_code == 1 {
+                        return ToolResult::ok(json!({
+                            "project": project,
+                            "head_commit": null,
+                            "limit": limit,
+                            "skip": skip,
+                            "count": 0,
+                            "truncated": false,
+                            "next_skip": null,
+                            "commits": [],
+                        }));
+                    }
+                    None
+                }
+            }
         };
-        if output.exit_code == Some(GIT_LOG_SNAPSHOT_UNAVAILABLE_EXIT) {
+        let Some(snapshot_head) = snapshot_head else {
             return ToolResult::err_with_output(
                 "git log snapshot is unavailable",
                 json!({
@@ -243,13 +355,20 @@ impl ToolRuntime {
                     "state_changed": false,
                 }),
             );
-        }
-        if output.exit_code != Some(0) {
+        };
+        let output = match self
+            .run_git_process(&resolved_project, git_log_args(&snapshot_head, limit, skip))
+            .await
+        {
+            Ok(output) => output,
+            Err(result) => return result,
+        };
+        if output.exit_code != 0 {
             return ToolResult {
                 success: false,
                 output: json!({
                     "project": project,
-                    "head_commit": head_commit,
+                    "head_commit": snapshot_head,
                     "limit": limit,
                     "skip": skip,
                     "exit_code": output.exit_code,
@@ -258,7 +377,17 @@ impl ToolRuntime {
                 error: Some("git log failed".to_string()),
             };
         }
-        let (head_commit, commits, truncated) = match parse_git_log_page(&output.stdout, limit) {
+        if output.stdout_truncated {
+            return ToolResult::err_with_output(
+                "git log source is incomplete; retry with a smaller limit",
+                json!({
+                    "project": project,
+                    "error_kind": "source_incomplete",
+                    "state_changed": false,
+                }),
+            );
+        }
+        let (commits, truncated) = match parse_git_log_commits(&output.stdout, limit) {
             Ok(page) => page,
             Err(error) => {
                 return ToolResult::err_with_output(
@@ -274,7 +403,7 @@ impl ToolRuntime {
         let next_skip = git_log_next_skip(skip, commits.len(), truncated);
         let mut payload = json!({
             "project": project,
-            "head_commit": head_commit,
+            "head_commit": snapshot_head,
             "limit": limit,
             "skip": skip,
             "count": commits.len(),
@@ -282,15 +411,33 @@ impl ToolRuntime {
             "next_skip": next_skip,
             "commits": commits,
         });
-        if let (Some(next_skip), Some(head_commit)) = (next_skip, head_commit.as_deref()) {
+        if let Some(next_skip) = next_skip {
             payload["suggested_call"] = git_log_suggested_call(
                 &resolved_project,
-                head_commit,
+                &snapshot_head,
                 limit,
                 next_skip,
                 session_id.as_deref(),
             );
         }
         ToolResult::ok(payload)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completed_git_process_rejects_malformed_success() {
+        let result = completed_git_process(ToolResult::ok(json!({})));
+        let error = match result {
+            Ok(_) => panic!("malformed successful process result must fail closed"),
+            Err(error) => error,
+        };
+
+        assert!(!error.success);
+        assert_eq!(error.output["error_kind"], "source_incomplete");
+        assert_eq!(error.output["state_changed"], false);
     }
 }

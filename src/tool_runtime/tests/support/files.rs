@@ -1,6 +1,6 @@
 use crate::tool_runtime::git::{
-    collect_show_changes_untracked_previews_for_root, git_log_command, git_log_command_at_head,
-    parse_show_changes_output, show_changes_command, split_show_changes_stdout,
+    collect_show_changes_untracked_previews_for_root, git_log_args, parse_show_changes_output,
+    show_changes_command, split_show_changes_stdout,
 };
 use crate::tool_runtime::helpers::run_command_sync;
 use crate::tool_runtime::{
@@ -67,14 +67,20 @@ pub(in crate::tool_runtime::tests) fn git_log_stdout(
     root: &Path,
     limit: usize,
     skip: usize,
-) -> String {
-    let command = git_log_command(limit, skip);
-    let (exit_code, stdout, stderr, _) = run_command_sync(&command, root, 30);
-    assert_eq!(
-        exit_code, 0,
-        "git log helper command failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+) -> (String, String) {
+    let head = std::process::Command::new("git")
+        .args(["rev-parse", "--verify", "HEAD^{commit}"])
+        .current_dir(root)
+        .output()
+        .expect("resolve git log fixture HEAD");
+    assert!(
+        head.status.success(),
+        "git log fixture HEAD failed: {}",
+        String::from_utf8_lossy(&head.stderr)
     );
-    stdout
+    let head = String::from_utf8(head.stdout).unwrap().trim().to_string();
+    let stdout = git_log_stdout_at_head(root, &head, limit, skip);
+    (head, stdout)
 }
 
 pub(in crate::tool_runtime::tests) fn git_log_stdout_at_head(
@@ -83,13 +89,18 @@ pub(in crate::tool_runtime::tests) fn git_log_stdout_at_head(
     limit: usize,
     skip: usize,
 ) -> String {
-    let command = git_log_command_at_head(head_commit, limit, skip);
-    let (exit_code, stdout, stderr, _) = run_command_sync(&command, root, 30);
-    assert_eq!(
-        exit_code, 0,
-        "snapshot git log helper command failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    let output = std::process::Command::new("git")
+        .args(git_log_args(head_commit, limit, skip))
+        .current_dir(root)
+        .output()
+        .expect("run snapshot git log fixture command");
+    assert!(
+        output.status.success(),
+        "snapshot git log helper command failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
-    stdout
+    String::from_utf8(output.stdout).unwrap()
 }
 
 pub(in crate::tool_runtime::tests) fn show_changes_output_from_command(

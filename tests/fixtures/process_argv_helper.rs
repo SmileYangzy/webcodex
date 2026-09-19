@@ -159,7 +159,8 @@ fn main() {
                 println!("{}:{value}", value.len());
             }
         }
-        Some("stdin") => {
+        // Cargo-shaped aliases let validation fixtures exercise the same EOF path.
+        Some("stdin" | "check" | "test") => {
             let mut input = String::new();
             std::io::stdin().read_to_string(&mut input).unwrap();
             print!("{input}");

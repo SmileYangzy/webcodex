@@ -322,6 +322,12 @@ Shell `env` overrides inherited values; profile `env` overrides shell `env`.
 Profiles cache this environment per project/config generation. An explicit
 `init_script` can modify the snapshot; no startup script runs otherwise.
 
+On Windows, these child environments default `PYTHONIOENCODING` to `utf-8`
+for redirected Python stdin/stdout/stderr. Explicit inherited, shell or profile
+values take precedence. This does not change Python file encodings or the system
+code page. Shell Jobs and structured validation steps without input receive EOF;
+they never inherit the Runner's parent-liveness input pipe.
+
 Set `environment_mode = "isolated"` for a minimal environment: `/usr/bin:/bin` on
 Unix, or SystemRoot and its System32 PATH on Windows, plus configured env and
 path_prepend. This is environment isolation, not a filesystem sandbox.

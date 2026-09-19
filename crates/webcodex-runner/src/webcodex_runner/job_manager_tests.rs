@@ -11,8 +11,7 @@ use serde_json::json;
 use std::ffi::OsString;
 #[cfg(feature = "runner-real-process-tests")]
 use std::io::BufReader;
-#[cfg(feature = "runner-real-process-tests")]
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -1067,6 +1066,164 @@ fn structured_process_helper() -> Arc<StructuredProcessHelper> {
             })
         })
         .clone()
+}
+
+const JOB_STDIN_EOF_SUBPROCESS: &str = "WEBCODEX_JOB_STDIN_EOF_SUBPROCESS";
+const JOB_STDIN_PARENT_BYTES: &[u8] = b"parent-only-stdin";
+
+#[cfg(windows)]
+fn shell_arg_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+#[cfg(not(windows))]
+fn shell_arg_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn raw_shell_helper_command(helper: &Path) -> String {
+    let command = format!(
+        "{} {}",
+        shell_arg_quote(&helper.to_string_lossy()),
+        shell_arg_quote("stdin")
+    );
+    #[cfg(windows)]
+    {
+        format!("& {command}")
+    }
+    #[cfg(not(windows))]
+    {
+        command
+    }
+}
+
+fn run_job_stdin_eof_subprocess(mode: &str) {
+    let temp = tempfile::tempdir().unwrap();
+    let helper = structured_process_helper();
+    let (sink, mut rx) = structured_test_sink("stdin-agent", "stdin-instance");
+    let manager = JobManager::new(1);
+    let mut shell = ShellConfig::default();
+    let request = match mode {
+        "raw_shell" => {
+            let mut request =
+                shell_job_request(temp.path(), &raw_shell_helper_command(&helper.path));
+            request.request_id = "request-raw-shell-stdin-eof".to_string();
+            request.job_id = Some("raw-shell-stdin-eof".to_string());
+            request
+        }
+        "validation" => {
+            let bin = temp.path().join("bin");
+            std::fs::create_dir(&bin).unwrap();
+            std::fs::copy(
+                &helper.path,
+                bin.join(format!("cargo{}", std::env::consts::EXE_SUFFIX)),
+            )
+            .unwrap();
+            shell.path_prepend.push(bin);
+            let steps = ["check", "test"].map(|name| ShellJobValidationStep {
+                name: name.to_string(),
+                program: "cargo".to_string(),
+                args: vec![name.to_string()],
+                env: Vec::new(),
+            });
+            let mut request = shell_job_request(temp.path(), "");
+            request.request_id = "request-validation-stdin-eof".to_string();
+            request.kind = "start_validation_job".to_string();
+            request.job_id = Some("validation-stdin-eof".to_string());
+            request.command = serde_json::to_string(&steps).unwrap();
+            request.job_context.as_mut().unwrap().validation_steps =
+                steps.iter().map(|step| step.name.clone()).collect();
+            request
+        }
+        other => panic!("unknown Job stdin EOF subprocess mode: {other}"),
+    };
+    manager.enqueue(
+        sink,
+        PendingJobStart::from_wire(
+            1,
+            RunnerPolicy {
+                allow_cwd_anywhere: true,
+                ..RunnerPolicy::default()
+            },
+            shell,
+            SshConfig::default(),
+            temp.path().join("project-registry"),
+            request,
+        ),
+    );
+
+    let updates = collect_job_updates(&mut rx, Duration::from_secs(10));
+    let terminal = updates
+        .iter()
+        .rev()
+        .find(|update| update.finished)
+        .unwrap_or_else(|| panic!("{mode} Job did not reach terminal state: {updates:?}"));
+    assert_eq!(terminal.status, "completed", "{terminal:?}");
+    assert_eq!(terminal.exit_code, Some(0), "{terminal:?}");
+    assert!(
+        terminal
+            .log_snapshot
+            .as_ref()
+            .is_none_or(|logs| logs.stdout.tail.is_empty()),
+        "{mode} Job consumed inherited Runner stdin: {terminal:?}"
+    );
+    wait_for_job_workers(&manager);
+
+    let mut parent_bytes = vec![0; JOB_STDIN_PARENT_BYTES.len()];
+    std::io::stdin().read_exact(&mut parent_bytes).unwrap();
+    assert_eq!(parent_bytes, JOB_STDIN_PARENT_BYTES);
+}
+
+#[test]
+fn shell_and_validation_jobs_receive_eof_without_consuming_runner_stdin() {
+    if let Ok(mode) = std::env::var(JOB_STDIN_EOF_SUBPROCESS) {
+        run_job_stdin_eof_subprocess(&mode);
+        return;
+    }
+
+    for mode in ["raw_shell", "validation"] {
+        let mut child = Command::new(std::env::current_exe().unwrap());
+        child
+            .arg("--exact")
+            .arg(
+                "webcodex_runner::job_manager::job_manager_tests::shell_and_validation_jobs_receive_eof_without_consuming_runner_stdin",
+            )
+            .arg("--nocapture")
+            .env(JOB_STDIN_EOF_SUBPROCESS, mode)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = child.spawn().unwrap();
+        let mut child_stdin = child.stdin.take().unwrap();
+        child_stdin.write_all(JOB_STDIN_PARENT_BYTES).unwrap();
+        child_stdin.flush().unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                drop(child_stdin);
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "{mode} subprocess hung while its parent kept stdin open; stdout={}; stderr={}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(child_stdin);
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{mode} subprocess failed; stdout={}; stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 fn structured_process_context(

@@ -6378,26 +6378,351 @@ fn git_read_commands_are_non_mutating_and_log_is_bounded() {
     assert_eq!(normalize_git_log_limit(Some(999)), 100);
     assert_eq!(normalize_git_log_skip(Some(20_000)), 10_000);
 
-    let log = git_log_command(21, 7);
-    assert!(log.contains("git log"));
-    assert!(log.contains("-n 22"));
-    assert!(log.contains("--skip 7"));
+    let head = "a".repeat(40);
+    let log = git_log_args(&head, 21, 7);
+    assert_eq!(log[0], "log");
+    assert_eq!(log[4..], ["-n", "22", "--skip", "7", head.as_str()]);
+    assert!(log
+        .iter()
+        .any(|arg| arg == "--pretty=format:%H%x1f%h%x1f%D%x1f%an%x1f%ae%x1f%aI%x1f%s%x1e"));
 
     for forbidden in [
-        "git apply",
-        "git commit",
-        "git checkout",
-        "git reset",
-        "git push",
-        "git stash",
-        "git merge",
-        "git rebase",
-        "git rm ",
+        "apply", "commit", "checkout", "reset", "push", "stash", "merge", "rebase", "rm",
     ] {
         assert!(
-            !log.contains(forbidden),
-            "git_log command must not contain {forbidden:?}: {log}"
+            !log.iter().any(|arg| arg == forbidden),
+            "git_log argv must not contain {forbidden:?}: {log:?}"
         );
+    }
+}
+
+async fn run_git_log_via_structured_runner(
+    runtime: &ToolRuntime,
+    client_id: &str,
+    project: String,
+    head_commit: Option<String>,
+    limit: Option<usize>,
+    skip: Option<usize>,
+) -> (ToolResult, Vec<Vec<String>>) {
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        async move {
+            runtime
+                .git_log(project, head_commit, limit, skip, None)
+                .await
+        }
+    });
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut requests = Vec::new();
+    while !task.is_finished() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "git_log did not finish for client {client_id}"
+        );
+        if let Some(request) = probe_patch_agent_request(runtime, client_id).await {
+            assert_eq!(request.kind, "run_process");
+            assert!(request.command.is_empty());
+            assert!(request.script.is_none());
+            let process = request.process.as_ref().expect("typed git process");
+            assert_eq!(process.executable, "git");
+            assert!(!process.args.iter().any(|arg| arg.contains("wclog_")));
+            requests.push(process.args.clone());
+            complete_agent_request_by_running_locally(runtime, client_id, request).await;
+        } else {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+    (task.await.unwrap(), requests)
+}
+
+#[tokio::test]
+async fn git_log_uses_structured_git_argv_and_fences_detached_snapshot() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_git_repo(tmp.path());
+    commit_file(tmp.path(), "first.txt", "first\n", "first");
+    commit_file(tmp.path(), "second.txt", "second\n", "second");
+    let (_, head, stderr, _) = run_command_sync("git rev-parse HEAD", tmp.path(), 30);
+    assert!(stderr.is_empty(), "rev-parse failed: {stderr}");
+    let head = head.trim().to_string();
+    git_test_command_ok(tmp.path(), &format!("git checkout --detach {head}"));
+
+    let runtime = test_runtime();
+    let project =
+        register_structured_git_agent_at_path(&runtime, "log-argv", "repo", tmp.path()).await;
+    let (result, requests) =
+        run_git_log_via_structured_runner(&runtime, "log-argv", project, None, Some(1), Some(0))
+            .await;
+
+    assert!(result.success, "{:?}", result.error);
+    assert_eq!(result.output["head_commit"], head);
+    assert_eq!(result.output["count"], 1);
+    assert_eq!(result.output["truncated"], true);
+    assert_eq!(
+        requests.len(),
+        2,
+        "unexpected git argv requests: {requests:?}"
+    );
+    assert_eq!(
+        requests[0],
+        ["rev-parse", "--verify", "HEAD^{commit}"].map(str::to_string)
+    );
+    assert_eq!(requests[1][0], "log");
+    assert_eq!(requests[1].last(), Some(&head));
+    assert_eq!(
+        result.output["suggested_call"]["arguments"]["head_commit"],
+        head
+    );
+}
+
+#[tokio::test]
+async fn git_log_structured_argv_preserves_unborn_repository_result() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_git_repo(tmp.path());
+    let runtime = test_runtime();
+    let project =
+        register_structured_git_agent_at_path(&runtime, "log-unborn", "repo", tmp.path()).await;
+    let (result, requests) =
+        run_git_log_via_structured_runner(&runtime, "log-unborn", project, None, Some(20), Some(0))
+            .await;
+
+    assert!(result.success, "{:?}", result.error);
+    assert_eq!(result.output["head_commit"], Value::Null);
+    assert_eq!(result.output["commits"], json!([]));
+    assert_eq!(result.output["truncated"], false);
+    assert_eq!(
+        requests.len(),
+        3,
+        "unexpected git argv requests: {requests:?}"
+    );
+    assert_eq!(
+        requests[0],
+        ["rev-parse", "--verify", "HEAD^{commit}"].map(str::to_string)
+    );
+    assert_eq!(
+        requests[1],
+        ["symbolic-ref", "-q", "HEAD"].map(str::to_string)
+    );
+    assert_eq!(&requests[2][..3], ["show-ref", "--verify", "--quiet"]);
+    assert!(requests[2][3].starts_with("refs/heads/"));
+}
+
+#[tokio::test]
+async fn git_log_continuation_keeps_original_snapshot_after_head_moves() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_git_repo(tmp.path());
+    commit_file(tmp.path(), "first.txt", "first\n", "first");
+    commit_file(tmp.path(), "second.txt", "second\n", "second");
+
+    let runtime = test_runtime();
+    let project =
+        register_structured_git_agent_at_path(&runtime, "log-continuation", "repo", tmp.path())
+            .await;
+    let (first_page, first_requests) = run_git_log_via_structured_runner(
+        &runtime,
+        "log-continuation",
+        project.clone(),
+        None,
+        Some(1),
+        Some(0),
+    )
+    .await;
+    assert!(first_page.success, "{:?}", first_page.error);
+    let snapshot = first_page.output["head_commit"]
+        .as_str()
+        .expect("resolved snapshot")
+        .to_string();
+    assert_eq!(first_page.output["commits"][0]["subject"], "second");
+    assert_eq!(
+        first_page.output["suggested_call"]["arguments"]["head_commit"],
+        snapshot
+    );
+    assert_eq!(
+        first_requests[0],
+        ["rev-parse", "--verify", "HEAD^{commit}"].map(str::to_string)
+    );
+
+    commit_file(tmp.path(), "third.txt", "third\n", "third");
+    let (continued, continuation_requests) = run_git_log_via_structured_runner(
+        &runtime,
+        "log-continuation",
+        project,
+        Some(snapshot.clone()),
+        Some(1),
+        Some(1),
+    )
+    .await;
+
+    assert!(continued.success, "{:?}", continued.error);
+    assert_eq!(continued.output["head_commit"], snapshot);
+    assert_eq!(continued.output["commits"][0]["subject"], "first");
+    assert_eq!(continuation_requests.len(), 2);
+    assert_eq!(
+        continuation_requests[0],
+        ["cat-file", "-t", snapshot.as_str()].map(str::to_string)
+    );
+    assert_eq!(continuation_requests[1][0], "log");
+    assert_eq!(continuation_requests[1].last(), Some(&snapshot));
+}
+
+#[tokio::test]
+async fn git_log_missing_explicit_snapshot_is_unavailable() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_git_repo(tmp.path());
+    commit_file(tmp.path(), "first.txt", "first\n", "first");
+    let missing = "f".repeat(40);
+    let runtime = test_runtime();
+    let project =
+        register_structured_git_agent_at_path(&runtime, "log-missing", "repo", tmp.path()).await;
+
+    let (result, requests) = run_git_log_via_structured_runner(
+        &runtime,
+        "log-missing",
+        project,
+        Some(missing.clone()),
+        Some(20),
+        Some(0),
+    )
+    .await;
+
+    assert!(!result.success);
+    assert_eq!(result.output["error_kind"], "snapshot_unavailable");
+    assert_eq!(result.output["head_commit"], missing);
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0],
+        ["cat-file", "-t", missing.as_str()].map(str::to_string)
+    );
+}
+
+#[tokio::test]
+async fn git_log_fatal_ref_check_is_not_reported_as_unborn() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_git_repo(tmp.path());
+    let runtime = test_runtime();
+    let project =
+        register_structured_git_agent_at_path(&runtime, "log-ref-fatal", "repo", tmp.path()).await;
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        async move {
+            runtime
+                .git_log(project, None, Some(20), Some(0), None)
+                .await
+        }
+    });
+
+    let rev_parse = wait_for_patch_agent_request(&runtime, "log-ref-fatal").await;
+    assert_eq!(
+        rev_parse.process.as_ref().unwrap().args,
+        ["rev-parse", "--verify", "HEAD^{commit}"].map(str::to_string)
+    );
+    complete_patch_agent_request(
+        &runtime,
+        "log-ref-fatal",
+        &rev_parse.request_id,
+        128,
+        "",
+        "fatal: unable to read HEAD",
+    )
+    .await;
+
+    let symbolic_ref = wait_for_patch_agent_request(&runtime, "log-ref-fatal").await;
+    assert_eq!(
+        symbolic_ref.process.as_ref().unwrap().args,
+        ["symbolic-ref", "-q", "HEAD"].map(str::to_string)
+    );
+    complete_patch_agent_request(
+        &runtime,
+        "log-ref-fatal",
+        &symbolic_ref.request_id,
+        0,
+        "refs/heads/main\n",
+        "",
+    )
+    .await;
+
+    let show_ref = wait_for_patch_agent_request(&runtime, "log-ref-fatal").await;
+    assert_eq!(
+        show_ref.process.as_ref().unwrap().args,
+        ["show-ref", "--verify", "--quiet", "refs/heads/main"].map(str::to_string)
+    );
+    complete_patch_agent_request(
+        &runtime,
+        "log-ref-fatal",
+        &show_ref.request_id,
+        128,
+        "",
+        "fatal: git metadata unavailable",
+    )
+    .await;
+
+    let result = task.await.unwrap();
+    assert!(!result.success);
+    assert_eq!(result.output["error_kind"], "snapshot_unavailable");
+}
+
+#[tokio::test]
+async fn git_log_truncated_snapshot_metadata_is_source_incomplete() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_git_repo(tmp.path());
+    commit_file(tmp.path(), "first.txt", "first\n", "first");
+    let (_, head, _, _) = run_command_sync("git rev-parse HEAD", tmp.path(), 30);
+    let head = head.trim().to_string();
+    let runtime = test_runtime();
+    let project = register_structured_git_agent_at_path(
+        &runtime,
+        "log-metadata-truncated",
+        "repo",
+        tmp.path(),
+    )
+    .await;
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let head = head.clone();
+        async move {
+            runtime
+                .git_log(project, Some(head), Some(20), Some(0), None)
+                .await
+        }
+    });
+
+    let request = wait_for_patch_agent_request(&runtime, "log-metadata-truncated").await;
+    assert_eq!(
+        request.process.as_ref().unwrap().args,
+        ["cat-file", "-t", head.as_str()].map(str::to_string)
+    );
+    complete_patch_agent_request_with_truncation(
+        &runtime,
+        "log-metadata-truncated",
+        &request.request_id,
+        0,
+        "commit\n",
+        "",
+        true,
+        false,
+    )
+    .await;
+
+    let result = task.await.unwrap();
+    assert!(!result.success);
+    assert_eq!(result.output["error_kind"], "source_incomplete");
+}
+
+#[tokio::test]
+async fn git_log_rejects_ref_or_range_before_runner_dispatch() {
+    let runtime = test_runtime();
+    for head_commit in ["HEAD", "main", "HEAD~1", "a..b"] {
+        let result = runtime
+            .git_log(
+                "missing-project".to_string(),
+                Some(head_commit.to_string()),
+                Some(20),
+                Some(0),
+                None,
+            )
+            .await;
+        assert!(!result.success, "{head_commit:?} must be rejected");
+        assert_eq!(result.output["state_changed"], false);
+        assert_eq!(result.output["error_kind"], "invalid_commit_id");
     }
 }
 

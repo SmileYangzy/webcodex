@@ -285,6 +285,10 @@ Runner 到 configured local provider 的内建 gateway 有意限制为 bounded s
 Shell env 覆盖继承值，profile env 再覆盖 Shell env；未配置 init_script 时不执行
 启动脚本，也不会自动 source `.bashrc` / `.profile`。
 
+Windows 子进程环境默认设置 `PYTHONIOENCODING=utf-8`，用于 Python 的重定向标准输入、
+输出和错误流；已继承或在 Shell/profile 中显式配置的值优先。不更改 Python 文件编码或
+系统代码页。没有输入的 Shell Job 和结构化验证步骤收到 EOF，不继承 Runner 的父进程存活管道。
+
 可显式选择 `environment_mode = "isolated"`：Unix 仅提供 `/usr/bin:/bin` PATH，
 Windows 提供 SystemRoot 与 System32 PATH，再应用配置 env/path_prepend。这不是文件系统沙箱。
 MCP 的显式 credential delegation 规则不变；Native Plugin 继续使用已有的凭据过滤。

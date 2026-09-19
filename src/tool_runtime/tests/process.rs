@@ -519,6 +519,44 @@ async fn run_process_enqueues_only_typed_argv_and_reports_completed_exit_codes()
 }
 
 #[tokio::test]
+async fn run_process_preserves_runner_transport_truncation_on_success_and_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = test_runtime();
+    let project = register_process_agent(&runtime, "process-truncated", temp.path(), true).await;
+
+    for exit_code in [0, 19] {
+        let task = tokio::spawn({
+            let runtime = runtime.clone();
+            let project = project.clone();
+            async move {
+                runtime
+                    .run_internal_process_sync(project, "argv-helper".to_string(), vec![], 30)
+                    .await
+            }
+        });
+        let request = wait_for_patch_agent_request(&runtime, "process-truncated").await;
+        complete_patch_agent_request_with_truncation(
+            &runtime,
+            "process-truncated",
+            &request.request_id,
+            exit_code,
+            "stdout tail",
+            "stderr tail",
+            true,
+            true,
+        )
+        .await;
+        let result = task.await.unwrap();
+        assert_eq!(result.success, exit_code == 0);
+        assert_eq!(result.output["exit_code"], exit_code);
+        assert_eq!(result.output["stdout_tail"], "stdout tail");
+        assert_eq!(result.output["stderr_tail"], "stderr tail");
+        assert_eq!(result.output["stdout_truncated"], true);
+        assert_eq!(result.output["stderr_truncated"], true);
+    }
+}
+
+#[tokio::test]
 async fn run_process_preserves_remote_windows_cwd_syntax_before_dispatch() {
     let runtime = test_runtime();
     let client_id = "process-windows-cwd";

@@ -4,9 +4,35 @@ use super::super::*;
 use super::support::*;
 use crate::runner_protocol::RunnerCapabilities;
 use crate::tool_runtime::git::{
-    git_log_next_skip, normalize_git_log_limit, normalize_git_log_skip,
+    git_log_args, git_log_next_skip, normalize_git_log_limit, normalize_git_log_skip,
 };
 use serde_json::json;
+
+async fn complete_git_log_process(
+    runtime: &ToolRuntime,
+    client_id: &str,
+    args: &[String],
+    exit_code: i32,
+    stdout: &str,
+    stderr: &str,
+) {
+    let request = wait_for_patch_agent_request(runtime, client_id).await;
+    assert_eq!(request.kind, "run_process");
+    assert!(request.command.is_empty());
+    assert!(request.script.is_none());
+    let process = request.process.as_ref().expect("typed git argv");
+    assert_eq!(process.executable, "git");
+    assert_eq!(process.args, args);
+    complete_patch_agent_request(
+        runtime,
+        client_id,
+        &request.request_id,
+        exit_code,
+        stdout,
+        stderr,
+    )
+    .await;
+}
 
 #[tokio::test]
 async fn git_status_with_session_id_records_git_read_event() {
@@ -63,7 +89,7 @@ async fn git_log_parses_commits() {
     init_git_repo(root);
     commit_file(root, "a.txt", "one\n", "first commit");
     commit_file(root, "a.txt", "two\n", "second commit");
-    let stdout = git_log_stdout(root, 20, 0);
+    let (head, stdout) = git_log_stdout(root, 20, 0);
     let runtime = runtime_with_agent_project("git-log-parse");
     let caps = RunnerCapabilities {
         git: true,
@@ -91,14 +117,29 @@ async fn git_log_parses_commits() {
                 .await
         }
     });
-    let req = wait_for_patch_agent_request(&runtime, "git-log-parse").await;
-    assert!(req.command.contains("git log"));
-    assert!(req.command.contains("-n 21"));
-    complete_patch_agent_request(&runtime, "git-log-parse", &req.request_id, 0, &stdout, "").await;
+    complete_git_log_process(
+        &runtime,
+        "git-log-parse",
+        &["rev-parse", "--verify", "HEAD^{commit}"].map(str::to_string),
+        0,
+        &head,
+        "",
+    )
+    .await;
+    complete_git_log_process(
+        &runtime,
+        "git-log-parse",
+        &git_log_args(&head, 20, 0),
+        0,
+        &stdout,
+        "",
+    )
+    .await;
     let result = task.await.unwrap();
 
     assert!(result.success, "{:?}", result.error);
     assert_eq!(result.output["project"], project);
+    assert_eq!(result.output["head_commit"], head);
     assert_eq!(result.output["limit"], 20);
     assert_eq!(result.output["skip"], 0);
     assert_eq!(result.output["count"], 2);
@@ -126,7 +167,7 @@ async fn git_log_limit_and_skip_returns_second_recent_and_truncated() {
     commit_file(root, "a.txt", "one\n", "first commit");
     commit_file(root, "a.txt", "two\n", "second commit");
     commit_file(root, "a.txt", "three\n", "third commit");
-    let stdout = git_log_stdout(root, 1, 1);
+    let (head, stdout) = git_log_stdout(root, 1, 1);
     let runtime = runtime_with_agent_project("git-log-page");
     let caps = RunnerCapabilities {
         git: true,
@@ -154,10 +195,24 @@ async fn git_log_limit_and_skip_returns_second_recent_and_truncated() {
                 .await
         }
     });
-    let req = wait_for_patch_agent_request(&runtime, "git-log-page").await;
-    assert!(req.command.contains("-n 2"));
-    assert!(req.command.contains("--skip 1"));
-    complete_patch_agent_request(&runtime, "git-log-page", &req.request_id, 0, &stdout, "").await;
+    complete_git_log_process(
+        &runtime,
+        "git-log-page",
+        &["rev-parse", "--verify", "HEAD^{commit}"].map(str::to_string),
+        0,
+        &head,
+        "",
+    )
+    .await;
+    complete_git_log_process(
+        &runtime,
+        "git-log-page",
+        &git_log_args(&head, 1, 1),
+        0,
+        &stdout,
+        "",
+    )
+    .await;
     let result = task.await.unwrap();
 
     assert!(result.success, "{:?}", result.error);
@@ -176,11 +231,13 @@ async fn run_git_log_page(
     limit: usize,
     skip: usize,
 ) -> ToolResult {
-    run_git_log_page_with_stdout(client_id, git_log_stdout(root, limit, skip), limit, skip).await
+    let (head, stdout) = git_log_stdout(root, limit, skip);
+    run_git_log_page_with_stdout(client_id, &head, stdout, limit, skip).await
 }
 
 async fn run_git_log_page_with_stdout(
     client_id: &str,
+    head: &str,
     stdout: String,
     limit: usize,
     skip: usize,
@@ -215,10 +272,24 @@ async fn run_git_log_page_with_stdout(
                 .await
         }
     });
-    let request = wait_for_patch_agent_request(&runtime, client_id).await;
-    assert!(request.command.contains(&format!("-n {}", limit + 1)));
-    assert!(request.command.contains(&format!("--skip {skip}")));
-    complete_patch_agent_request(&runtime, client_id, &request.request_id, 0, &stdout, "").await;
+    complete_git_log_process(
+        &runtime,
+        client_id,
+        &["rev-parse", "--verify", "HEAD^{commit}"].map(str::to_string),
+        0,
+        head,
+        "",
+    )
+    .await;
+    complete_git_log_process(
+        &runtime,
+        client_id,
+        &git_log_args(head, limit, skip),
+        0,
+        &stdout,
+        "",
+    )
+    .await;
     task.await.unwrap()
 }
 
@@ -228,6 +299,21 @@ async fn run_git_log_tool_call_with_stdout(
     stdout: String,
     expected_head: &str,
 ) -> ToolResult {
+    let ToolCall::GitLog {
+        head_commit,
+        limit,
+        skip,
+        ..
+    } = &call
+    else {
+        panic!("expected a git_log continuation");
+    };
+    assert_eq!(head_commit.as_deref(), Some(expected_head));
+    let args = git_log_args(
+        expected_head,
+        normalize_git_log_limit(*limit),
+        normalize_git_log_skip(*skip),
+    );
     let runtime = runtime_with_agent_project(client_id);
     register_agent(
         &runtime,
@@ -246,18 +332,16 @@ async fn run_git_log_tool_call_with_stdout(
             runtime.dispatch_with_auth(call, Some(&bootstrap)).await
         }
     });
-    let request = wait_for_patch_agent_request(&runtime, client_id).await;
-    assert!(
-        request.command.contains(expected_head),
-        "{}",
-        request.command
-    );
-    assert!(
-        !request.command.contains("HEAD^{commit}"),
-        "{}",
-        request.command
-    );
-    complete_patch_agent_request(&runtime, client_id, &request.request_id, 0, &stdout, "").await;
+    complete_git_log_process(
+        &runtime,
+        client_id,
+        &["cat-file", "-t", expected_head].map(str::to_string),
+        0,
+        "commit\n",
+        "",
+    )
+    .await;
+    complete_git_log_process(&runtime, client_id, &args, 0, &stdout, "").await;
     task.await.unwrap()
 }
 
@@ -271,10 +355,9 @@ async fn git_log_retained_tail_never_advertises_a_complete_or_continuable_page()
     };
     // Exercise actual registry retention, which drops the oversized first
     // record's prefix but leaves a perfectly parseable older commit behind.
-    let stdout = record(&"x".repeat(300 * 1024))
-        + &record("older")
-        + &format!("__WEBCODEX_GIT_LOG_HEAD__={}\u{1e}", "a".repeat(40));
-    let result = run_git_log_page_with_stdout("git-log-retained-tail", stdout, 2, 0).await;
+    let stdout = record(&"x".repeat(300 * 1024)) + &record("older");
+    let result =
+        run_git_log_page_with_stdout("git-log-retained-tail", &"a".repeat(40), stdout, 2, 0).await;
     assert!(!result.success);
     assert_eq!(result.output["error_kind"], "source_incomplete");
     assert!(result.output.get("next_skip").is_none());
@@ -430,16 +513,13 @@ async fn git_log_missing_exact_snapshot_fails_closed_without_head_fallback() {
                 .await
         }
     });
-    let request = wait_for_patch_agent_request(&runtime, "git-log-missing-snapshot").await;
-    assert!(request.command.contains(&missing));
-    assert!(!request.command.contains("HEAD^{commit}"));
-    complete_patch_agent_request(
+    complete_git_log_process(
         &runtime,
         "git-log-missing-snapshot",
-        &request.request_id,
-        42,
+        &["cat-file", "-t", missing.as_str()].map(str::to_string),
+        128,
         "",
-        "git log snapshot unavailable\n",
+        "fatal: git cat-file: could not get object info\n",
     )
     .await;
     let result = task.await.unwrap();
@@ -448,6 +528,11 @@ async fn git_log_missing_exact_snapshot_fails_closed_without_head_fallback() {
     assert_eq!(result.output["head_commit"], missing);
     assert!(result.output.get("commits").is_none());
     assert!(result.output.get("suggested_call").is_none());
+    assert!(
+        probe_patch_agent_request(&runtime, "git-log-missing-snapshot")
+            .await
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -483,13 +568,30 @@ async fn git_log_unborn_repository_is_an_empty_final_page() {
                 .await
         }
     });
-    let request = wait_for_patch_agent_request(&runtime, "git-log-unborn").await;
-    complete_patch_agent_request(
+    complete_git_log_process(
         &runtime,
         "git-log-unborn",
-        &request.request_id,
+        &["rev-parse", "--verify", "HEAD^{commit}"].map(str::to_string),
+        128,
+        "",
+        "fatal: Needed a single revision\n",
+    )
+    .await;
+    complete_git_log_process(
+        &runtime,
+        "git-log-unborn",
+        &["symbolic-ref", "-q", "HEAD"].map(str::to_string),
         0,
-        "__WEBCODEX_GIT_LOG_HEAD__=unborn\u{1e}",
+        "refs/heads/main\n",
+        "",
+    )
+    .await;
+    complete_git_log_process(
+        &runtime,
+        "git-log-unborn",
+        &["show-ref", "--verify", "--quiet", "refs/heads/main"].map(str::to_string),
+        1,
+        "",
         "",
     )
     .await;
@@ -500,6 +602,10 @@ async fn git_log_unborn_repository_is_an_empty_final_page() {
     assert_eq!(result.output["commits"], json!([]));
     assert_eq!(result.output["truncated"], false);
     assert_eq!(result.output["next_skip"], serde_json::Value::Null);
+    assert!(result.output.get("suggested_call").is_none());
+    assert!(probe_patch_agent_request(&runtime, "git-log-unborn")
+        .await
+        .is_none());
 }
 
 #[tokio::test]
@@ -544,7 +650,7 @@ async fn git_log_read_only_session_allowed_and_recorded() {
     init_git_repo(root);
     commit_file(root, "a.txt", "one\n", "first commit");
     commit_file(root, "a.txt", "two\n", "second commit");
-    let stdout = git_log_stdout(root, 1, 0);
+    let (head, stdout) = git_log_stdout(root, 1, 0);
     let runtime = runtime_with_agent_project("git-log-readonly");
     let caps = RunnerCapabilities {
         git: true,
@@ -589,11 +695,19 @@ async fn git_log_read_only_session_allowed_and_recorded() {
                 .await
         }
     });
-    let req = wait_for_patch_agent_request(&runtime, "git-log-readonly").await;
-    complete_patch_agent_request(
+    complete_git_log_process(
         &runtime,
         "git-log-readonly",
-        &req.request_id,
+        &["rev-parse", "--verify", "HEAD^{commit}"].map(str::to_string),
+        0,
+        &head,
+        "",
+    )
+    .await;
+    complete_git_log_process(
+        &runtime,
+        "git-log-readonly",
+        &git_log_args(&head, 1, 0),
         0,
         &stdout,
         "",

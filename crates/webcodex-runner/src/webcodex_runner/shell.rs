@@ -266,6 +266,12 @@ fn apply_shell_environment(cmd: &mut Command, shell: &ShellConfig) -> Result<(),
     for key in SENSITIVE_ENV_KEYS {
         cmd.env_remove(key);
     }
+    // Redirected Python streams otherwise default to the Windows ANSI code page.
+    // Keep file encodings and explicit inherited/configured choices unchanged.
+    #[cfg(windows)]
+    if std::env::var_os("PYTHONIOENCODING").is_none() {
+        cmd.env("PYTHONIOENCODING", "utf-8");
+    }
     if !shell.path_prepend.is_empty() {
         let mut paths = shell.path_prepend.clone();
         if let Some(current) = std::env::var_os("PATH") {
@@ -1007,6 +1013,10 @@ pub(crate) fn base_shell_env(
             env
         }
     };
+    #[cfg(windows)]
+    if env_lookup(&env, "PYTHONIOENCODING").is_none() {
+        env_insert(&mut env, "PYTHONIOENCODING", "utf-8".to_string());
+    }
     if !shell.path_prepend.is_empty() {
         let mut paths = shell.path_prepend.clone();
         // The inherited Windows PATH may be spelled `Path`; lookup must be

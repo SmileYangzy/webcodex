@@ -1129,7 +1129,7 @@ impl ToolRuntime {
                     let exit_code = response.exit_code;
                     let stdout = response.stdout.unwrap_or_default();
                     let stderr = response.stderr.unwrap_or_default();
-                    match state {
+                    let mut result = match state {
                         ShellCommandExecutionState::NotStarted => {
                             let reason = response
                                 .error
@@ -1170,7 +1170,14 @@ impl ToolRuntime {
                             timeout,
                             state,
                         ),
+                    };
+                    if response.stdout_truncated {
+                        result.output["stdout_truncated"] = json!(true);
                     }
+                    if response.stderr_truncated {
+                        result.output["stderr_truncated"] = json!(true);
+                    }
+                    result
                 }
                 Ok(Err(_)) => {
                     let dispatch = self
