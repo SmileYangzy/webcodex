@@ -1089,6 +1089,30 @@ fn workspace_symbols_supports_information_workspace_and_uri_only_shapes() {
 }
 
 #[test]
+fn cold_call_hierarchy_waits_for_workspace_readiness() {
+    let _serial = super::serialize_fake_lsp_test();
+    let fixture = NavFixture::new("call_hierarchy_readiness_timeout");
+    let started = Instant::now();
+    let result = fixture.request_with_timeout(
+        RunnerLspPayload {
+            project_id: "demo".into(),
+            request: RunnerLspRequest::CallHierarchy {
+                path: "src/main.rs".into(),
+                line: 1,
+                column: 4,
+                direction: CallHierarchyDirection::Both,
+                depth: 1,
+                limit: 50,
+            },
+        },
+        1,
+    );
+    assert_eq!(result["success"], false, "{result}");
+    assert_eq!(result["error"]["code"], "lsp_request_timeout", "{result}");
+    assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+#[test]
 fn cold_workspace_symbols_waits_for_quiescent_readiness_before_dispatch() {
     let _serial = super::serialize_fake_lsp_test();
     let fixture = NavFixture::new("workspace_readiness_timeout");

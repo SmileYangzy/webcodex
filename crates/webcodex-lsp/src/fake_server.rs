@@ -154,7 +154,7 @@ fn run() -> io::Result<()> {
                 if server_status_requested {
                     let behavior = scenario_behavior(&scenario);
                     match behavior {
-                        "workspace_readiness_timeout" => {
+                        "workspace_readiness_timeout" | "call_hierarchy_readiness_timeout" => {
                             write_server_status(&mut writer, "ok", false, None)?;
                         }
                         "workspace_readiness_restart" => {

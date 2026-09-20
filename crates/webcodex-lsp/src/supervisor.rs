@@ -650,7 +650,7 @@ impl LspSupervisor {
                 text,
             }),
             true,
-            false,
+            true,
         )
     }
 
@@ -670,7 +670,7 @@ impl LspSupervisor {
             Some(operation_deadline),
             None,
             true,
-            false,
+            true,
         )
     }
 
@@ -690,7 +690,7 @@ impl LspSupervisor {
             Some(operation_deadline),
             None,
             true,
-            false,
+            true,
         )
     }
 
