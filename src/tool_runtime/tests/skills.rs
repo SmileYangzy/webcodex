@@ -501,20 +501,15 @@ async fn call_kernel_with_fake_operator_store(
                         }
                     }
                     RunnerSkillRequest::ResolveName { name } => {
-                        let key = skill_name_key(&name);
                         let mut skills = Vec::new();
-                        if let Some(configured) = state
-                            .configured
-                            .as_ref()
-                            .filter(|configured| skill_name_key(&configured.name) == key)
-                        {
+                        if let Some(configured) = state.configured.as_ref().filter(|configured| {
+                            webcodex_core::skill_metadata::skill_name_eq(&configured.name, &name)
+                        }) {
                             skills.push(configured_descriptor(configured));
                         }
-                        if let Some(managed) = state
-                            .managed
-                            .as_ref()
-                            .filter(|managed| skill_name_key(&managed.name) == key)
-                        {
+                        if let Some(managed) = state.managed.as_ref().filter(|managed| {
+                            webcodex_core::skill_metadata::skill_name_eq(&managed.name, &name)
+                        }) {
                             skills.push(managed_descriptor(managed));
                         }
                         let mut seen = std::collections::BTreeSet::new();
