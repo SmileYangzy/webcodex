@@ -13,7 +13,6 @@ use super::{ToolCall, ToolRuntime};
 use crate::action_audit_sessions::secret_like_value;
 use crate::projects::ProjectConfig;
 
-const CHECKPOINT_VERSION: u32 = 1;
 const CHECKPOINT_ID_PREFIX: &str = "wc_ckpt_";
 const DEFAULT_LIST_LIMIT: usize = 20;
 const MAX_LIST_LIMIT: usize = 100;
@@ -280,7 +279,13 @@ impl ToolRuntime {
             };
         }
         let mut checkpoint = helper_output;
-        checkpoint["version"] = json!(CHECKPOINT_VERSION);
+        // The helper owns the payload format. Older helpers omitted the v1 marker.
+        if checkpoint.get("version").is_none() {
+            checkpoint["version"] = json!(1);
+        }
+        if !matches!(checkpoint["version"].as_u64(), Some(1 | 2)) {
+            return ToolResult::err("unsupported checkpoint version");
+        }
         checkpoint["project"] = json!(project);
         checkpoint["project_input"] = json!(resolved.input);
         checkpoint["resolved_project"] = json!(resolved.resolved_id);
@@ -385,7 +390,10 @@ impl ToolRuntime {
             Ok(value) => value,
             Err(err) => return ToolResult::err(err),
         };
-        if checkpoint.get("version").and_then(Value::as_u64) != Some(CHECKPOINT_VERSION as u64) {
+        if !matches!(
+            checkpoint.get("version").and_then(Value::as_u64),
+            Some(1 | 2)
+        ) {
             return ToolResult::err("unsupported checkpoint version");
         }
         let helper_output = match self

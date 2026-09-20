@@ -601,6 +601,55 @@ async fn checkpoint_validation_metadata_is_bounded() {
 }
 
 #[tokio::test]
+async fn checkpoint_runtime_preserves_v2_bytes_with_autocrlf() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init_git_repo(root);
+    assert!(std::process::Command::new("git")
+        .args(["config", "core.autocrlf", "true"])
+        .current_dir(root)
+        .status()
+        .unwrap()
+        .success());
+    commit_file(root, "a.txt", "base\n", "base commit");
+    let original = b"checkpoint\nsecond line\n";
+    fs::write(root.join("a.txt"), original).unwrap();
+    let runtime = test_runtime().with_checkpoint_state_dir(state.path());
+    let project =
+        register_runner_project_at_path(&runtime, "ckpt-v2-bytes", "agent-proj", root).await;
+    let created = dispatch_checkpoint_with_local_agent(
+        &runtime,
+        "ckpt-v2-bytes",
+        checkpoint_create_call(project.clone(), None, None, Some(false)),
+    )
+    .await;
+    assert!(created.success, "{:?}", created.error);
+    let stored: Value = serde_json::from_slice(
+        &fs::read(created.output["storage_path"].as_str().unwrap()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(stored["version"], 2);
+    fs::write(root.join("a.txt"), b"polluted\r\n").unwrap();
+    let restored = dispatch_checkpoint_with_local_agent(
+        &runtime,
+        "ckpt-v2-bytes",
+        ToolCall::WorkspaceCheckpointRestore {
+            project,
+            checkpoint_id: created.output["checkpoint_id"].as_str().unwrap().to_owned(),
+            confirm: true,
+            session_id: None,
+        },
+    )
+    .await;
+    assert!(restored.success, "{:?}", restored.error);
+    assert_eq!(fs::read(root.join("a.txt")).unwrap(), original);
+    assert!(!restored.output["warnings"]
+        .to_string()
+        .contains("legacy_v1"));
+}
+
+#[tokio::test]
 async fn checkpoint_restore_tracked_changes() {
     let tmp = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
