@@ -20,6 +20,10 @@ mod audit;
 mod communication;
 mod connection_observation;
 mod goal;
+mod goal_plan;
+#[cfg(test)]
+mod goal_plan_tests;
+mod goal_stall;
 mod job_receipts;
 mod job_terminal_wait;
 #[cfg(test)]
@@ -174,3 +178,15 @@ mod project_reference_tests;
 
 #[cfg(test)]
 mod job_receipts_tests;
+
+pub use goal_plan::{
+    GoalCheckpoint, GoalPlan, GoalStep, GoalStepStatus, NewGoalStep,
+    MAX_GOAL_COMPLETION_CONDITIONS, MAX_GOAL_CONDITION_BYTES, MAX_GOAL_PLAN_BYTES,
+    MAX_GOAL_PROGRESS_SUMMARY_BYTES, MAX_GOAL_STEPS, MAX_GOAL_STEP_ID_BYTES,
+    MAX_GOAL_STEP_TITLE_CHARS,
+};
+
+pub use goal_stall::{
+    GoalStallAttention, GoalStallCandidate, GOAL_ACTIVITY_ATTENTION_AFTER_MS,
+    GOAL_CARD_ALIVE_GRACE_MS, GOAL_CARD_OBSERVATION_ADVANCE_MS,
+};

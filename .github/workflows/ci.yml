@@ -351,7 +351,10 @@ jobs:
             WEBCODEX_GIT_DIRTY=false
             WEBCODEX_BUILT_AT=${{ env.WEBCODEX_CI_BUILT_AT }}
           cache-from: type=gha,scope=server-image-ci-amd64
-          cache-to: type=gha,mode=max,scope=server-image-ci-amd64
+          # GHA cache export is a performance optimization, not image evidence.
+          # BuildKit can transiently return layer-blob not_found after the image
+          # itself has built; keep build/load/smoke authoritative in that case.
+          cache-to: type=gha,mode=max,scope=server-image-ci-amd64,ignore-error=true
           provenance: false
           sbom: false
       - name: Smoke amd64 Server image

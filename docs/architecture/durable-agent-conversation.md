@@ -15,7 +15,8 @@ A1 adds a concrete communication domain without changing the meaning of Workflow
 | Wake Delivery Attempt | One Endpoint/generation-bound attempt to deliver a Wake Intent through a continuation adapter | the durable communication fact or a grant of execution authority |
 | Agent Task | Planned durable asynchronous work accepted/created for an Agent | Conversation Message, Workflow Session todo, Job, or execution authority |
 | Agent Wait | Caller-owned durable one-shot rendezvous over 1..8 exact AgentTask-terminal sources with closed `any|all` mode | a Task dependency graph, Goal attention policy, Host binding, scheduler, or source-authority grant |
-| Workflow Session | Existing execution, provenance, validation, Job, workspace, todo, and guidance context | a chat room |
+| Goal | High-level durable workflow/progress truth: fixed completion intent, bounded plan/checkpoints, lifecycle and controller routing | Task execution ownership or inherited authority |
+| Workflow Session | Concrete current-work context: existing execution, provenance, validation, Job, workspace, todo, and guidance | a chat room or a Goal |
 
 An Agent Card contains a mutable non-unique handle, display name, description, bounded specialty labels, profile revision, and timestamps. These fields are self-description metadata. Canonical identity is only the Server-generated `agent_id`, and neither identity nor metadata grants Project, filesystem, Runner, Agent Task, or Workflow Session authority.
 
@@ -96,18 +97,64 @@ Each View creates a stable `wc_host_binding_<32 lowercase hex>` fence from 128 b
 
 The v14 controller state machine is therefore `Bound(E1/g1) -> Stale(E1/g1) -> Replacing(E1/g1 -> E2/g2) -> Bound(E2/g2)`. `Stale` is durable Endpoint truth (expired lifecycle or elapsed lease), while the active iframe binding and Host carrier remain process-local. There is no durable `Replacing` row: the replacement transaction either commits E2/g2 plus its idempotency record together or commits nothing. The App may update its card identity only from the strict successful replacement envelope naming the exact old selector and exactly `generation+1`. Ordinary bind/state/Wake projections remain unable to retarget the card. The App increments a local identity epoch when accepting replacement; outstanding old bind/state Promises and scheduled timers capture the prior epoch and become inert, while any delayed ordinary old-generation projection is ignored rather than allowed to tear down or revert the new generation. The same iframe/card then clears only local controller coordination state, renders `Reconnecting…`, binds E2/g2, and resumes normal Wake reconciliation.
 
-Successful prepare carries the exact bounded envelope in standard `CallToolResult.structuredContent.output.app_protocol.automatic_message`. This is confined to the ModelHidden app-only prepare tool, not `present_agent_continuation` or ordinary model tools. No continuation custom ToolResult `_meta` channel remains. A successful response with a missing, malformed, mismatched, or oversized envelope is treated conservatively like a prepare timeout: heartbeat/acquire reconcile the durable fence and finish as `delivery_unknown`, without another prepare or `ui/message` for that Attempt. Typed audit/Session projections and tool-name-based forensic trace suppression also cover the standard App result payload. Agent v1-v15 remain thin hidden read aliases; discovery advertises only v16. The published continuation projection schema still requires the nullable restart `recovery` field, while the dedicated replacement tool has a separate strict `endpoint_recovery` envelope; the two recovery paths are not inferred from each other. Goal Plan remains v2.
+Successful prepare carries the exact bounded envelope in standard `CallToolResult.structuredContent.output.app_protocol.automatic_message`. This is confined to the ModelHidden app-only prepare tool, not `present_agent_continuation` or ordinary model tools. No continuation custom ToolResult `_meta` channel remains. A successful response with a missing, malformed, mismatched, or oversized envelope is treated conservatively like a prepare timeout: heartbeat/acquire reconcile the durable fence and finish as `delivery_unknown`, without another prepare or `ui/message` for that Attempt. Typed audit/Session projections and tool-name-based forensic trace suppression also cover the standard App result payload. Agent v1-v15 remain thin hidden read aliases; discovery advertises only v16. The published continuation projection schema still requires the nullable restart `recovery` field, while the dedicated replacement tool has a separate strict `endpoint_recovery` envelope; the two recovery paths are not inferred from each other. Goal Plan uses the sole v3 resource and wire version 2; its old pre-production resource aliases are removed independently of Agent carrier compatibility.
 
 A successful `ui/message` call proves only Host dispatch acceptance, not model resumption. The App never automatically retries an Attempt after the durable dispatch fence; timeout, reload, View loss, or an outcome that cannot prove non-delivery remains `delivery_unknown`. The only production proof that the continuation model turn actually ran is a later exact `consume_agent_wake`, which remains valid for an already-dispatched `mcp_app` Attempt even if View teardown has withdrawn transient wake capability. A late Host ACK after exact consume is idempotent and cannot regress `consumed`. v16 allows hidden/background Views to acquire, prepare, and dispatch while retaining their slower bounded heartbeat cadence; visibility changes alone never imply delivery uncertainty. Host scheduling remains eventually available/best effort rather than a real-time guarantee. Runtime Console itself remains polling-only and non-wake-capable. The empirical Host behavior and remaining manual dogfood boundary are recorded in [`../agent/mcp-app-continuation-experiments.md`](../agent/mcp-app-continuation-experiments.md).
 
 Goal-correlated terminal attention reuses that carrier without reusing A4b's active-Attempt semantics. A Goal may name one explicit durable `controller_agent_id` independently from the worker Agent assigned to a concrete Task/Attempt. Without an explicit Goal-scoped AgentWait, exact TaskAttempt terminalization atomically creates the narrow `agent_task_terminal` attention Event plus `attention_event` Wake for each currently active owned Goal correlation, targeting that Goal controller when present; a controller-less legacy Goal still falls back to the Task assignee. A generic AgentWait does not change that routing. An explicitly registered Goal-scoped AgentWait is the only precedence override: while its one-shot Wait remains `waiting` or `triggered`, its exact registered Goal/Task sources route terminal facts through the Wait and suppress the duplicate per-Task Goal attention Event/Wake. Scoped `all` partials therefore create neither kind of Wake; the final required terminal fact creates the single Wait-origin Wake. Scoped registration must happen before every selected Task terminalizes, under the same IMMEDIATE-transaction ordering used by terminalization, so no old attention is retracted or rewritten. Cancellation restores ordinary attention only for future terminal facts; it never backfills suppressed historical attention. The Wait retains the controller Agent validated at registration and is not retargeted if Goal controller metadata later changes. On scoped resume the compact automatic message names only exact `wait_id`/`goal_id` and tells the model to bootstrap and consume the exact Wake, `read_agent_wait`, `get_goal`, re-read every source AgentTask, and explicitly decide Goal state from current durable truth. Neither attention nor Wait continuation copies Goal/Task bodies or transfers Goal/Task/Project/Session/execution authority.
 
+## Goal workflow continuity — G4
+
+The WebCodex-owned startup workflow and `single_window_goal_workflow` recommended
+flow now use durable Goals for substantial multi-step/cross-turn work in any
+repository, independently of `AGENTS.md`. Explicitly correlate the current Workflow
+Session, establish fixed completion intent and bounded steps, checkpoint recoverable
+milestones with the single revision-fenced/idempotent `checkpoint_goal`, then
+freshly verify/review and explicitly complete. `finish_coding_task` surfaces sparse
+owned active Goal follow-up but never completes a Goal automatically.
+
+One durable Agent may be both a callable Worker/Task assignee and a Goal controller,
+in either setup order and for more than one Goal. Reuse an already-callable exact
+Agent established by durable setup or exact Wake context; never create a second
+Goal-only identity or infer identity from Window co-location. Task/Attempt owns
+execution, while controller identity routes the next reasoning opportunity. Neither
+identity grants Project/Runner/Session/Job authority.
+
+The second and only new attention kind is `goal_workflow_stalled`. Goal Plan remains
+a separate sparse progress card and detector. Its ordinary polling and App-only
+selector-only recheck are NonMeaningful. The Server, not browser timestamps,
+recomputes active owned Goal/controller, explicit authorized Session and current
+Window relation, complete observation coverage, no active meaningful request,
+five-minute quiet and fresh exact-Goal card observation. Window/card heartbeat is
+inactivity evidence, not authority; **stalled is not offline**. The existing Window
+registry and action ledger supply evidence; there is no second liveness database,
+Goal timer, periodic scanner or scheduler.
+
+The transaction binds exact Goal/controller/Session and the last meaningful-work
+epoch, atomically creating one immutable fact and one logical Wake. Repeated polls,
+View refreshes or Goal metadata revisions cannot mint more turns. Only fresh
+meaningful work after that attention can permit a later independent epoch. Historical
+Event routing is immutable and is not an assertion that the Goal remains stalled.
+
+The existing Agent Continuation card alone crosses the Host dispatch fence and calls
+`ui/message`. Goal Plan never carries Host turn dispatch. Without a Host carrier,
+durable Wake truth does not claim model resumption; readiness remains carrier-only,
+accepted dispatch is not resume, delivery-unknown cannot be blindly resent, and
+only exact consume proves execution of a new turn. The compact stall message
+requires bootstrap and immediate exact consume, `get_goal`, exact correlated
+`session_handoff_summary`, then continued work from the latest checkpoint/current
+step using current authorized Job/Project truth. Recovery is a **fresh reasoning
+opportunity**, not retry of the preceding uncertain tool effect.
+
 ## Next boundaries
 
-Agent Task plus fenced TaskAttempt (A3), CodingAgentRun execution (A4a), Endpoint continuation execution (A4b), the production MCP App Host carrier, the first Goal-correlated terminal-attention loop, and explicit Goal controller routing are now implemented; the detailed execution roadmap lives in [`durable-agent-runtime.md`](durable-agent-runtime.md). Agent Tasks and Workflow Session todos remain separate domains.
-
-The attention implementation intentionally stops at one Event kind: `agent_task_terminal`. It is not a generic Event/Actor framework, timer/cron service, webhook bus, dependency DAG, worker pool, or Goal scheduler. The existing `agent_task_attempt` Wake continues to mean "execute this exact active Attempt" with lease/heartbeat/controller fencing; `attention_event` means "a correlated Task Attempt is terminal; re-read Goal and Task truth and explicitly decide the next step." Both reuse the same Endpoint/Host delivery state machine and one-dispatched-Wake-per-Agent bound, but their source correctness rules remain separate.
-
-Future work should add new attention facts only when concrete dogfood requires them. Timer events, external completion, Agent-scoped Memory, richer Goal orchestration, scheduling, worker pools, or DAG semantics are not implied by explicit Goal controller routing. The standing separation remains: worker Agent = concrete Task/Attempt execution identity, Goal controller Agent = next-reasoning routing identity, Event = durable semantic fact, Wake = bounded reasoning opportunity, AgentTask = work truth, Goal = high-level `active | completed | cancelled` intent/control truth. None of those identities is inherited authority.
+The attention domain has exactly `agent_task_terminal` and `goal_workflow_stalled`;
+it is not a generic Event/Actor framework, timer/cron service, webhook bus, dependency
+DAG, worker pool or Goal scheduler. Existing Task-terminal attention and Goal-scoped
+ANY/ALL Wait precedence are unchanged. `agent_task_attempt` still requests execution
+of an exact active fenced Attempt; `attention_event` requests re-reading current
+authorized truth before deciding the next step. Neither attention source changes
+TaskAttempt ownership or leases. Agent-scoped Memory, arbitrary predicates,
+automatic successor tasks and scheduling remain outside this workflow contract.
 
 Current project-scoped Memory behavior is unchanged. Agent identity is stable enough for a future Memory principal or namespace keyed by `agent_id`; A1/A2 do not migrate Memory, add Agent Skills, spawn autonomous workers, implement DAG/swarm orchestration, federation, A2A compatibility, PostgreSQL, or distributed multi-Server leases.

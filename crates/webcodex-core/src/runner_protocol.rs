@@ -1125,7 +1125,7 @@ pub struct RunnerProjectSummary {
     /// Project-bound shell profile name (`project.shell_profile`). Non-secret:
     /// just a profile name. `None` means the project did not override the
     /// profile, so the Runner falls back to `shell.default_profile`. Carried so
-    /// `listProjects` / `runtime_status` can show which profile a project uses
+    /// `list_projects` / `runtime_status` can show which profile a project uses
     /// without exposing env values or init_script contents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shell_profile: Option<String>,

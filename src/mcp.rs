@@ -81,6 +81,22 @@ fn runtime(depot: &Depot) -> Option<Arc<ToolRuntime>> {
     depot.obtain::<Arc<ToolRuntime>>().ok().cloned()
 }
 
+// Retain only the exact Goal selector for successful Goal Plan polls. This is
+// observation correlation, not client liveness evidence or authority. No other
+// arguments, Goal body, or Host binding are copied into the activity ledger.
+fn goal_plan_observation_id(tool_name: Option<&str>, params: &Value) -> Option<String> {
+    if tool_name != Some("goal_plan_state") {
+        return None;
+    }
+    let id = params.pointer("/arguments/goal_id")?.as_str()?;
+    let suffix = id.strip_prefix("wc_goal_")?;
+    (suffix.len() == 16
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')))
+    .then(|| id.to_string())
+}
+
 fn finalize_mcp_tool_observability(
     runtime: &ToolRuntime,
     audit: Option<&ActionAudit>,
@@ -125,10 +141,10 @@ fn finalize_mcp_tool_observability(
         }
     }
 
-    if let Some(active) = live_window_request.take() {
-        active.complete(timing, continuity_eligible);
-    }
-    if let (Some(audit), Some((event, audit_timing))) = (audit, audit_event) {
+    // Keep the request active until its completed observation is durable. A
+    // detector must never see neither the active call nor its completed work.
+    let evidence_recorded = if let (Some(audit), Some((event, audit_timing))) = (audit, audit_event)
+    {
         audit.record_with_completion(
             event,
             audit_timing,
@@ -136,7 +152,12 @@ fn finalize_mcp_tool_observability(
             transition,
             streaming,
             continuity_eligible,
-        );
+        )
+    } else {
+        false
+    };
+    if let Some(active) = live_window_request.take() {
+        active.complete(timing, continuity_eligible, evidence_recorded);
     }
 }
 
@@ -485,6 +506,7 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
     } else {
         None
     };
+    let observed_goal_plan_id = goal_plan_observation_id(tool_name.as_deref(), &request.params);
     let build_audit_event = |success: bool,
                              status: StatusCode,
                              error: Option<String>,
@@ -512,6 +534,11 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
                         .is_meaningful(),
                 )
                 .recorder_gap(correlation.recorder_gap_session_id.clone());
+            if success {
+                if let Some(goal_id) = observed_goal_plan_id.as_deref() {
+                    event = event.ids(json!({"goal_id": goal_id}));
+                }
+            }
             event.project = correlation
                 .resolved_project
                 .clone()

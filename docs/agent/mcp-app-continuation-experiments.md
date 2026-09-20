@@ -225,7 +225,7 @@ Visible status distinguishes script activity, Host initialization, exact identit
 selection, and live binding/polling, with separate initialization, binding, and
 identity errors. Diagnostics do not display binding ids, claim fences, or consume
 tokens. `tools/list` and `resources/list` advertise only the canonical
-`ui://webcodex/agent-continuation/v16` and `ui://webcodex/goal-plan/v2` resources.
+`ui://webcodex/agent-continuation/v16` and `ui://webcodex/goal-plan/v3` resources. Goal Plan now uses only its current resource (wire version 2), with no old Goal-resource aliases.
 Agent continuation v1-v15 are hidden read aliases serving the same current template. Reading an alias does not revive an expired Endpoint or bypass exact generation/authorization fencing; the same current template must still complete explicit Server-authorized one-hop replacement transitions. The v11 fingerprint-proven restart fallback, v12 strict restart projection, v13 canonical Host-window refresh fence, v14 expired-Endpoint replacement, and v15 bounded successor replay remain intact; v16 changes only visibility eligibility for automatic dispatch.
 
 ## Goal-correlated terminal attention carrier
@@ -233,6 +233,24 @@ Agent continuation v1-v15 are hidden read aliases serving the same current templ
 The production carrier has durable Goal attention and AgentWait Wake sources without changing its Host correctness state machine. In the default path, an exact current AgentTaskAttempt terminal transition atomically persists a narrow `agent_task_terminal` attention Event and pending `attention_event` Wake for each currently active caller-owned Goal correlation, targeting the Goal's explicit controller when present (otherwise the legacy Task-assignee fallback). Generic AgentWaits do not suppress that path. An explicit Goal-scoped AgentWait registered before its selected exact Tasks terminalize owns terminal attention for only those exact Goal/Task sources while the Wait is active: ANY emits the Wait Wake instead of duplicate Goal attention on its first match; ALL partials emit neither Wake, and the final required match emits the single Wait-origin Wake. The Event/Wait records carry only exact semantic identities and bounded terminal-state references; neither copies Task result/instruction or Goal objective, and neither grants Task, Goal, Project, Session, Endpoint, or filesystem authority.
 
 These sources deliberately do **not** reuse A4b's active-Attempt correctness contract: the source Attempt is already terminal, so attention/Wait acquire and prepare never depend on Attempt heartbeat/lease/controller liveness. Both reuse exact Agent/Endpoint/generation/binding fences, the durable Wake claim/prepare fence, one-dispatched-Wake-per-Agent bound, `dispatchStarted` anti-resend behavior, Host outcome uncertainty, and exact consume proof. Goal-scoped Wait registration itself is linearized before terminalization with SQLite IMMEDIATE transactions and requires the exact active Goal, its explicit current controller, exact pre-terminal correlated Tasks, and an explicit 1..8 source list. The Server-generated Goal-scoped automatic message names `goal_id` but copies no objective/result body; it tells the resumed model to bootstrap the exact Wake, consume immediately, read the Wait, independently call normal `get_goal`, re-read every source AgentTask, and explicitly decide/update Goal state. Cancellation restores ordinary Goal attention only for future terminals and never synthesizes past attention. There is still no automatic Goal completion, reopening, Task discovery, scheduler, dependency DAG, or next-Task generation.
+
+## G4 — Goal workflow stall detector
+
+The next concrete dogfood need is implemented as `goal_workflow_stalled`, the
+second narrow attention kind. Goal Plan shows bounded mechanical progress and
+submits a selector-only App recheck; the Server requires an active owned Goal,
+explicit exact controller, authorized correlated current Session, fresh exact-Goal
+card observation, complete evidence and no active meaningful request. It reuses the
+existing Window activity ledger/registry and Agent attention/Wake transactions.
+Same-epoch polling cannot mint repeated turns. The separate Agent Continuation
+card remains the only `ui/message` carrier; accepted dispatch is not resume, and
+uncertain delivery is not an automatic retry. The same Agent may be both callable
+Worker and Goal controller. No repository `AGENTS.md` is required for this workflow.
+
+The [G4 dogfood guide](goal-workflow-continuity-dogfood.md) distinguishes deterministic
+regression coverage from manual verification in a real, separately authorized Host.
+Stalled is not offline; fresh-turn recovery consumes the exact Wake and recovers the
+current Goal/Session checkpoint instead of replaying a disappeared turn's effects.
 
 ## Remaining verification boundary
 

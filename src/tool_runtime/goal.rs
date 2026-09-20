@@ -1,15 +1,20 @@
 use super::{RecoveryKind, ToolResult, ToolRuntime};
+use crate::auth::scopes::{
+    SCOPE_COMMUNICATION_MANAGE, SCOPE_COMMUNICATION_READ, SCOPE_PROJECT_READ,
+    SCOPE_SESSION_COLLABORATE,
+};
 use crate::auth::{AuthContext, SCOPE_RUNTIME_READ};
 use crate::db::{
-    GoalCorrelationKind, GoalDetail, GoalLifecycle, GoalPatch, GoalStoreError, NewGoal,
-    MAX_GOAL_LIST_LIMIT,
+    GoalCheckpoint, GoalCorrelationKind, GoalDetail, GoalLifecycle, GoalPatch, GoalStep,
+    GoalStoreError, NewGoal, MAX_GOAL_LIST_LIMIT,
 };
 use serde::Serialize;
 use serde_json::{json, to_value};
 use std::collections::{BTreeSet, HashMap};
 
 const DEFAULT_GOAL_LIST_LIMIT: usize = 50;
-pub(crate) const GOAL_ACTIVITY_ATTENTION_AFTER_MS: i64 = 5 * 60_000;
+pub(crate) const GOAL_ACTIVITY_ATTENTION_AFTER_MS: i64 =
+    crate::db::GOAL_ACTIVITY_ATTENTION_AFTER_MS;
 const GOAL_ACTIVITY_SESSION_SCAN_LIMIT: usize = 16;
 const GOAL_ACTIVITY_WINDOW_SCAN_LIMIT: usize = 16;
 const GOAL_ACTIVITY_EVENT_SCAN_LIMIT: usize = 64;
@@ -75,7 +80,12 @@ pub(crate) struct GoalPlanProjection {
     pub version: u8,
     pub goal_id: String,
     pub title: String,
-    pub objective: String,
+    pub total_step_count: usize,
+    pub completed_step_count: usize,
+    pub current_step_id: Option<String>,
+    pub steps: Vec<GoalStep>,
+    pub progress_summary: Option<String>,
+    pub checkpoint_at_unix_ms: Option<i64>,
     pub controller_agent_id: Option<String>,
     pub lifecycle: GoalLifecycle,
     pub revision: i64,
@@ -88,14 +98,15 @@ pub(crate) struct GoalPlanProjection {
 
 fn goal_plan_projection(goal: GoalDetail, activity: GoalActivityObservation) -> GoalPlanProjection {
     GoalPlanProjection {
-        // Activity is an additive observation field. Keep the wire projection at
-        // v1 so an already-mounted pre-liveness Goal Plan View can continue to
-        // accept authoritative state across a Server upgrade and simply ignore
-        // the new field until that View is remounted with the current resource.
-        version: 1,
+        version: 2,
         goal_id: goal.summary.goal_id,
         title: goal.summary.title,
-        objective: goal.objective,
+        total_step_count: goal.plan.steps.len(),
+        completed_step_count: goal.plan.completed_count(),
+        current_step_id: goal.plan.current_step().map(|step| step.id.clone()),
+        steps: goal.plan.steps,
+        progress_summary: goal.plan.progress_summary,
+        checkpoint_at_unix_ms: goal.plan.checkpoint_at_unix_ms,
         controller_agent_id: goal.controller_agent_id,
         lifecycle: goal.summary.lifecycle,
         revision: goal.summary.revision,
@@ -230,12 +241,52 @@ impl ToolRuntime {
         self.create_goal_with_controller(auth, title, objective, None, idempotency_key)
     }
 
+    #[cfg(test)]
     pub(crate) fn create_goal_with_controller(
         &self,
         auth: Option<&AuthContext>,
         title: String,
         objective: String,
         controller_agent_id: Option<String>,
+        idempotency_key: String,
+    ) -> ToolResult {
+        self.create_goal_with_plan(
+            auth,
+            NewGoal {
+                title,
+                objective,
+                controller_agent_id,
+                idempotency_key,
+                completion_conditions: Vec::new(),
+                steps: Vec::new(),
+            },
+        )
+    }
+
+    pub(crate) fn create_goal_with_plan(
+        &self,
+        auth: Option<&AuthContext>,
+        input: NewGoal,
+    ) -> ToolResult {
+        let principal = match goal_principal(auth) {
+            Ok(principal) => principal,
+            Err(result) => return result,
+        };
+        let Some(db) = self.communication_db.as_ref() else {
+            return goal_store_unavailable();
+        };
+        match db.create_goal(&principal, input) {
+            Ok(result) => serialized_goal_success(result),
+            Err(error) => goal_error(error, RecoveryKind::RetrySame),
+        }
+    }
+
+    pub(crate) fn checkpoint_goal(
+        &self,
+        auth: Option<&AuthContext>,
+        goal_id: String,
+        expected_revision: i64,
+        checkpoint: GoalCheckpoint,
         idempotency_key: String,
     ) -> ToolResult {
         let principal = match goal_principal(auth) {
@@ -245,14 +296,12 @@ impl ToolRuntime {
         let Some(db) = self.communication_db.as_ref() else {
             return goal_store_unavailable();
         };
-        match db.create_goal(
+        match db.checkpoint_goal(
             &principal,
-            NewGoal {
-                title,
-                objective,
-                controller_agent_id,
-                idempotency_key,
-            },
+            &goal_id,
+            expected_revision,
+            checkpoint,
+            &idempotency_key,
         ) {
             Ok(result) => serialized_goal_success(result),
             Err(error) => goal_error(error, RecoveryKind::RetrySame),
@@ -324,6 +373,9 @@ impl ToolRuntime {
                 )
                 .await
             else {
+                // Missing or revoked correlated Sessions may hide Window work.
+                // Their older timestamps cannot make an incomplete scan complete.
+                coverage_partial = true;
                 continue;
             };
             if !visibility_cache.contains_key(&resolved_project.resolved_id)
@@ -340,6 +392,7 @@ impl ToolRuntime {
             )
             .await
             {
+                coverage_partial = true;
                 continue;
             }
             let mut linked = match db.list_session_linked_windows(
@@ -375,7 +428,7 @@ impl ToolRuntime {
         coverage_partial |= self.window_activity.coverage_partial_for(principal);
 
         for window_key in candidate_windows {
-            let events = match db.list_window_activity_events(
+            let events = match db.list_goal_window_activity_events(
                 &window_key,
                 principal,
                 GOAL_ACTIVITY_EVENT_SCAN_LIMIT,
@@ -386,15 +439,16 @@ impl ToolRuntime {
                     continue;
                 }
             };
-            if events.len() == GOAL_ACTIVITY_EVENT_SCAN_LIMIT
-                && events.last().is_some_and(|oldest_scanned| {
+            let meaningful_events: Vec<_> =
+                events.iter().filter(|event| event.meaningful).collect();
+            if meaningful_events.len() == GOAL_ACTIVITY_EVENT_SCAN_LIMIT
+                && meaningful_events.last().is_some_and(|oldest_scanned| {
                     now_ms.saturating_sub(oldest_scanned.ended_at_ms)
                         <= GOAL_ACTIVITY_ATTENTION_AFTER_MS
                 })
             {
-                // Events are newest-first. Only a full page whose oldest row is
-                // still inside the attention horizon can hide omitted evidence
-                // capable of changing an inactivity conclusion.
+                // Meaningful events are newest-completed-first. Transport polls
+                // cannot evict the work anchor or turn complete evidence partial.
                 coverage_partial = true;
             }
             for event in events {
@@ -410,6 +464,7 @@ impl ToolRuntime {
                 )
                 .await
                 {
+                    coverage_partial = true;
                     continue;
                 }
                 last_seen_at_ms = Some(last_seen_at_ms.unwrap_or(i64::MIN).max(event.ended_at_ms));
@@ -434,6 +489,7 @@ impl ToolRuntime {
                 )
                 .await
                 {
+                    coverage_partial = true;
                     continue;
                 }
                 last_seen_at_ms = Some(
@@ -451,7 +507,7 @@ impl ToolRuntime {
         let quiet_for_ms =
             last_meaningful_activity_at_ms.map(|last| now_ms.saturating_sub(last).max(0));
         let state = if active_meaningful_request_count > 0
-            || quiet_for_ms.is_some_and(|quiet| quiet <= GOAL_ACTIVITY_ATTENTION_AFTER_MS)
+            || quiet_for_ms.is_some_and(|quiet| quiet < GOAL_ACTIVITY_ATTENTION_AFTER_MS)
         {
             GoalActivityState::Active
         } else if coverage_partial {
@@ -473,6 +529,212 @@ impl ToolRuntime {
             linked_window_count: Some(linked_window_count),
             active_meaningful_request_count: Some(active_meaningful_request_count),
             coverage_partial,
+        }
+    }
+
+    /// Sparse Goal follow-up for an independently authorized exact Workflow
+    /// Session. This does not complete Goals or reuse Session authority as Goal
+    /// authority. Inaccessible Goal metadata is never exposed through closeout.
+    pub(crate) fn goal_follow_up_for_session(
+        &self,
+        auth: Option<&AuthContext>,
+        session_id: &str,
+    ) -> Option<serde_json::Value> {
+        if !auth.is_some_and(|auth| auth.has_scope(SCOPE_COMMUNICATION_READ)) {
+            return None;
+        }
+        let principal = goal_principal(auth).ok()?;
+        let db = self.communication_db.as_ref()?;
+        match db.active_goals_for_workflow_session(&principal, session_id, 8) {
+            Ok((goals, truncated)) if !goals.is_empty() => Some(json!({
+                "available": true,
+                "truncated": truncated,
+                "goals": goals.into_iter().map(|goal| {
+                    let incomplete = goal.plan.steps.len() - goal.plan.completed_count();
+                    json!({
+                        "goal_id": goal.summary.goal_id,
+                        "revision": goal.summary.revision,
+                        "incomplete_step_count": incomplete,
+                        "current_step": goal.plan.current_step().map(|step| json!({"id": step.id, "title": step.title})),
+                        "next_action": if incomplete > 0 { "checkpoint_goal" } else { "update_goal" },
+                    })
+                }).collect::<Vec<_>>(),
+            })),
+            Ok(_) => None,
+            Err(_) => Some(json!({"available": false, "truncated": false, "goals": []})),
+        }
+    }
+
+    pub(crate) async fn goal_plan_recheck_attention_for_window(
+        &self,
+        auth: Option<&AuthContext>,
+        window: Option<&crate::client_window::ClientWindow>,
+        goal_id: String,
+    ) -> ToolResult {
+        self.goal_plan_recheck_attention_with_clock(auth, window, goal_id, || {
+            chrono::Utc::now().timestamp_millis()
+        })
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn goal_plan_recheck_attention_at(
+        &self,
+        auth: Option<&AuthContext>,
+        window: Option<&crate::client_window::ClientWindow>,
+        goal_id: String,
+        now: i64,
+    ) -> ToolResult {
+        self.goal_plan_recheck_attention_with_clock(auth, window, goal_id, || now)
+            .await
+    }
+
+    async fn goal_plan_recheck_attention_with_clock(
+        &self,
+        auth: Option<&AuthContext>,
+        window: Option<&crate::client_window::ClientWindow>,
+        goal_id: String,
+        clock: impl Fn() -> i64 + Send + Sync,
+    ) -> ToolResult {
+        let principal = match goal_principal(auth) {
+            Ok(principal) => principal,
+            Err(result) => return result,
+        };
+        let Some(db) = self.communication_db.as_ref() else {
+            return goal_store_unavailable();
+        };
+        // Read through the normal owned Goal path before projecting any mapping.
+        let goal = match db.read_goal(&principal, &goal_id) {
+            Ok(goal) => goal,
+            Err(error) => return goal_error(error, RecoveryKind::Reobserve),
+        };
+        let ineligible = || ToolResult::ok(json!({"attention": null, "state_changed": false}));
+        if !auth.is_some_and(|auth| {
+            [
+                SCOPE_COMMUNICATION_READ,
+                SCOPE_COMMUNICATION_MANAGE,
+                SCOPE_RUNTIME_READ,
+                SCOPE_SESSION_COLLABORATE,
+                SCOPE_PROJECT_READ,
+            ]
+            .iter()
+            .all(|scope| auth.has_scope(scope))
+        }) || goal.summary.lifecycle != GoalLifecycle::Active
+        {
+            return ineligible();
+        }
+        let (Some(window), Some(controller_agent_id), Some(activity_db)) = (
+            window,
+            goal.controller_agent_id.as_ref(),
+            self.window_activity_db.as_ref(),
+        ) else {
+            return ineligible();
+        };
+        // Atomic attention revalidation requires the existing shared action/Goal
+        // database, not a second liveness store or a cross-database best effort.
+        if !std::sync::Arc::ptr_eq(db, activity_db) {
+            return ineligible();
+        }
+        let Some(activity_fence) = self.window_activity.meaningful_revision() else {
+            return ineligible();
+        };
+        let activity = self
+            .goal_activity_observation_at(auth, &goal, clock())
+            .await;
+        if !activity.available
+            || activity.coverage_partial
+            || activity.state != GoalActivityState::AttentionNeeded
+            || activity.active_meaningful_request_count != Some(0)
+        {
+            return ineligible();
+        }
+        let Some(last_work) = activity.last_meaningful_activity_at_ms else {
+            return ineligible();
+        };
+        let (observation_kind, observation_id) = match super::runtime_observation_principal(auth) {
+            Ok(principal) => principal,
+            Err(_) => return ineligible(),
+        };
+        let observation_principal = Some((observation_kind.as_str(), observation_id.as_str()));
+        let relations =
+            match activity_db.list_window_workflow_sessions(window.key(), observation_principal, 2)
+            {
+                Ok(relations) => relations,
+                Err(_) => return ineligible(),
+            };
+        let Some(relation) = relations.first() else {
+            return ineligible();
+        };
+        if relations
+            .get(1)
+            .is_some_and(|other| other.last_linked_at_ms >= relation.last_linked_at_ms)
+            || !goal.correlations.iter().any(|correlation| {
+                correlation.kind == GoalCorrelationKind::WorkflowSession
+                    && correlation.reference_id == relation.workflow_session_id
+            })
+        {
+            return ineligible();
+        }
+        let session_id = &relation.workflow_session_id;
+        let Some((Some(project), owner_fingerprint)) =
+            self.sessions.session_target_authority(session_id)
+        else {
+            return ineligible();
+        };
+        let resolved = match self
+            .authorize_session_target(session_id, "goal_plan_recheck_attention", auth)
+            .await
+        {
+            Ok(Some(resolved)) => resolved,
+            _ => return ineligible(),
+        };
+        if resolved.resolved_id != project || relation.project.as_deref() != Some(project.as_str())
+        {
+            return ineligible();
+        }
+        let candidate = crate::db::GoalStallCandidate {
+            goal_id,
+            expected_revision: goal.summary.revision,
+            controller_agent_id: controller_agent_id.clone(),
+            workflow_session_id: session_id.clone(),
+            project_id: project.clone(),
+            observed_window_key: window.key().to_string(),
+            observation_principal_kind: observation_kind.clone(),
+            observation_principal_id: observation_id.clone(),
+            last_meaningful_activity_at_ms: last_work,
+        };
+        // No awaits or transport dispatch under these fences. A meaningful call
+        // that starts/finishes during visibility checks, or a closed/evicted
+        // Session, invalidates the candidate before its durable transaction.
+        let committed = self
+            .window_activity
+            .with_goal_stall_fence(
+                activity_fence,
+                (observation_kind.as_str(), observation_id.as_str()),
+                || {
+                    self.sessions.with_active_session_authority_fence(
+                        session_id,
+                        &project,
+                        &owner_fingerprint,
+                        || db.record_goal_workflow_stalled(&principal, &candidate, &clock),
+                    )
+                },
+            )
+            .flatten();
+        match committed {
+            Some(Ok(Some(attention))) => {
+                if attention.created {
+                    if let Some(controller) = self.agent_continuations.as_ref() {
+                        controller.schedule_agent(controller_agent_id);
+                    }
+                }
+                // A durable Wake is not proof of Host delivery or a resumed turn.
+                serialized_goal_success(
+                    json!({"state_changed": attention.created, "attention": attention}),
+                )
+            }
+            Some(Err(error)) => target_authorization_error(error),
+            Some(Ok(None)) | None => ineligible(),
         }
     }
 

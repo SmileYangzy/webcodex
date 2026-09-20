@@ -171,8 +171,8 @@ async fn http_audit_sessions_happy_path_returns_seeded_session() {
     seed_event(
         &db,
         "sess-a",
-        "/api/projects/list",
-        "listProjects",
+        "/api/tools/call",
+        "list_projects",
         "success",
         json!({"project_count": 2}),
     );
@@ -202,8 +202,8 @@ async fn http_audit_sessions_limit_upper_cap_is_two_hundred() {
         seed_event(
             &db,
             &format!("cap-{}", i),
-            "/api/projects/list",
-            "listProjects",
+            "/api/tools/call",
+            "list_projects",
             "success",
             json!({}),
         );
@@ -229,8 +229,8 @@ async fn http_audit_sessions_limit_lower_bound_is_one() {
         seed_event(
             &db,
             &format!("low-{}", i),
-            "/api/projects/list",
-            "listProjects",
+            "/api/tools/call",
+            "list_projects",
             "success",
             json!({}),
         );
@@ -254,16 +254,16 @@ async fn http_audit_sessions_status_filter() {
     seed_event(
         &db,
         "open-1",
-        "/api/projects/list",
-        "listProjects",
+        "/api/tools/call",
+        "list_projects",
         "success",
         json!({}),
     );
     seed_event(
         &db,
         "closed-1",
-        "/api/projects/list",
-        "listProjects",
+        "/api/tools/call",
+        "list_projects",
         "success",
         json!({}),
     );

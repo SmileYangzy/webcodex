@@ -3,6 +3,7 @@ use super::communication::{
     allocate_identity, digest_json, digest_text, now_unix_ms, validate_communication_principal,
     validate_id, CommunicationPrincipal, CommunicationStoreError, DURABLE_AGENT_ID_PREFIX,
 };
+use super::goal_plan::{GoalCheckpoint, GoalPlan, NewGoalStep, MAX_GOAL_PLAN_BYTES};
 use super::Database;
 use rusqlite::{
     params, types::Type, Connection, OptionalExtension, Transaction, TransactionBehavior,
@@ -21,6 +22,7 @@ const MAX_GOAL_IDEMPOTENCY_KEY_CHARS: usize = 128;
 
 const OP_CREATE_GOAL: &str = "create_goal";
 const OP_UPDATE_GOAL: &str = "update_goal";
+const OP_CHECKPOINT_GOAL: &str = "checkpoint_goal";
 const OP_ASSOCIATE_GOAL_AGENT_TASK: &str = "associate_goal_agent_task";
 const OP_ASSOCIATE_GOAL_WORKFLOW_SESSION: &str = "associate_goal_workflow_session";
 
@@ -79,6 +81,8 @@ fn goal_store_error(error: rusqlite::Error) -> GoalStoreError {
 
 #[derive(Debug, Clone)]
 pub struct NewGoal {
+    pub completion_conditions: Vec<String>,
+    pub steps: Vec<NewGoalStep>,
     pub title: String,
     pub objective: String,
     pub controller_agent_id: Option<String>,
@@ -192,6 +196,7 @@ pub struct GoalSummary {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct GoalDetail {
     pub summary: GoalSummary,
+    pub plan: GoalPlan,
     pub objective: String,
     pub controller_agent_id: Option<String>,
     pub terminal_reason: Option<String>,
@@ -281,6 +286,18 @@ impl Database {
                 [],
             )?;
         }
+        let has_plan: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('wc_goals') WHERE name = 'plan_json')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_plan {
+            // One additive column; there is only one current plan encoding.
+            conn.execute(
+                "ALTER TABLE wc_goals ADD COLUMN plan_json TEXT NOT NULL DEFAULT '{\"completion_conditions\":[],\"steps\":[],\"progress_summary\":null,\"checkpoint_at_unix_ms\":null}'",
+                [],
+            )?;
+        }
         Ok(())
     }
 
@@ -304,20 +321,14 @@ impl Database {
         let controller_agent_id =
             validate_optional_controller_agent_id(input.controller_agent_id.as_deref())?;
         let idempotency_key = validate_idempotency_key(&input.idempotency_key)?;
-        let request_hash = if let Some(controller_agent_id) = controller_agent_id.as_deref() {
-            goal_request_hash(&json!({
-                "title": title,
-                "objective": objective,
-                "controller_agent_id": controller_agent_id,
-            }))
-        } else {
-            // Preserve the Phase 1 request hash for controller-less Goals so accepted
-            // pre-upgrade idempotency records continue to replay exactly.
-            goal_request_hash(&json!({
-                "title": title,
-                "objective": objective,
-            }))
-        };
+        let plan = GoalPlan::new(input.completion_conditions, input.steps, now)?;
+        let request_hash = goal_request_hash(&json!({
+            "title": title,
+            "objective": objective,
+            "controller_agent_id": controller_agent_id,
+            "completion_conditions": plan.completion_conditions,
+            "steps": plan.steps.iter().map(|step| json!({"id": step.id, "title": step.title})).collect::<Vec<_>>(),
+        }));
 
         let mut conn = self.lock_connection(crate::StoreDomain::Goal);
         let transaction = conn
@@ -354,8 +365,8 @@ impl Database {
                 "INSERT INTO wc_goals (
                     goal_id, owner_principal_kind, owner_principal_digest,
                     title, objective, controller_agent_id, lifecycle, revision, created_at_unix_ms,
-                    updated_at_unix_ms, terminal_at_unix_ms, terminal_reason
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', 1, ?7, ?7, NULL, NULL)",
+                    updated_at_unix_ms, terminal_at_unix_ms, terminal_reason, plan_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', 1, ?7, ?7, NULL, NULL, ?8)",
                 params![
                     goal_id,
                     principal.kind,
@@ -364,6 +375,7 @@ impl Database {
                     objective,
                     controller_agent_id,
                     now,
+                    plan.persisted_json()?,
                 ],
             )
             .map_err(goal_store_error)?;
@@ -395,6 +407,55 @@ impl Database {
         validate_goal_id(goal_id)?;
         let conn = self.lock_connection(crate::StoreDomain::Goal);
         load_owned_goal(&conn, principal, goal_id)
+    }
+
+    /// Bounded, owner-scoped explicit Session correlations for workflow closeout.
+    /// The caller independently authorizes the Session; no Project/Window lookup
+    /// or execution authority is inferred by this query.
+    pub fn active_goals_for_workflow_session(
+        &self,
+        principal: &CommunicationPrincipal,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<(Vec<GoalDetail>, bool), GoalStoreError> {
+        validate_goal_principal(principal)?;
+        validate_workflow_session_id(session_id).map_err(map_communication_validation_error)?;
+        if limit == 0 || limit > 8 {
+            return Err(GoalStoreError::new(
+                "invalid_goal_follow_up_limit",
+                "Goal follow-up limit must be within 1..=8",
+            ));
+        }
+        let conn = self.lock_connection(crate::StoreDomain::Goal);
+        let mut statement = conn
+            .prepare(
+                "SELECT g.goal_id FROM wc_goals g
+             JOIN wc_goal_correlations c ON c.goal_id = g.goal_id
+             WHERE g.owner_principal_kind = ?1 AND g.owner_principal_digest = ?2
+               AND g.lifecycle = 'active' AND c.kind = 'workflow_session' AND c.reference_id = ?3
+             ORDER BY g.goal_id LIMIT ?4",
+            )
+            .map_err(goal_store_error)?;
+        let ids = statement
+            .query_map(
+                params![
+                    principal.kind,
+                    principal.digest,
+                    session_id,
+                    (limit + 1) as i64
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(goal_store_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(goal_store_error)?;
+        let truncated = ids.len() > limit;
+        let goals = ids
+            .iter()
+            .take(limit)
+            .map(|id| load_owned_goal(&conn, principal, id))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((goals, truncated))
     }
 
     pub fn list_goals(
@@ -484,7 +545,7 @@ impl Database {
         };
         let goals = goal_ids
             .iter()
-            .map(|goal_id| load_owned_goal_summary(&conn, principal, goal_id))
+            .map(|goal_id| load_owned_goal(&conn, principal, goal_id).map(|goal| goal.summary))
             .collect::<Result<Vec<_>, _>>()?;
         let next_offset = if offset.saturating_add(goals.len()) < total_count as usize {
             Some(offset.saturating_add(goals.len()))
@@ -566,28 +627,15 @@ impl Database {
             ));
         }
         let idempotency_key = validate_idempotency_key(idempotency_key)?;
-        let request_hash = if let Some(controller_agent_id) = controller_agent_id.as_deref() {
-            goal_request_hash(&json!({
-                "goal_id": goal_id,
-                "expected_revision": expected_revision,
-                "title": title,
-                "objective": objective,
-                "controller_agent_id": controller_agent_id,
-                "lifecycle": patch.lifecycle,
-                "terminal_reason": terminal_reason,
-            }))
-        } else {
-            // Preserve the Phase 1 hash shape when controller routing is not part of
-            // the update, including exact replay of pre-upgrade mutations.
-            goal_request_hash(&json!({
-                "goal_id": goal_id,
-                "expected_revision": expected_revision,
-                "title": title,
-                "objective": objective,
-                "lifecycle": patch.lifecycle,
-                "terminal_reason": terminal_reason,
-            }))
-        };
+        let request_hash = goal_request_hash(&json!({
+            "goal_id": goal_id,
+            "expected_revision": expected_revision,
+            "title": title,
+            "objective": objective,
+            "controller_agent_id": controller_agent_id,
+            "lifecycle": patch.lifecycle,
+            "terminal_reason": terminal_reason,
+        }));
 
         let mut conn = self.lock_connection(crate::StoreDomain::Goal);
         let transaction = conn
@@ -632,6 +680,12 @@ impl Database {
             ));
         }
         let target_lifecycle = patch.lifecycle.unwrap_or(GoalLifecycle::Active);
+        if target_lifecycle == GoalLifecycle::Completed && !current.plan.complete() {
+            return Err(GoalStoreError::new(
+                "goal_plan_incomplete",
+                "Complete every Goal plan step with checkpoint_goal before completing the Goal",
+            ));
+        }
         let target_title = title.unwrap_or_else(|| current.summary.title.clone());
         let target_objective = objective.unwrap_or_else(|| current.objective.clone());
         let target_controller_agent_id =
@@ -684,6 +738,109 @@ impl Database {
             created: false,
             replayed: false,
             state_changed,
+        })
+    }
+
+    pub fn checkpoint_goal(
+        &self,
+        principal: &CommunicationPrincipal,
+        goal_id: &str,
+        expected_revision: i64,
+        checkpoint: GoalCheckpoint,
+        idempotency_key: &str,
+    ) -> Result<GoalMutation, GoalStoreError> {
+        self.checkpoint_goal_at(
+            principal,
+            goal_id,
+            expected_revision,
+            checkpoint,
+            idempotency_key,
+            now_unix_ms(),
+        )
+    }
+
+    pub(crate) fn checkpoint_goal_at(
+        &self,
+        principal: &CommunicationPrincipal,
+        goal_id: &str,
+        expected_revision: i64,
+        checkpoint: GoalCheckpoint,
+        idempotency_key: &str,
+        now: i64,
+    ) -> Result<GoalMutation, GoalStoreError> {
+        validate_goal_principal(principal)?;
+        validate_goal_id(goal_id)?;
+        if expected_revision < 1 {
+            return Err(GoalStoreError::new(
+                "invalid_goal_revision",
+                "expected_revision must be at least 1",
+            ));
+        }
+        let checkpoint = checkpoint.normalized()?;
+        let key = validate_idempotency_key(idempotency_key)?;
+        let hash = goal_request_hash(&json!({
+            "goal_id": goal_id,
+            "expected_revision": expected_revision,
+            "checkpoint": checkpoint,
+        }));
+        let mut conn = self.lock_connection(crate::StoreDomain::Goal);
+        let transaction = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(goal_store_error)?;
+        let current = load_owned_goal(&transaction, principal, goal_id)?;
+        if let Some(replayed_goal_id) =
+            lookup_idempotent_goal(&transaction, principal, OP_CHECKPOINT_GOAL, &key, &hash)?
+        {
+            if replayed_goal_id != goal_id {
+                return Err(GoalStoreError::new(
+                    "goal_idempotency_conflict",
+                    "Checkpoint replay points at a different Goal",
+                ));
+            }
+            transaction.commit().map_err(goal_store_error)?;
+            return Ok(GoalMutation {
+                goal: current,
+                created: false,
+                replayed: true,
+                state_changed: false,
+            });
+        }
+        if current.summary.lifecycle.terminal() {
+            return Err(GoalStoreError::new(
+                "goal_terminal",
+                "Terminal Goal state is immutable",
+            ));
+        }
+        if current.summary.revision != expected_revision {
+            return Err(GoalStoreError::revision_changed(current.summary.revision));
+        }
+        let next_revision = expected_revision
+            .checked_add(1)
+            .ok_or_else(persisted_goal_state_error)?;
+        let now = now.max(current.summary.updated_at_unix_ms);
+        // Validate the complete candidate before any mutation. A new checkpoint is
+        // one recovery point even when its summary or selected steps are unchanged.
+        let plan = current.plan.checkpoint(&checkpoint, now)?;
+        transaction.execute(
+            "UPDATE wc_goals SET plan_json = ?2, revision = ?3, updated_at_unix_ms = ?4 WHERE goal_id = ?1 AND revision = ?5",
+            params![goal_id, plan.persisted_json()?, next_revision, now, expected_revision],
+        ).map_err(goal_store_error)?;
+        record_idempotent_goal(
+            &transaction,
+            principal,
+            OP_CHECKPOINT_GOAL,
+            &key,
+            &hash,
+            goal_id,
+            now,
+        )?;
+        let goal = load_owned_goal(&transaction, principal, goal_id)?;
+        transaction.commit().map_err(goal_store_error)?;
+        Ok(GoalMutation {
+            goal,
+            created: false,
+            replayed: false,
+            state_changed: true,
         })
     }
 
@@ -985,7 +1142,7 @@ fn validate_idempotency_key(value: &str) -> Result<String, GoalStoreError> {
 }
 
 fn goal_request_hash(value: &serde_json::Value) -> String {
-    digest_json("webcodex.goal.request.v1", value).expect("Goal request serializes")
+    digest_json("webcodex.goal.request.v2", value).expect("Goal request serializes")
 }
 
 fn lookup_idempotent_goal(
@@ -1074,6 +1231,16 @@ fn validate_loaded_goal_summary(summary: &GoalSummary) -> Result<(), GoalStoreEr
 
 fn validate_loaded_goal_detail(detail: &GoalDetail) -> Result<(), GoalStoreError> {
     validate_loaded_goal_summary(&detail.summary)?;
+    detail
+        .plan
+        .validate_persisted(
+            detail.summary.created_at_unix_ms,
+            detail.summary.updated_at_unix_ms,
+        )
+        .map_err(|_| persisted_goal_state_error())?;
+    if detail.summary.lifecycle == GoalLifecycle::Completed && !detail.plan.complete() {
+        return Err(persisted_goal_state_error());
+    }
     let normalized_objective =
         validate_objective(&detail.objective).map_err(|_| persisted_goal_state_error())?;
     if normalized_objective != detail.objective
@@ -1115,45 +1282,7 @@ fn validate_loaded_goal_detail(detail: &GoalDetail) -> Result<(), GoalStoreError
     Ok(())
 }
 
-fn load_owned_goal_summary(
-    conn: &Connection,
-    principal: &CommunicationPrincipal,
-    goal_id: &str,
-) -> Result<GoalSummary, GoalStoreError> {
-    validate_goal_id(goal_id)?;
-    let summary = conn
-        .query_row(
-            "SELECT goal_id, title, lifecycle, revision, created_at_unix_ms,
-                    updated_at_unix_ms, terminal_at_unix_ms,
-                    (SELECT COUNT(*) FROM wc_goal_correlations c
-                     WHERE c.goal_id = g.goal_id AND c.kind = 'agent_task'),
-                    (SELECT COUNT(*) FROM wc_goal_correlations c
-                     WHERE c.goal_id = g.goal_id AND c.kind = 'workflow_session')
-             FROM wc_goals g
-             WHERE goal_id = ?1 AND owner_principal_kind = ?2 AND owner_principal_digest = ?3",
-            params![goal_id, principal.kind, principal.digest],
-            |row| {
-                Ok(GoalSummary {
-                    goal_id: row.get(0)?,
-                    title: row.get(1)?,
-                    lifecycle: GoalLifecycle::from_db(&row.get::<_, String>(2)?, 2)?,
-                    revision: row.get(3)?,
-                    created_at_unix_ms: row.get(4)?,
-                    updated_at_unix_ms: row.get(5)?,
-                    terminal_at_unix_ms: row.get(6)?,
-                    agent_task_count: row.get(7)?,
-                    workflow_session_count: row.get(8)?,
-                })
-            },
-        )
-        .optional()
-        .map_err(goal_store_error)?
-        .ok_or_else(|| GoalStoreError::new("goal_not_found", "Goal does not exist"))?;
-    validate_loaded_goal_summary(&summary)?;
-    Ok(summary)
-}
-
-fn load_owned_goal(
+pub(super) fn load_owned_goal(
     conn: &Connection,
     principal: &CommunicationPrincipal,
     goal_id: &str,
@@ -1167,10 +1296,16 @@ fn load_owned_goal(
                     (SELECT COUNT(*) FROM wc_goal_correlations c
                      WHERE c.goal_id = g.goal_id AND c.kind = 'agent_task'),
                     (SELECT COUNT(*) FROM wc_goal_correlations c
-                     WHERE c.goal_id = g.goal_id AND c.kind = 'workflow_session')
+                     WHERE c.goal_id = g.goal_id AND c.kind = 'workflow_session'),
+                    CASE WHEN length(CAST(plan_json AS BLOB)) <= ?4 THEN plan_json ELSE NULL END
              FROM wc_goals g
              WHERE goal_id = ?1 AND owner_principal_kind = ?2 AND owner_principal_digest = ?3",
-            params![goal_id, principal.kind, principal.digest],
+            params![
+                goal_id,
+                principal.kind,
+                principal.digest,
+                MAX_GOAL_PLAN_BYTES as i64
+            ],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -1185,6 +1320,7 @@ fn load_owned_goal(
                     row.get::<_, Option<String>>(9)?,
                     row.get::<_, i64>(10)?,
                     row.get::<_, i64>(11)?,
+                    row.get::<_, Option<String>>(12)?,
                 ))
             },
         )
@@ -1214,7 +1350,10 @@ fn load_owned_goal(
         .map_err(goal_store_error)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(goal_store_error)?;
+    let plan = GoalPlan::from_persisted(row.12.as_deref().ok_or_else(persisted_goal_state_error)?)
+        .map_err(|_| persisted_goal_state_error())?;
     let detail = GoalDetail {
+        plan,
         summary: GoalSummary {
             goal_id: row.0,
             title: row.1,

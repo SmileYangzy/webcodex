@@ -37,6 +37,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
     match name {
         "work_on_project" => Some(work_on_project_output_schema()),
         "finish_coding_task" => Some(wrapped_output_schema(vec![
+            ("goal_follow_up", super::goals::goal_follow_up_schema()),
             (
                 "summary_only",
                 schema_type("boolean", "True only for compact summary_only output."),
@@ -538,6 +539,9 @@ fn startup_workflow_schema() -> Value {
                     "context_sidecar": {"type": "string", "maxLength": 320},
                     "runner_targeting": {"type": "string", "maxLength": 320},
                     "persistent_shell": {"type": "string", "maxLength": 320},
+                    "goal_workflow": {"type": "string", "maxLength": 720},
+                    "goal_continuation": {"type": "string", "maxLength": 720},
+                    "goal_checkpoint": {"type": "string", "maxLength": 480},
                     "normal_closeout": {"type": "string", "maxLength": 480}
                 },
                 "required": [
@@ -548,6 +552,9 @@ fn startup_workflow_schema() -> Value {
                     "context_sidecar",
                     "runner_targeting",
                     "persistent_shell",
+                    "goal_workflow",
+                    "goal_continuation",
+                    "goal_checkpoint",
                     "normal_closeout"
                 ],
                 "additionalProperties": false

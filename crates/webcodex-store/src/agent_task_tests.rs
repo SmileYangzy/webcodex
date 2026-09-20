@@ -741,6 +741,8 @@ fn backend_terminal_truth_reconciles_exact_attempt_after_ordinary_lease_expiry()
         .create_goal_at(
             &owner,
             NewGoal {
+                completion_conditions: Vec::new(),
+                steps: Vec::new(),
                 title: "Coding terminal Goal".to_string(),
                 objective: "Re-evaluate high-level intent after backend terminal truth."
                     .to_string(),
@@ -933,6 +935,8 @@ fn backend_terminal_truth_routes_goal_scoped_wait_without_duplicate_attention() 
         .create_goal_at(
             &owner,
             NewGoal {
+                completion_conditions: Vec::new(),
+                steps: Vec::new(),
                 title: "Coding Goal-scoped rendezvous".to_string(),
                 objective: "Route exact terminal attention through the explicit rendezvous."
                     .to_string(),
@@ -4282,6 +4286,8 @@ fn inbox_and_attention_wake_consumes_never_become_active_turn_proof() {
         .create_goal_at(
             &owner,
             NewGoal {
+                completion_conditions: Vec::new(),
+                steps: Vec::new(),
                 title: "Active-turn negative attention Goal".to_string(),
                 objective:
                     "Generate an attention_event Wake that must never renew another TaskAttempt."

@@ -14,7 +14,8 @@ use crate::mcp_gateway::{
     validate_json_value, validate_request, validate_tool_result, validate_tools, McpGatewayContent,
     McpGatewayDispatchState, McpGatewayProvider, McpGatewayProviderState, McpGatewayRequest,
     McpGatewayResponse, McpGatewayResponsePayload, McpGatewayTool, McpGatewayToolResult,
-    MCP_GATEWAY_MAX_MESSAGE_BYTES,
+    MCP_GATEWAY_MAX_MESSAGE_BYTES, MCP_GATEWAY_MAX_PROVIDER_MESSAGE_BYTES,
+    MCP_GATEWAY_MAX_RESULT_BYTES,
 };
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -562,6 +563,35 @@ fn resolve_provider_cwd(
     }
 }
 
+fn validate_provider_tool_result_structure(result: &Value) -> Result<(), ProviderFailure> {
+    // Preserve the existing JSON depth/node/string and 512 KiB non-image
+    // defenses while exempting only standard image.data from the generic
+    // JSON-string ceiling. The typed image validator applies its own stricter
+    // base64/decoded aggregate budget below.
+    let mut structural = result.clone();
+    if let Some(items) = structural.get_mut("content").and_then(Value::as_array_mut) {
+        for item in items {
+            let is_image = item.get("type").and_then(Value::as_str) == Some("image");
+            if is_image {
+                if let Some(data) = item
+                    .as_object_mut()
+                    .and_then(|object| object.get_mut("data"))
+                {
+                    if data.is_string() {
+                        *data = Value::String(String::new());
+                    }
+                }
+            }
+        }
+    }
+    validate_json_value(
+        &structural,
+        MCP_GATEWAY_MAX_RESULT_BYTES,
+        "provider tool result",
+    )
+    .map_err(|_| ProviderFailure::completed("invalid_provider_result"))
+}
+
 impl ProviderConnection {
     fn spawn(
         config: &McpGatewayProviderConfig,
@@ -724,12 +754,7 @@ impl ProviderConnection {
         // boundary. Provider tools/call receives only gateway-owned fields.
         let params = json!({"name": name, "arguments": arguments});
         let result = self.request("tools/call", params, timeout)?;
-        validate_json_value(
-            &result,
-            MCP_GATEWAY_MAX_MESSAGE_BYTES,
-            "provider tool result",
-        )
-        .map_err(|_| ProviderFailure::completed("invalid_provider_result"))?;
+        validate_provider_tool_result_structure(&result)?;
         let object = result
             .as_object()
             .ok_or_else(|| ProviderFailure::completed("invalid_provider_result"))?;
@@ -742,16 +767,38 @@ impl ProviderConnection {
             let item = item
                 .as_object()
                 .ok_or_else(|| ProviderFailure::completed("invalid_provider_result"))?;
-            if item.get("type").and_then(Value::as_str) != Some("text") {
-                return Err(ProviderFailure::completed("unsupported_provider_content"));
-            }
-            let text = item
-                .get("text")
+            let content_type = item
+                .get("type")
                 .and_then(Value::as_str)
                 .ok_or_else(|| ProviderFailure::completed("invalid_provider_result"))?;
-            content.push(McpGatewayContent::Text {
-                text: text.to_string(),
-            });
+            match content_type {
+                "text" => {
+                    let text = item
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| ProviderFailure::completed("invalid_provider_result"))?;
+                    content.push(McpGatewayContent::Text {
+                        text: text.to_string(),
+                    });
+                }
+                "image" => {
+                    let data = item
+                        .get("data")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| ProviderFailure::completed("invalid_provider_result"))?;
+                    let mime_type = item
+                        .get("mimeType")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| ProviderFailure::completed("invalid_provider_result"))?;
+                    content.push(McpGatewayContent::Image {
+                        data: data.to_string(),
+                        mime_type: mime_type.to_string(),
+                    });
+                }
+                _ => {
+                    return Err(ProviderFailure::completed("unsupported_provider_content"));
+                }
+            }
         }
         let result = McpGatewayToolResult {
             content,
@@ -955,14 +1002,14 @@ fn provider_stdout_reader(
 fn read_bounded_line(reader: &mut impl BufRead) -> Result<Option<Vec<u8>>, ReaderFault> {
     let mut line = Vec::new();
     let read = (&mut *reader)
-        .take((MCP_GATEWAY_MAX_MESSAGE_BYTES + 2) as u64)
+        .take((MCP_GATEWAY_MAX_PROVIDER_MESSAGE_BYTES + 2) as u64)
         .read_until(b'\n', &mut line)
         .map_err(|_| ReaderFault::Io)?;
     if read == 0 {
         return Ok(None);
     }
     if line.last() != Some(&b'\n') {
-        return Err(if line.len() > MCP_GATEWAY_MAX_MESSAGE_BYTES {
+        return Err(if line.len() > MCP_GATEWAY_MAX_PROVIDER_MESSAGE_BYTES {
             ReaderFault::TooLarge
         } else {
             ReaderFault::Malformed
@@ -972,8 +1019,8 @@ fn read_bounded_line(reader: &mut impl BufRead) -> Result<Option<Vec<u8>>, Reade
     if line.last() == Some(&b'\r') {
         line.pop();
     }
-    if line.is_empty() || line.len() > MCP_GATEWAY_MAX_MESSAGE_BYTES {
-        return Err(if line.len() > MCP_GATEWAY_MAX_MESSAGE_BYTES {
+    if line.is_empty() || line.len() > MCP_GATEWAY_MAX_PROVIDER_MESSAGE_BYTES {
+        return Err(if line.len() > MCP_GATEWAY_MAX_PROVIDER_MESSAGE_BYTES {
             ReaderFault::TooLarge
         } else {
             ReaderFault::Malformed

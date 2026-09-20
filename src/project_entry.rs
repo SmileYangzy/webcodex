@@ -533,13 +533,16 @@ async fn collect_readiness_from_remote(
     }
     let runtime_project_id = config.runtime_project_id();
     let projects = match client
-        .post(format!("{}/api/projects/list", config.server_url()))
+        .post(format!("{}/api/tools/call", config.server_url()))
         .bearer_auth(credential)
         .json(&serde_json::json!({
-            "client_id": config.executor_client_id,
-            "project": runtime_project_id,
-            "limit": 1,
-            "summary_only": true,
+            "tool": "list_projects",
+            "params": {
+                "client_id": config.executor_client_id,
+                "project": runtime_project_id,
+                "limit": 1,
+                "summary_only": true,
+            }
         }))
         .send()
         .await

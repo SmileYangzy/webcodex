@@ -3387,6 +3387,11 @@ async fn runtime_status_tools_summary_lists_names() {
     assert!(result.success);
     let tools = &result.output["tools"];
     let names = tools["names"].as_array().unwrap();
+    let expected_names = registered_tool_specs()
+        .into_iter()
+        .map(|spec| Value::String(spec.name))
+        .collect::<Vec<_>>();
+    assert_eq!(names, expected_names.as_slice());
     assert!(!names.is_empty());
     assert!(
         names.iter().any(|n| n == "runtime_status"),

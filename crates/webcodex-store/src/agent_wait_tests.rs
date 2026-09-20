@@ -159,6 +159,8 @@ fn goal(
     db.create_goal(
         owner,
         NewGoal {
+            completion_conditions: Vec::new(),
+            steps: Vec::new(),
             title: format!("Goal {label}"),
             objective: format!("PRIVATE objective {label}"),
             controller_agent_id: controller_agent_id.map(str::to_string),

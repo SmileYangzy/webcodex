@@ -341,9 +341,13 @@ fn new_session_record(session_id: &str, title: Option<&str>, now: i64) -> Action
     }
 }
 
-pub fn record_action_event(db: &Arc<Database>, input: ActionAuditEventInput) {
-    if let Err(e) = record_action_event_inner(db, input) {
-        tracing::warn!("failed to record action event: {}", e);
+pub fn record_action_event(db: &Arc<Database>, input: ActionAuditEventInput) -> bool {
+    match record_action_event_inner(db, input) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!("failed to record action event: {}", e);
+            false
+        }
     }
 }
 

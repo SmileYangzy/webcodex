@@ -35,6 +35,8 @@ fn create_agent(db: &Database, owner: &CommunicationPrincipal, key: &str) -> Str
 
 fn input(key: &str) -> NewGoal {
     NewGoal {
+        completion_conditions: Vec::new(),
+        steps: Vec::new(),
         title: "Ship durable Goal foundation".to_string(),
         objective: "Preserve high-level durable intent without granting execution authority."
             .to_string(),

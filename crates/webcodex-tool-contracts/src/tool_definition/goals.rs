@@ -10,7 +10,7 @@ use crate::metadata::{
 };
 use webcodex_core::authority::{
     COMMUNICATION_MANAGE_SCOPES, COMMUNICATION_READ_SCOPES, SCOPE_COMMUNICATION_MANAGE,
-    SCOPE_COMMUNICATION_READ, SCOPE_SESSION_COLLABORATE,
+    SCOPE_COMMUNICATION_READ, SCOPE_PROJECT_READ, SCOPE_RUNTIME_READ, SCOPE_SESSION_COLLABORATE,
 };
 
 const GOAL_SESSION_ASSOCIATE_SCOPES: &[&str] = &[
@@ -20,6 +20,26 @@ const GOAL_SESSION_ASSOCIATE_SCOPES: &[&str] = &[
 ];
 
 pub(super) const DEFINITIONS: &[ToolDefinition] = &[
+    require_all_scopes(
+        def(
+            "goal_plan_recheck_attention",
+            super::ToolAuditPolicy::typed_fields(&[
+                super::ToolAuditResultField::value("state_changed"),
+                super::ToolAuditResultField::value("error_kind"),
+            ]),
+            ModelHidden, TOOL_CATEGORY_GOAL, None, TOOL_PROVIDER_CONTROL,
+            super::ToolSemanticContract {
+                effect: super::ToolEffect::Mutate,
+                risk: WorkflowManage,
+                approval: super::ToolApprovalPolicy::Standard,
+                idempotency: super::ToolIdempotency::FencedReplay,
+            },
+            Some(COMMUNICATION_MANAGE), false, NoPath, false, false,
+            super::ToolSessionEvidencePolicy::NONE,
+        ).with_activity(super::ToolActivityPresentation::Transport, super::ToolActivityInteraction::NonMeaningful),
+        &[SCOPE_COMMUNICATION_READ, SCOPE_COMMUNICATION_MANAGE, SCOPE_RUNTIME_READ, SCOPE_SESSION_COLLABORATE, SCOPE_PROJECT_READ],
+    ),
+
     require_all_scopes(
         model_spec(
             def(
@@ -50,7 +70,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 false,
                 super::ToolSessionEvidencePolicy::NONE,
             ),
-            "Create one explicit durable high-level Goal owned by the current management principal, optionally with one exact independently authorized durable controller Agent for future attention routing. Controller identity is routing-only and never selects a Project, starts a Workflow Session, claims an AgentTaskAttempt, reaches a Runner, or dispatches a Job.",
+            "Create a durable Goal with fixed bounded completion intent and plan for substantial multi-step or cross-turn work; reuse an existing Goal when appropriate. Tiny lookups/trivial edits do not need one. Explicitly associate the current Workflow Session, then checkpoint recovery-worthy milestones. For automatic continuation supply an exact owned controller Agent and use the existing continuation carrier. Reuse an already-callable Agent from explicit durable setup or exact Wake context, never from Window inference. Controller identity routes attention only and grants no execution authority.",
         ),
         COMMUNICATION_MANAGE_SCOPES,
     ),
@@ -204,6 +224,40 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
     require_all_scopes(
         model_spec(
             def(
+                "checkpoint_goal",
+                super::ToolAuditPolicy::typed_fields(&[
+                    super::ToolAuditResultField::pointer("goal_id", "/goal/summary/goal_id"),
+                    super::ToolAuditResultField::pointer("lifecycle", "/goal/summary/lifecycle"),
+                    super::ToolAuditResultField::pointer("revision", "/goal/summary/revision"),
+                    super::ToolAuditResultField::value("created"),
+                    super::ToolAuditResultField::value("replayed"),
+                    super::ToolAuditResultField::value("state_changed"),
+                    super::ToolAuditResultField::value("error_kind"),
+                ]),
+                ModelVisible,
+                TOOL_CATEGORY_GOAL,
+                None,
+                TOOL_PROVIDER_CONTROL,
+                super::ToolSemanticContract {
+                    effect: super::ToolEffect::Mutate,
+                    risk: WorkflowManage,
+                    approval: super::ToolApprovalPolicy::Standard,
+                    idempotency: super::ToolIdempotency::Keyed,
+                },
+                Some(COMMUNICATION_MANAGE),
+                false,
+                NoPath,
+                false,
+                false,
+                super::ToolSessionEvidencePolicy::NONE,
+            ),
+            "Checkpoint one exact owned active Goal at a recovery-worthy milestone. Atomically complete selected stable step ids, optionally select one current step, and record a bounded summary using the exact revision and idempotency key. The whole batch validates before mutation; completed steps never regress, at most one step is in_progress, and each new checkpoint increments revision once. Exact replay is read-only; changed replay conflicts. Terminal Goals are immutable. This is progress truth, not effect replay, execution authority, or a routine session_handoff_summary requirement.",
+        ),
+        COMMUNICATION_MANAGE_SCOPES,
+    ),
+    require_all_scopes(
+        model_spec(
+            def(
                 "update_goal",
                 super::ToolAuditPolicy::typed_fields(&[
                     super::ToolAuditResultField::pointer("goal_id", "/goal/summary/goal_id"),
@@ -231,7 +285,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 false,
                 super::ToolSessionEvidencePolicy::NONE,
             ),
-            "Update bounded Goal metadata, explicitly replace its exact independently authorized durable controller Agent, or transition active to completed/cancelled using an exact revision and idempotency key. Omitted controller preserves the current routing identity; terminal Goal state is immutable. Controller routing grants no execution authority and no execution domain is inferred or mutated.",
+            "Update bounded Goal metadata, explicitly replace its exact independently authorized durable controller Agent, or transition active to completed/cancelled using an exact revision and idempotency key. Omitted controller preserves the current routing identity; terminal Goal state is immutable. Controller routing grants no execution authority and no execution domain is inferred or mutated. Complete every plan step with checkpoint_goal and freshly verify/review before explicitly completing a Goal; the Server cannot judge natural-language completion conditions.",
         ),
         COMMUNICATION_MANAGE_SCOPES,
     ),

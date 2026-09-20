@@ -273,10 +273,12 @@ Runner 到 configured local provider 的内建 gateway 有意限制为 bounded s
 
 - provider-side tool 行为基于 MCP `2025-06-18`；
 - 支持 `tools/list` 与 `tools/call`；
-- 不支持 callback、list pagination、media/resource 与端到端 progress forwarding；
-- 支持 text tool result 与有界 `structuredContent`。
+- 不支持 callback、list pagination 与端到端 progress forwarding；
+- tool result 支持 text 以及标准的有界 image content block，并保持 provider `content` 原始顺序；image `data` 必须是 standard Base64，MIME 仅支持 `image/png`、`image/jpeg`、`image/webp`，单个 result 内全部 image block 合计 decoded data 上限为 1 MiB；
+- 有界 `structuredContent` 与 image content 独立原样保留；
+- audio、resource、`resource_link` 以及未知 content block type 仍不支持。
 
-不支持的 protocol/content shape 会 fail closed，而不是静默转换。
+不支持的 protocol/content shape 会 fail closed，而不是静默转换；该 gateway 仍是 bounded MCP tool subset，不是透明的 media/resource bridge。
 
 ## Shell profile
 

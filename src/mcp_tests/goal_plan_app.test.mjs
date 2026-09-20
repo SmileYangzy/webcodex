@@ -3,8 +3,9 @@ import assert from "node:assert/strict";
 import { app, flush, toolResult } from "./app_test_support.mjs";
 
 const plan = {
-  version: 1, goal_id: `wc_goal_ERERERERERERERER`, title: "Ship Goal",
-  objective: "Review and validate the Goal flow", lifecycle: "active", revision: 1,
+  version: 2, goal_id: `wc_goal_ERERERERERERERER`, title: "Ship Goal",
+  total_step_count: 0, completed_step_count: 0, current_step_id: null, steps: [],
+  progress_summary: null, checkpoint_at_unix_ms: null, lifecycle: "active", revision: 1,
   updated_at_unix_ms: 1000, terminal_at_unix_ms: null,
   controller_agent_id: null,
   agent_task_count: 0, workflow_session_count: 0,
@@ -236,7 +237,7 @@ test("Goal activity refreshes on the same authoritative revision in both directi
     },
   };
   await view.reply(view.calls("goal_plan_state").at(-1), toolResult({ goal_plan: attention }));
-  assert.match(view.nodes.activity.textContent, /Window still recently observed/);
+  assert.match(view.nodes.activity.textContent, /does not establish that the Window is offline/);
   assert.match(view.nodes.activity.textContent, /may need attention/);
   assert.equal(view.nodes.revision.textContent, "1");
 

@@ -301,6 +301,12 @@ fn tool_definitions_are_activity_semantics_ssot() {
         ("runtime_status", Support, NonMeaningful, NoKind),
         ("tool_manifest", Support, NonMeaningful, NoKind),
         ("goal_plan_state", Transport, NonMeaningful, NoKind),
+        (
+            "goal_plan_recheck_attention",
+            Transport,
+            NonMeaningful,
+            NoKind,
+        ),
         ("agent_continuation_state", Transport, NonMeaningful, NoKind),
     ] {
         assert_eq!(

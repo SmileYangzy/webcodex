@@ -1778,6 +1778,9 @@ impl ToolRuntime {
             existing_suggested_actions: output.get("suggested_next_actions"),
             session_changed_during_snapshot: false,
         });
+        if let Some(follow_up) = self.goal_follow_up_for_session(auth, &session_id) {
+            output["goal_follow_up"] = follow_up;
+        }
         let decision = finish_decision_output(&output);
         if summary_only {
             return ToolResult::ok(compact_finish_output(&decision));
@@ -2919,6 +2922,9 @@ fn finish_decision_output(output: &Value) -> Value {
     if let Some(presentation) = output.get("presentation") {
         decision["presentation"] = presentation.clone();
     }
+    if let Some(follow_up) = output.get("goal_follow_up") {
+        decision["goal_follow_up"] = follow_up.clone();
+    }
     apply_compact_workflow_outcomes(&mut decision, true, Some(hygiene_checked));
     let verdict = decision
         .get("verdict")
@@ -2950,6 +2956,9 @@ fn compact_finish_output(decision: &Value) -> Value {
     });
     if let Some(presentation) = decision.get("presentation") {
         output["presentation"] = presentation.clone();
+    }
+    if let Some(follow_up) = decision.get("goal_follow_up") {
+        output["goal_follow_up"] = follow_up.clone();
     }
     output
 }

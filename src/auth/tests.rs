@@ -79,7 +79,7 @@ fn is_runner_transport_path_allows_only_the_seven_exact_paths() {
     assert!(!is_runner_transport_path("/api/runtime/status"));
     assert!(!is_runner_transport_path("/api/tools/list"));
     assert!(!is_runner_transport_path("/api/tools/call"));
-    assert!(!is_runner_transport_path("/api/projects/list"));
+    assert!(!is_runner_transport_path("/api/runtime-console/projects"));
     assert!(!is_runner_transport_path("/mcp"));
     assert!(!is_runner_transport_path("/api/audit/sessions"));
     assert!(!is_runner_transport_path("/api/users/list"));
@@ -283,7 +283,7 @@ fn gate_router(config: Arc<crate::Config>, db: Arc<crate::Database>) -> Router {
                 .push(Router::with_path("tools/list").post(echo_ok))
                 .push(Router::with_path("tools/call").post(echo_ok))
                 .push(Router::with_path("future/authenticated-route").post(echo_ok))
-                .push(Router::with_path("projects/list").post(echo_ok))
+                .push(Router::with_path("runtime-console/projects").post(echo_ok))
                 .push(Router::with_path("shell/job").post(echo_ok))
                 .push(Router::with_path("audit/sessions").post(echo_ok))
                 .push(Router::with_path("audit/session").post(echo_ok))
@@ -359,7 +359,7 @@ async fn gate_token_class_route_matrix_preserves_authority_boundaries() {
     for path in [
         "/api/runtime/status",
         "/api/tools/list",
-        "/api/projects/list",
+        "/api/runtime-console/projects",
         "/mcp",
         "/api/agent-tokens/list",
         "/api/tokens/list",
@@ -381,7 +381,7 @@ async fn gate_token_class_route_matrix_preserves_authority_boundaries() {
     for path in [
         "/api/runtime/status",
         "/api/tools/list",
-        "/api/projects/list",
+        "/api/runtime-console/projects",
     ] {
         let (status, body) = gate_send(&service, path, Some(&user_token)).await;
         assert_eq!(status, salvo::http::StatusCode::OK, "{path}: {body:?}");
@@ -390,7 +390,7 @@ async fn gate_token_class_route_matrix_preserves_authority_boundaries() {
     for path in [
         "/api/runtime/status",
         "/api/tools/list",
-        "/api/projects/list",
+        "/api/runtime-console/projects",
         "/api/shell/agent/register",
         "/api/agent-tokens/list",
     ] {
@@ -411,7 +411,7 @@ fn account_control_path_allowlist_is_exact() {
     assert!(is_account_control_path("/api/tokens/revoke"));
     assert!(is_account_control_path("/api/agent-tokens/register_hash"));
     assert!(!is_account_control_path("/api/runtime/status"));
-    assert!(!is_account_control_path("/api/projects/list"));
+    assert!(!is_account_control_path("/api/runtime-console/projects"));
     assert!(!is_account_control_path("/api/tools/list"));
     assert!(!is_account_control_path("/mcp"));
     assert!(!is_account_control_path("/api/users/me/extra"));
@@ -463,7 +463,7 @@ async fn gate_account_credential_cannot_call_runtime_project_tool_or_mcp_paths()
     let service = Service::new(gate_router(config, db));
     for path in [
         "/api/runtime/status",
-        "/api/projects/list",
+        "/api/runtime-console/projects",
         "/api/tools/list",
         "/api/shell/agent/register",
         "/mcp",
@@ -1202,7 +1202,7 @@ fn enforce_token_surface_matrix() {
     let runtime_paths = [
         "/api/runtime/status",
         "/api/tools/list",
-        "/api/projects/list",
+        "/api/runtime-console/projects",
         "/mcp",
     ];
     let lightweight_account_rejected: Vec<&str> = crate::route_metadata::iter_routes()
@@ -1237,7 +1237,7 @@ fn enforce_token_surface_matrix() {
             vec![
                 "/api/runtime/status",
                 "/api/tools/list",
-                "/api/projects/list",
+                "/api/runtime-console/projects",
             ],
             runner_transport.to_vec(),
             "",
@@ -1249,7 +1249,7 @@ fn enforce_token_surface_matrix() {
             vec![
                 "/api/runtime/status",
                 "/api/tools/list",
-                "/api/projects/list",
+                "/api/runtime-console/projects",
                 "/mcp",
                 "/api/users/me",
             ],
@@ -1285,7 +1285,7 @@ fn enforce_token_surface_matrix() {
             ],
             vec![
                 "/api/runtime/status",
-                "/api/projects/list",
+                "/api/runtime-console/projects",
                 "/api/tools/list",
                 "/mcp",
                 "/api/shell/agent/register",
@@ -1297,7 +1297,7 @@ fn enforce_token_surface_matrix() {
             oauth2,
             vec![
                 "/api/runtime/status",
-                "/api/projects/list",
+                "/api/runtime-console/projects",
                 "/api/tools/list",
                 "/api/tools/call",
                 "/mcp",
@@ -1965,7 +1965,7 @@ async fn oauth2_scope_gate_matrix() {
     // A granted scope opens exactly its own surface…
     for (scopes, path) in [
         ("runtime:read", "/api/runtime/status"),
-        ("project:read", "/api/projects/list"),
+        ("project:read", "/api/runtime-console/projects"),
         ("job:run", "/api/shell/job"),
     ] {
         let (_tmp, service, token) = gate_oauth2_token_with_scopes(scopes).await;
@@ -1983,7 +1983,7 @@ async fn oauth2_scope_gate_matrix() {
         ),
         (
             "runtime:read",
-            "/api/projects/list",
+            "/api/runtime-console/projects",
             Some(SCOPE_PROJECT_READ),
         ),
         ("project:write", "/api/shell/job", Some(SCOPE_JOB_RUN)),
@@ -2037,14 +2037,19 @@ async fn api_token_obeys_declared_scope_and_unknown_route_policy() {
 
     for path in [
         "/api/runtime/status",
-        "/api/projects/list",
+        "/api/runtime-console/projects",
         "/api/shell/job",
     ] {
         let (status, body) = gate_send(&service, path, Some(&user_token)).await;
         assert_eq!(status, StatusCode::OK, "{} body: {:?}", path, body);
     }
 
-    let (status, body) = gate_send(&service, "/api/projects/list", Some(&runtime_only_token)).await;
+    let (status, body) = gate_send(
+        &service,
+        "/api/runtime-console/projects",
+        Some(&runtime_only_token),
+    )
+    .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "body: {body:?}");
     assert_ne!(body["error"], "insufficient_scope");
     assert!(body["error"]

@@ -128,7 +128,7 @@ The public ToolSpec must not contain a provenance field. Model JSON must not be 
 
 Dedicated REST adapters may remain only when they serve a real current CLI, product, or external REST consumer. Tests by themselves are not compatibility consumers.
 
-Current retained compatibility surfaces include `/api/runtime/status` and the Project lifecycle REST routes such as `/api/projects/list`; generic runtime execution uses canonical `/api/tools/call`. These compatibility routes are not generic GPT Action operations and stay `Hidden` from `/openapi.json`. Route metadata describes HTTP security/surface facts; it no longer owns a generic `PublicAction` operation registry.
+`/api/runtime/status` remains a stable operational/status API for real CLI, deployment, readiness, and diagnostics consumers. `/api/projects/resolve-or-register` remains a hidden internal operator workflow endpoint because it provides atomic exact-path convergence that is intentionally absent from the model-visible tool registry. Ordinary Project lifecycle and Runner-config execution use canonical `/api/tools/call`. These retained compatibility/operator routes are not generic GPT Action operations and stay `Hidden` from `/openapi.json`. Route metadata describes HTTP security/surface facts; it no longer owns a generic `PublicAction` operation registry.
 
 ## 10. Project-scoped runtime boundary
 

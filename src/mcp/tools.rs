@@ -464,7 +464,12 @@ pub(super) fn add_stateless_workflow_recorder_metadata(payload: &mut Value) {
         let tool_name = tool.get("name").and_then(Value::as_str);
         if matches!(
             tool_name,
-            Some("goal_plan_state" | "work_result_state" | "changes_file_diff")
+            Some(
+                "goal_plan_state"
+                    | "goal_plan_recheck_attention"
+                    | "work_result_state"
+                    | "changes_file_diff"
+            )
         ) || tool_name.is_some_and(is_host_continuation_app_tool_name)
         {
             continue;
@@ -1908,7 +1913,11 @@ pub(super) async fn handle_call(
     let work_result_app_admitted = server_mcp_apps_enabled && stateless_2026;
     let agent_continuation_app_admitted = server_mcp_apps_enabled && stateless_2026;
     let job_terminal_continuation_app_admitted = server_mcp_apps_enabled && stateless_2026;
-    let app_only_goal_plan_state = goal_plan_app_admitted && params.name == "goal_plan_state";
+    let app_only_goal_plan_state = goal_plan_app_admitted
+        && matches!(
+            params.name.as_str(),
+            "goal_plan_state" | "goal_plan_recheck_attention"
+        );
     let app_only_work_result_state = work_result_app_admitted && params.name == "work_result_state";
     let app_only_changes_file_diff = work_result_app_admitted && params.name == "changes_file_diff";
     let app_only_agent_continuation =

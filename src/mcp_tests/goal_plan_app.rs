@@ -16,8 +16,10 @@ fn goal_auth(username: &str) -> crate::auth::AuthContext {
     auth.role = Some("user".to_string());
     auth.scopes = vec![
         crate::auth::SCOPE_RUNTIME_READ.to_string(),
+        crate::auth::SCOPE_PROJECT_READ.to_string(),
         crate::auth::SCOPE_COMMUNICATION_READ.to_string(),
         crate::auth::SCOPE_COMMUNICATION_MANAGE.to_string(),
+        crate::auth::scopes::SCOPE_SESSION_COLLABORATE.to_string(),
     ];
     auth.token_kind = Some("user".to_string());
     auth
@@ -71,7 +73,7 @@ async fn handle_with_server_apps_enabled(
 
 #[tokio::test]
 async fn goal_plan_app_descriptor_is_sparse_app_only_resource_backed_and_adaptive_direct() {
-    assert_eq!(MCP_GOAL_PLAN_UI_RESOURCE_URI, "ui://webcodex/goal-plan/v2");
+    assert_eq!(MCP_GOAL_PLAN_UI_RESOURCE_URI, "ui://webcodex/goal-plan/v3");
     let (_temp, _db, adaptive) = goal_runtime();
     let auth = goal_auth("goal-plan-descriptor");
 
@@ -99,6 +101,22 @@ async fn goal_plan_app_descriptor_is_sparse_app_only_resource_backed_and_adaptiv
     let state = tool(&ui["result"], "goal_plan_state").expect("app-only goal_plan_state");
     assert_eq!(state.pointer("/_meta/ui/visibility"), Some(&json!(["app"])));
     assert!(state.pointer("/_meta/ui/resourceUri").is_none());
+    let recheck =
+        tool(&ui["result"], "goal_plan_recheck_attention").expect("app-only stall detector");
+    assert_eq!(
+        recheck.pointer("/_meta/ui/visibility"),
+        Some(&json!(["app"]))
+    );
+    assert_eq!(recheck["inputSchema"]["required"], json!(["goal_id"]));
+    assert_eq!(
+        recheck["inputSchema"]["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect::<Vec<_>>(),
+        vec!["goal_id"]
+    );
+    assert!(recheck.pointer("/_meta/ui/resourceUri").is_none());
     assert_eq!(state["inputSchema"]["required"], json!(["goal_id"]));
     assert_eq!(
         state["inputSchema"]["properties"]
@@ -126,6 +144,7 @@ async fn goal_plan_app_descriptor_is_sparse_app_only_resource_backed_and_adaptiv
         .pointer("/_meta/ui/resourceUri")
         .is_none());
     assert!(tool(&plain["result"], "goal_plan_state").is_none());
+    assert!(tool(&plain["result"], "goal_plan_recheck_attention").is_none());
 
     let disabled_ui = handle_with_server_apps_enabled(
         &adaptive,
@@ -190,7 +209,10 @@ async fn goal_plan_app_descriptor_is_sparse_app_only_resource_backed_and_adaptiv
         .unwrap()
         .iter()
         .any(|resource| resource["uri"] == "ui://webcodex/goal-plan/v1"));
-    for uri in [MCP_GOAL_PLAN_UI_RESOURCE_URI, "ui://webcodex/goal-plan/v1"] {
+    for old_uri in ["ui://webcodex/goal-plan/v1", "ui://webcodex/goal-plan/v2"] {
+        assert!(super::super::resources::mcp_goal_plan_app_resource_read(old_uri, None).is_none());
+    }
+    for uri in [MCP_GOAL_PLAN_UI_RESOURCE_URI] {
         let read = handle_with_server_apps_enabled(
             &adaptive,
             rpc(
@@ -213,6 +235,11 @@ async fn goal_plan_app_descriptor_is_sparse_app_only_resource_backed_and_adaptiv
     }
     for required in [
         "goal_plan_state",
+        "goal_plan_recheck_attention",
+        "completed_step_count",
+        "current_step_id",
+        "progress_summary",
+        "handledWorkEpoch",
         "controller_agent_id",
         "ui/notifications/tool-input",
         "visibilitychange",
@@ -279,7 +306,7 @@ async fn goal_plan_poll_reads_authoritative_revision_without_ui_request_identity
     );
     assert_eq!(
         present["result"]["structuredContent"]["output"]["goal_plan"]["version"],
-        1
+        2
     );
     assert_eq!(
         present["result"]["structuredContent"]["output"]["goal_plan"]["activity"]["available"],
@@ -360,8 +387,11 @@ async fn goal_plan_poll_reads_authoritative_revision_without_ui_request_identity
         poll2["result"]["structuredContent"]["output"]["goal_plan"]["revision"],
         2
     );
+    assert!(poll2["result"]["structuredContent"]["output"]["goal_plan"]
+        .get("objective")
+        .is_none());
     assert_eq!(
-        poll2["result"]["structuredContent"]["output"]["goal_plan"]["objective"],
+        runtime.get_goal(Some(&bob), goal_id.clone()).output["goal"]["objective"],
         "Revision two objective"
     );
     assert_eq!(
@@ -407,4 +437,97 @@ async fn goal_plan_poll_reads_authoritative_revision_without_ui_request_identity
     )
     .await;
     assert!(matches!(disabled, McpOutcome::BadRequest(_)));
+}
+
+#[test]
+fn goal_plan_detector_accepts_only_exact_selector_and_never_client_timing_or_authority() {
+    let goal_id = "wc_goal_G4G4G4G4G4G4G4G4";
+    let base = json!({"goal_id": goal_id});
+    assert!(crate::tool_runtime::ToolCall::from_tool_name(
+        "goal_plan_recheck_attention",
+        base.clone()
+    )
+    .is_ok());
+    for (field, value) in [
+        ("last_seen_at_ms", json!(900000)),
+        ("last_meaningful_activity_at_ms", json!(1)),
+        ("quiet_for_ms", json!(899999)),
+        ("active_meaningful_request_count", json!(0)),
+        ("workflow_session_id", json!("wc_sess_SsSsSsSsSsSsSsSs")),
+        ("controller_agent_id", json!("wc_dagent_AgAgAgAgAgAgAgAg")),
+        ("window_id", json!("client-window")),
+        ("coverage_partial", json!(false)),
+    ] {
+        let mut forged = base.clone();
+        forged[field] = value;
+        assert!(
+            crate::tool_runtime::ToolCall::from_tool_name("goal_plan_recheck_attention", forged)
+                .is_err(),
+            "{field}"
+        );
+    }
+    assert_eq!(
+        super::super::goal_plan_observation_id(
+            Some("goal_plan_state"),
+            &json!({"arguments": base})
+        ),
+        Some(goal_id.into())
+    );
+    assert!(super::super::goal_plan_observation_id(
+        Some("goal_plan_recheck_attention"),
+        &json!({"arguments": base})
+    )
+    .is_none());
+    assert!(super::super::goal_plan_observation_id(
+        Some("goal_plan_state"),
+        &json!({"arguments": {"goal_id": "not-a-goal"}})
+    )
+    .is_none());
+}
+
+#[tokio::test]
+async fn goal_plan_detector_is_app_only_reauthorized_and_does_not_mutate_without_evidence() {
+    let (_temp, db, runtime) = goal_runtime();
+    let owner = goal_auth("detector-owner");
+    let goal_id = create_goal(&runtime, &owner, "detector-goal");
+    let request = || {
+        rpc(
+            "tools/call",
+            Some(json!(4390)),
+            mcp_2026_params(json!({
+                "name": "goal_plan_recheck_attention", "arguments": {"goal_id": goal_id}
+            })),
+        )
+    };
+    let allowed = handle_with_server_apps_enabled(&runtime, request(), Some(&owner), true).await;
+    let McpOutcome::Ok(result) = allowed else {
+        panic!("authorized App recheck must return a tool result");
+    };
+    assert_eq!(result["result"]["structuredContent"]["success"], true);
+    assert_eq!(
+        result["result"]["structuredContent"]["output"],
+        json!({"attention": null, "state_changed": false})
+    );
+    let disabled = handle_with_server_apps_enabled(&runtime, request(), Some(&owner), false).await;
+    assert!(matches!(disabled, McpOutcome::BadRequest(_)));
+    let foreign = goal_auth("detector-foreign");
+    let denied = handle_with_server_apps_enabled(&runtime, request(), Some(&foreign), true).await;
+    let McpOutcome::Ok(result) = denied else {
+        panic!("foreign Goal must return existence-hidden failure");
+    };
+    assert_eq!(
+        result["result"]["structuredContent"]["output"]["error_kind"],
+        "goal_not_found"
+    );
+    assert!(!result.to_string().contains(&goal_id));
+    assert_eq!(
+        db.conn_for_tests()
+            .query_row(
+                "SELECT COUNT(*) FROM wc_agent_attention_events",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
 }

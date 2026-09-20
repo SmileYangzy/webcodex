@@ -59,7 +59,7 @@ pub(in crate::tool_runtime::tests) fn sample_tool_args_for_spec(spec: &ToolSpec)
         "work_on_project" => {
             args.insert("project".to_string(), json!(SAMPLE_PROJECT));
         }
-        "update_goal" => {
+        "update_goal" | "checkpoint_goal" => {
             args.insert("expected_revision".to_string(), json!(1));
         }
         "observe_jobs" => {
@@ -123,6 +123,7 @@ pub(in crate::tool_runtime::tests) fn sample_field_value(field: &str) -> Value {
         "content" => json!("fn main() {}\n"),
         "instruction" => json!("implement the requested change"),
         "objective" => json!("Preserve durable high-level intent without execution authority."),
+        "summary" => json!("Recovery-worthy checkpoint summary"),
         "title" => json!("Durable agent work"),
         "include_extension_catalog" => json!(false),
         "content_base64" => json!("AA=="),

@@ -511,6 +511,120 @@ async fn http_openai_mcp_passthrough_preserves_provider_error() {
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
+async fn http_mcp_passthrough_preserves_mixed_image_content_order() {
+    let _env = crate::auth::AuthEnvGuard::new();
+    _env.enable_direct_shared_key();
+    _env.disable_open_anonymous();
+    let (_tmp, db) = test_db();
+    let runtime = Arc::new(test_runtime());
+    register_failure_runner(&runtime).await;
+    let service = Service::new(build_test_router(
+        test_config(Some("secret")),
+        db,
+        runtime.clone(),
+    ));
+    let provider_result = McpGatewayToolResult {
+        content: vec![
+            McpGatewayContent::Text {
+                text: "before".into(),
+            },
+            McpGatewayContent::Image {
+                data: "iVBORw0KGgo=".into(),
+                mime_type: "image/png".into(),
+            },
+            McpGatewayContent::Text {
+                text: "after".into(),
+            },
+        ],
+        structured_content: Some(json!({"kind": "mixed"})),
+        is_error: false,
+    };
+
+    for action in ["describe", "call"] {
+        let mut arguments = json!({"action": action, "server": "probe-provider", "tool": "probe"});
+        if action == "call" {
+            arguments["arguments"] = json!({});
+        }
+        let complete = async {
+            let request = wait_for_failure_request(&runtime).await;
+            let payload = if action == "describe" {
+                assert!(matches!(
+                    request.mcp_gateway,
+                    Some(McpGatewayRequest::ToolsList { .. })
+                ));
+                McpGatewayResponsePayload::Tools {
+                    tools: vec![McpGatewayTool {
+                        name: "probe".into(),
+                        title: None,
+                        description: None,
+                        input_schema: json!({"type": "object"}),
+                        output_schema: None,
+                        annotations: None,
+                        meta: None,
+                    }],
+                }
+            } else {
+                assert!(matches!(
+                    request.mcp_gateway,
+                    Some(McpGatewayRequest::ToolsCall { .. })
+                ));
+                McpGatewayResponsePayload::ToolResult {
+                    result: provider_result.clone(),
+                }
+            };
+            runtime
+                .runner_registry
+                .complete(RunnerResultPayload {
+                    result: RunnerResultRequest {
+                        client_id: "failure-runner".into(),
+                        runner_instance_id: "inst".into(),
+                        request_id: request.request_id,
+                        exit_code: None,
+                        stdout: None,
+                        stderr: None,
+                        stdout_truncated: false,
+                        stderr_truncated: false,
+                        duration_ms: None,
+                        error: None,
+                    },
+                    command_execution_state: None,
+                    mcp_gateway: Some(McpGatewayResponse::success(payload)),
+                    plugin_gateway: None,
+                    coding_agent: None,
+                })
+                .await
+                .unwrap();
+        };
+        let ((status, body), ()) = tokio::join!(
+            http_call(
+                &service,
+                json!({"name": "mcp_tool", "arguments": arguments}),
+                client_meta("openai-mcp", "2"),
+                false
+            ),
+            complete,
+        );
+        assert_eq!(status, StatusCode::OK, "{body}");
+        if action == "call" {
+            assert_eq!(
+                body["result"],
+                serde_json::to_value(&provider_result).unwrap()
+            );
+            assert_eq!(body["result"]["content"][0]["text"], "before");
+            assert_eq!(body["result"]["content"][1]["type"], "image");
+            assert_eq!(body["result"]["content"][1]["data"], "iVBORw0KGgo=");
+            assert_eq!(body["result"]["content"][1]["mimeType"], "image/png");
+            assert_eq!(body["result"]["content"][2]["text"], "after");
+            assert_eq!(
+                body["result"]["structuredContent"],
+                json!({"kind": "mixed"})
+            );
+        }
+    }
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
 async fn http_apply_text_edits_and_process_failures_preserve_canonical_output() {
     let _env = crate::auth::AuthEnvGuard::new();
     _env.enable_direct_shared_key();

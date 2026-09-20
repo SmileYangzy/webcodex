@@ -10,6 +10,25 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
 pub(crate) const AGENT_ATTENTION_EVENT_ID_PREFIX: &str = "wc_attention_event_";
 pub(crate) const AGENT_ATTENTION_EVENT_KIND_AGENT_TASK_TERMINAL: &str = "agent_task_terminal";
+pub(crate) const AGENT_ATTENTION_EVENT_KIND_GOAL_WORKFLOW_STALLED: &str = "goal_workflow_stalled";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AgentAttentionSource {
+    AgentTaskTerminal {
+        task_id: String,
+        task_attempt_id: String,
+        terminal_task_state: AgentTaskState,
+    },
+    GoalWorkflowStalled {
+        workflow_session_id: String,
+        observed_window_key: String,
+        observation_principal_kind: String,
+        observation_principal_id: String,
+        last_meaningful_activity_at_ms: i64,
+        last_seen_at_ms: i64,
+        goal_revision: i64,
+    },
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AgentAttentionEventRecord {
@@ -19,38 +38,114 @@ pub(crate) struct AgentAttentionEventRecord {
     pub owner_principal_digest: String,
     pub target_agent_id: String,
     pub goal_id: String,
-    pub task_id: String,
-    pub task_attempt_id: String,
-    pub terminal_task_state: AgentTaskState,
+    pub source: AgentAttentionSource,
     pub created_at_unix_ms: i64,
 }
 
+impl AgentAttentionEventRecord {
+    pub fn task_id(&self) -> Option<&str> {
+        match &self.source {
+            AgentAttentionSource::AgentTaskTerminal { task_id, .. } => Some(task_id),
+            AgentAttentionSource::GoalWorkflowStalled { .. } => None,
+        }
+    }
+
+    pub fn task_attempt_id(&self) -> Option<&str> {
+        match &self.source {
+            AgentAttentionSource::AgentTaskTerminal {
+                task_attempt_id, ..
+            } => Some(task_attempt_id),
+            AgentAttentionSource::GoalWorkflowStalled { .. } => None,
+        }
+    }
+
+    pub fn workflow_session_id(&self) -> Option<&str> {
+        match &self.source {
+            AgentAttentionSource::AgentTaskTerminal { .. } => None,
+            AgentAttentionSource::GoalWorkflowStalled {
+                workflow_session_id,
+                ..
+            } => Some(workflow_session_id),
+        }
+    }
+}
+
+const ATTENTION_TABLE_SQL: &str = "
+    CREATE TABLE IF NOT EXISTS wc_agent_attention_events (
+        event_id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL CHECK(kind IN ('agent_task_terminal', 'goal_workflow_stalled')),
+        owner_principal_kind TEXT NOT NULL,
+        owner_principal_digest TEXT NOT NULL,
+        target_agent_id TEXT NOT NULL,
+        goal_id TEXT NOT NULL,
+        task_id TEXT,
+        task_attempt_id TEXT,
+        terminal_task_state TEXT,
+        workflow_session_id TEXT,
+        observed_window_key TEXT,
+        observation_principal_kind TEXT,
+        observation_principal_id TEXT,
+        last_meaningful_activity_at_ms INTEGER,
+        last_seen_at_ms INTEGER,
+        goal_revision INTEGER,
+        created_at_unix_ms INTEGER NOT NULL,
+        FOREIGN KEY(target_agent_id) REFERENCES wc_agent_identities(agent_id),
+        FOREIGN KEY(goal_id) REFERENCES wc_goals(goal_id),
+        FOREIGN KEY(task_id) REFERENCES wc_agent_tasks(task_id),
+        FOREIGN KEY(task_attempt_id) REFERENCES wc_agent_task_attempts(attempt_id),
+        CHECK (
+            (kind = 'agent_task_terminal'
+             AND task_id IS NOT NULL AND task_attempt_id IS NOT NULL
+             AND terminal_task_state IS NOT NULL AND terminal_task_state IN ('succeeded', 'failed')
+             AND workflow_session_id IS NULL AND observed_window_key IS NULL
+             AND observation_principal_kind IS NULL AND observation_principal_id IS NULL
+             AND last_meaningful_activity_at_ms IS NULL AND last_seen_at_ms IS NULL AND goal_revision IS NULL)
+            OR
+            (kind = 'goal_workflow_stalled'
+             AND task_id IS NULL AND task_attempt_id IS NULL AND terminal_task_state IS NULL
+             AND workflow_session_id IS NOT NULL AND observed_window_key IS NOT NULL
+             AND observation_principal_kind IS NOT NULL AND observation_principal_id IS NOT NULL
+             AND last_meaningful_activity_at_ms IS NOT NULL AND last_seen_at_ms IS NOT NULL
+             AND goal_revision IS NOT NULL AND goal_revision >= 1
+             AND last_meaningful_activity_at_ms < last_seen_at_ms
+             AND last_seen_at_ms <= created_at_unix_ms)
+        ),
+        UNIQUE(kind, goal_id, task_attempt_id),
+        UNIQUE(kind, goal_id, last_meaningful_activity_at_ms)
+    );";
+
 impl Database {
     pub(super) fn ensure_agent_attention_schema(conn: &mut Connection) -> anyhow::Result<()> {
+        let old_shape: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'wc_agent_attention_events')
+               AND NOT EXISTS(SELECT 1 FROM pragma_table_info('wc_agent_attention_events') WHERE name = 'workflow_session_id')",
+            [], |row| row.get(0),
+        )?;
+        // A single transactional schema replacement preserves the existing Task
+        // attention facts. There is no legacy read/write shape or dual routing.
+        if old_shape {
+            let transaction =
+                conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            transaction.execute_batch("ALTER TABLE wc_agent_attention_events RENAME TO wc_agent_attention_events_before_goal_workflow;")?;
+            transaction.execute_batch(ATTENTION_TABLE_SQL)?;
+            transaction.execute_batch(
+                "INSERT INTO wc_agent_attention_events (
+                    event_id, kind, owner_principal_kind, owner_principal_digest,
+                    target_agent_id, goal_id, task_id, task_attempt_id, terminal_task_state, created_at_unix_ms
+                 ) SELECT event_id, kind, owner_principal_kind, owner_principal_digest,
+                          target_agent_id, goal_id, task_id, task_attempt_id, terminal_task_state, created_at_unix_ms
+                   FROM wc_agent_attention_events_before_goal_workflow;
+                 DROP TABLE wc_agent_attention_events_before_goal_workflow;",
+            )?;
+            transaction.commit()?;
+        } else {
+            conn.execute_batch(ATTENTION_TABLE_SQL)?;
+        }
         conn.execute_batch(
-            "
-            CREATE TABLE IF NOT EXISTS wc_agent_attention_events (
-                event_id TEXT PRIMARY KEY,
-                kind TEXT NOT NULL CHECK(kind = 'agent_task_terminal'),
-                owner_principal_kind TEXT NOT NULL,
-                owner_principal_digest TEXT NOT NULL,
-                target_agent_id TEXT NOT NULL,
-                goal_id TEXT NOT NULL,
-                task_id TEXT NOT NULL,
-                task_attempt_id TEXT NOT NULL,
-                terminal_task_state TEXT NOT NULL CHECK(terminal_task_state IN ('succeeded', 'failed')),
-                created_at_unix_ms INTEGER NOT NULL,
-                FOREIGN KEY(target_agent_id) REFERENCES wc_agent_identities(agent_id),
-                FOREIGN KEY(goal_id) REFERENCES wc_goals(goal_id),
-                FOREIGN KEY(task_id) REFERENCES wc_agent_tasks(task_id),
-                FOREIGN KEY(task_attempt_id) REFERENCES wc_agent_task_attempts(attempt_id),
-                UNIQUE(kind, goal_id, task_attempt_id)
-            );
-            CREATE INDEX IF NOT EXISTS idx_wc_agent_attention_events_owner_created
+            "CREATE INDEX IF NOT EXISTS idx_wc_agent_attention_events_owner_created
                 ON wc_agent_attention_events(owner_principal_digest, created_at_unix_ms, event_id);
-            CREATE INDEX IF NOT EXISTS idx_wc_agent_attention_events_target_created
-                ON wc_agent_attention_events(target_agent_id, created_at_unix_ms, event_id);
-            ",
+             CREATE INDEX IF NOT EXISTS idx_wc_agent_attention_events_target_created
+                ON wc_agent_attention_events(target_agent_id, created_at_unix_ms, event_id);",
         )?;
         Ok(())
     }
@@ -154,42 +249,52 @@ pub(super) fn create_agent_task_terminal_attention_in_transaction(
                 ],
             )
             .map_err(store_error)?;
-        let wake_id = allocate_identity(
-            &transaction,
-            AGENT_WAKE_ID_PREFIX,
-            "SELECT EXISTS(SELECT 1 FROM wc_agent_wakes WHERE wake_id = ?1)",
-        )?;
-        transaction
-            .execute(
-                "INSERT INTO wc_agent_wakes (
-                    wake_id, target_agent_id, trigger_kind,
-                    first_triggering_delivery_id, latest_triggering_delivery_id,
-                    latest_conversation_id, latest_message_id,
-                    inbox_high_watermark, queued_delivery_count_snapshot,
-                    source_task_id, source_task_attempt_id, source_event_id,
-                    state, revision, created_at_unix_ms, updated_at_unix_ms,
-                    claimed_attempt_id, claimed_endpoint_id,
-                    claimed_controller_generation, claim_lease_expires_at_unix_ms,
-                    consumed_at_unix_ms, consumed_by_endpoint_id,
-                    consumed_controller_generation
-                 ) VALUES (?1, ?2, ?3, NULL, NULL, NULL, NULL, NULL, NULL,
-                           NULL, NULL, ?4, 'pending', 1, ?5, ?5,
-                           NULL, NULL, NULL, NULL, NULL, NULL, NULL)",
-                params![
-                    wake_id,
-                    target_agent_id,
-                    WAKE_TRIGGER_ATTENTION_EVENT,
-                    event_id,
-                    now,
-                ],
-            )
-            .map_err(store_error)?;
+        insert_attention_wake_in_transaction(transaction, target_agent_id, &event_id, now)?;
         attention_event_count += 1;
     }
     Ok((attention_event_count, schedule_agent_ids))
 }
 
-fn require_owned_attention_target(
+pub(super) fn insert_attention_wake_in_transaction(
+    transaction: &Transaction<'_>,
+    target_agent_id: &str,
+    event_id: &str,
+    now: i64,
+) -> Result<String, CommunicationStoreError> {
+    let wake_id = allocate_identity(
+        &transaction,
+        AGENT_WAKE_ID_PREFIX,
+        "SELECT EXISTS(SELECT 1 FROM wc_agent_wakes WHERE wake_id = ?1)",
+    )?;
+    transaction
+        .execute(
+            "INSERT INTO wc_agent_wakes (
+                wake_id, target_agent_id, trigger_kind,
+                first_triggering_delivery_id, latest_triggering_delivery_id,
+                latest_conversation_id, latest_message_id,
+                inbox_high_watermark, queued_delivery_count_snapshot,
+                source_task_id, source_task_attempt_id, source_event_id,
+                state, revision, created_at_unix_ms, updated_at_unix_ms,
+                claimed_attempt_id, claimed_endpoint_id,
+                claimed_controller_generation, claim_lease_expires_at_unix_ms,
+                consumed_at_unix_ms, consumed_by_endpoint_id,
+                consumed_controller_generation
+             ) VALUES (?1, ?2, ?3, NULL, NULL, NULL, NULL, NULL, NULL,
+                       NULL, NULL, ?4, 'pending', 1, ?5, ?5,
+                       NULL, NULL, NULL, NULL, NULL, NULL, NULL)",
+            params![
+                wake_id,
+                target_agent_id,
+                WAKE_TRIGGER_ATTENTION_EVENT,
+                event_id,
+                now,
+            ],
+        )
+        .map_err(store_error)?;
+    Ok(wake_id)
+}
+
+pub(super) fn require_owned_attention_target(
     conn: &Connection,
     principal: &CommunicationPrincipal,
     agent_id: &str,
@@ -225,6 +330,20 @@ pub(crate) fn require_agent_attention_event_for_wake(
             "Agent attention Wake is missing source_event_id",
         )
     })?;
+    let kind: Option<String> = conn.query_row(
+        "SELECT kind FROM wc_agent_attention_events
+         WHERE event_id = ?1 AND owner_principal_kind = ?2 AND owner_principal_digest = ?3 AND target_agent_id = ?4",
+        params![source_event_id, principal.kind, principal.digest, target_agent_id],
+        |row| row.get(0),
+    ).optional().map_err(store_error)?;
+    if kind.as_deref() == Some(AGENT_ATTENTION_EVENT_KIND_GOAL_WORKFLOW_STALLED) {
+        return super::goal_stall::require_goal_stall_event_for_wake(
+            conn,
+            principal,
+            source_event_id,
+            target_agent_id,
+        );
+    }
     let row = conn
         .query_row(
             "SELECT e.event_id, e.kind, e.owner_principal_kind, e.owner_principal_digest,
@@ -273,9 +392,11 @@ pub(crate) fn require_agent_attention_event_for_wake(
                     owner_principal_digest: row.get(3)?,
                     target_agent_id: row.get(4)?,
                     goal_id: row.get(5)?,
-                    task_id: row.get(6)?,
-                    task_attempt_id: row.get(7)?,
-                    terminal_task_state: AgentTaskState::from_db(&terminal_task_state, 8)?,
+                    source: AgentAttentionSource::AgentTaskTerminal {
+                        task_id: row.get(6)?,
+                        task_attempt_id: row.get(7)?,
+                        terminal_task_state: AgentTaskState::from_db(&terminal_task_state, 8)?,
+                    },
                     created_at_unix_ms: row.get(9)?,
                 })
             },
@@ -315,9 +436,11 @@ pub(crate) fn attention_events_for_attempt(
                 owner_principal_digest: row.get(3)?,
                 target_agent_id: row.get(4)?,
                 goal_id: row.get(5)?,
-                task_id: row.get(6)?,
-                task_attempt_id: row.get(7)?,
-                terminal_task_state: AgentTaskState::from_db(&terminal_task_state, 8)?,
+                source: AgentAttentionSource::AgentTaskTerminal {
+                    task_id: row.get(6)?,
+                    task_attempt_id: row.get(7)?,
+                    terminal_task_state: AgentTaskState::from_db(&terminal_task_state, 8)?,
+                },
                 created_at_unix_ms: row.get(9)?,
             })
         })

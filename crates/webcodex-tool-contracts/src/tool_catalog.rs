@@ -95,6 +95,7 @@ pub const TOOL_DISCOVERY_GROUPS: &[ToolDiscoveryGroup] = &[
             "get_goal",
             "present_goal_plan",
             "list_goals",
+            "checkpoint_goal",
             "update_goal",
             "associate_goal_agent_task",
             "associate_goal_workflow_session",
@@ -349,6 +350,16 @@ pub const TOOL_RECOMMENDED_FLOWS: &[ToolRecommendedFlow] = &[
             "rotate_agent_continuation_endpoint",
             "present_agent_continuation",
             "list_agent_identities",
+        ],
+    },
+    ToolRecommendedFlow {
+        name: "single_window_goal_workflow",
+        summary: "Substantial work: establish/reuse Goal + plan, explicitly link current Workflow Session, checkpoint milestones, validate/review and explicitly complete. Optional auto-resume reuses the same callable Agent and its separate continuation card.",
+        manifest_purpose: "WebCodex-owned cross-repository workflow, not AGENTS.md policy. For multi-step/cross-turn work create or reuse a Goal with completion_conditions and bounded steps; associate_goal_workflow_session and present_goal_plan. For automatic continuation reuse an exact already-callable durable Agent as controller, otherwise explicitly establish identity + Endpoint + Host carrier. Worker and Goal controller can be the same Agent; neither Window identity nor Goal links grant execution authority. Use checkpoint_goal at recovery-worthy boundaries; finish_coding_task returns sparse Goal follow-up. After fresh validation/review explicitly complete all steps and update_goal. Tiny reads/trivial edits do not require Goal setup.",
+        tools: &[
+            "work_on_project", "create_agent_identity", "rotate_agent_continuation_endpoint",
+            "present_agent_continuation", "get_goal", "create_goal", "associate_goal_workflow_session",
+            "present_goal_plan", "checkpoint_goal", "finish_coding_task", "update_goal",
         ],
     },
     ToolRecommendedFlow {

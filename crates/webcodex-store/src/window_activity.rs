@@ -193,6 +193,60 @@ impl Database {
         collect_window_event_rows(&conn, &mut rows, None)
     }
 
+    /// Goal liveness needs the latest meaningful work even after thousands of
+    /// transport-only App polls. Reuse the action ledger, with a bounded page of
+    /// meaningful events plus the newest observation; never maintain another clock.
+    pub fn list_goal_window_activity_events(
+        &self,
+        window_key: &str,
+        principal: Option<(&str, &str)>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<WindowActivityEventRecord>> {
+        let conn = self.lock_connection(crate::StoreDomain::WindowActivity);
+        let (kind, id) = principal
+            .map(|(kind, id)| (Some(kind), Some(id)))
+            .unwrap_or((None, None));
+        let mut statement = conn.prepare(
+            "WITH selected AS (
+                SELECT event_id FROM (
+                    SELECT event_id FROM action_events
+                    WHERE client_window_key = ?1 AND window_meaningful = 1
+                      AND window_started_at_ms IS NOT NULL AND window_ended_at_ms IS NOT NULL
+                      AND (?2 IS NULL OR (principal_correlation_kind = ?2 AND principal_correlation_id = ?3))
+                    ORDER BY window_ended_at_ms DESC, event_id DESC LIMIT ?4
+                )
+                UNION
+                SELECT event_id FROM (
+                    SELECT event_id FROM action_events
+                    WHERE client_window_key = ?1
+                      AND window_started_at_ms IS NOT NULL AND window_ended_at_ms IS NOT NULL
+                      AND (?2 IS NULL OR (principal_correlation_kind = ?2 AND principal_correlation_id = ?3))
+                    ORDER BY window_ended_at_ms DESC, event_id DESC LIMIT 1
+                )
+             )
+             SELECT e.event_id, e.client_window_key, e.client_window_source,
+                    e.server_trace_id, e.window_started_at_ms, e.window_ended_at_ms,
+                    e.duration_ms, e.action_name, e.operation, e.project, e.status,
+                    e.window_meaningful, e.recorder_gap_session_id,
+                    e.principal_correlation_kind, e.principal_correlation_id,
+                    e.request_observed_at_ms, e.response_handed_at_ms,
+                    e.window_transition_kind, e.response_streaming, e.window_continuity_eligible
+             FROM action_events e JOIN selected s ON s.event_id = e.event_id
+             ORDER BY e.window_ended_at_ms DESC, e.event_id DESC",
+        )?;
+        collect_window_events(
+            &conn,
+            &mut statement,
+            params![
+                window_key,
+                kind,
+                id,
+                bounded_limit(limit, MAX_WINDOW_ACTIVITY_LIMIT)
+            ],
+            None,
+        )
+    }
+
     /// Variant used only by feature-gated Code Mode Runtime Console dogfood.
     /// The ordinary Window query above intentionally keeps its historical SQL
     /// and does not read ActionAudit summary JSON.

@@ -4265,6 +4265,7 @@ impl ToolCallAuditProjection for ToolCall {
                 objective,
                 controller_agent_id,
                 idempotency_key,
+                ..
             } => typed_goal_request_audit(
                 GoalRequestAudit::Create,
                 &serde_json::json!({
@@ -4274,16 +4275,31 @@ impl ToolCallAuditProjection for ToolCall {
                     "idempotency_key": idempotency_key,
                 }),
             ),
+            Self::CheckpointGoal {
+                goal_id,
+                expected_revision,
+                completed_step_ids,
+                current_step_id,
+                summary,
+                idempotency_key,
+            } => serde_json::json!({
+                "goal_id": goal_id,
+                "expected_revision": expected_revision,
+                "completed_step_count": completed_step_ids.len(),
+                "current_step_present": current_step_id.is_some(),
+                "summary_bytes": summary.len(),
+                "idempotency_key_present": !idempotency_key.is_empty(),
+            }),
             Self::GetGoal { goal_id } => typed_goal_request_audit(
                 GoalRequestAudit::Get,
                 &serde_json::json!({"goal_id": goal_id}),
             ),
-            Self::PresentGoalPlan { goal_id } | Self::GoalPlanState { goal_id } => {
-                typed_goal_request_audit(
-                    GoalRequestAudit::Get,
-                    &serde_json::json!({"goal_id": goal_id}),
-                )
-            }
+            Self::PresentGoalPlan { goal_id }
+            | Self::GoalPlanState { goal_id }
+            | Self::GoalPlanRecheckAttention { goal_id } => typed_goal_request_audit(
+                GoalRequestAudit::Get,
+                &serde_json::json!({"goal_id": goal_id}),
+            ),
             Self::ListGoals {
                 lifecycle,
                 offset,

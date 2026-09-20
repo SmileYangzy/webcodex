@@ -1018,6 +1018,28 @@ impl SessionStore {
         inner.session_target_authority(session_id)
     }
 
+    /// Synchronous revalidation boundary for an already authorized current-work
+    /// target. Identity and creation authority remain explicit; this closure
+    /// cannot close/reassign a Session or confer authority through a Window.
+    /// The callback must not reenter SessionStore or perform asynchronous work.
+    pub fn with_active_session_authority_fence<T>(
+        &self,
+        session_id: &str,
+        expected_project: &str,
+        expected_owner_authority_fingerprint: &str,
+        commit: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let inner = self.inner.lock().ok()?;
+        let record = inner.sessions.get(session_id)?;
+        if !record.lifecycle().allows_mutation()
+            || record.project() != Some(expected_project)
+            || record.owner_authority_fingerprint() != expected_owner_authority_fingerprint
+        {
+            return None;
+        }
+        Some(commit())
+    }
+
     /// Return inherited defaults only for an active Session whose registered
     /// project exactly matches the already-resolved request project.
     pub fn execution_context_for_project(

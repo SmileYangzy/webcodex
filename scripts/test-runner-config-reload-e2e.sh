@@ -210,7 +210,7 @@ start_job() {
 }
 job_status() {
     runtime_tool_call "observe_jobs" "{\"items\":[{\"job_id\":\"$1\"}],\"tail_lines\":1}" | python3 -c \
-        'import json,sys; d=json.load(sys.stdin); assert d["success"]; item=d["output"]["items"][0]; assert item["success"]; print(item["output"]["status"])'
+        'import json,sys; d=json.load(sys.stdin); assert d["success"]; item=d["output"]["items"][0]; assert item["job_id"]==sys.argv[1]; print(item["status"])' "$1"
 }
 for command in awk curl git mv python3 setsid tail "$CARGO_BIN"; do require_command "$command"; done
 cd "$ROOT"
