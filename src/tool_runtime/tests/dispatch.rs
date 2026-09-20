@@ -4,6 +4,10 @@ use super::super::helpers::*;
 use super::super::*;
 use super::support::*;
 use crate::runner_protocol::{RunnerCapabilities, RunnerResultRequest};
+use crate::tool_runtime::kernel::{
+    HostFileImportTrust, ToolCallContext, ToolCallRequest, ToolInvocationMetadata,
+    ToolProtocolCapabilities, ToolTransport,
+};
 use serde_json::json;
 
 #[test]
@@ -21,6 +25,45 @@ fn public_dispatch_future_stays_heap_bounded() {
         std::mem::size_of_val(&future) <= 32,
         "public dispatch should expose only a small boxed future, got {} bytes",
         std::mem::size_of_val(&future)
+    );
+}
+
+#[test]
+fn kernel_adapter_futures_stay_heap_bounded() {
+    let runtime = test_runtime();
+    let context = ToolCallContext {
+        transport: ToolTransport::Api,
+        session_id: None,
+        auth: None,
+        window: None,
+        record_oauth_scope_denials: true,
+        host_file_import_trust: HostFileImportTrust::Untrusted,
+    };
+    let request = || ToolCallRequest {
+        tool_name: "runtime_status".to_string(),
+        arguments: json!({"compact": true}),
+    };
+
+    let api_future = runtime.call_tool_with_context(request(), context);
+    assert!(
+        std::mem::size_of_val(&api_future) <= 32,
+        "REST/Host kernel entry should expose only a small boxed future, got {} bytes",
+        std::mem::size_of_val(&api_future)
+    );
+
+    let mcp_future = runtime.call_tool_with_invocation_metadata(
+        request(),
+        ToolCallContext {
+            transport: ToolTransport::Mcp,
+            ..context
+        },
+        ToolInvocationMetadata::default(),
+        ToolProtocolCapabilities::default(),
+    );
+    assert!(
+        std::mem::size_of_val(&mcp_future) <= 32,
+        "MCP kernel entry should expose only a small boxed future, got {} bytes",
+        std::mem::size_of_val(&mcp_future)
     );
 }
 

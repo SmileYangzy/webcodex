@@ -2394,12 +2394,43 @@ impl ToolRuntime {
                 title,
                 objective,
                 controller_agent_id,
+                completion_conditions,
+                steps,
                 idempotency_key,
-            } => self.create_goal_with_controller(
+            } => self.create_goal_with_plan(
                 auth,
-                title,
-                objective,
-                controller_agent_id,
+                crate::db::NewGoal {
+                    title,
+                    objective,
+                    controller_agent_id,
+                    completion_conditions,
+                    idempotency_key,
+                    steps: steps
+                        .into_iter()
+                        .map(|step| crate::db::NewGoalStep {
+                            id: step.id,
+                            title: step.title,
+                        })
+                        .collect(),
+                },
+            ),
+
+            ToolCall::CheckpointGoal {
+                goal_id,
+                expected_revision,
+                completed_step_ids,
+                current_step_id,
+                summary,
+                idempotency_key,
+            } => self.checkpoint_goal(
+                auth,
+                goal_id,
+                expected_revision,
+                crate::db::GoalCheckpoint {
+                    completed_step_ids,
+                    current_step_id,
+                    summary,
+                },
                 idempotency_key,
             ),
 
@@ -2408,6 +2439,11 @@ impl ToolRuntime {
             ToolCall::PresentGoalPlan { goal_id } => self.present_goal_plan(auth, goal_id).await,
 
             ToolCall::GoalPlanState { goal_id } => self.goal_plan_state(auth, goal_id).await,
+
+            ToolCall::GoalPlanRecheckAttention { goal_id } => {
+                self.goal_plan_recheck_attention_for_window(auth, window, goal_id)
+                    .await
+            }
 
             ToolCall::ListGoals {
                 lifecycle,

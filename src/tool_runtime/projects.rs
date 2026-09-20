@@ -2,9 +2,9 @@
 //! and `create_project`.
 //!
 //! Registration and creation route to the selected Runner through the project-op
-//! path. Unregistration reuses the shared project lifecycle path so the
-//! model-facing tool and `POST /api/projects/unregister` have the same revision
-//! CAS, active-Job fence, capability check, uncertain-delivery semantics, and
+//! path. Unregistration reuses the shared project lifecycle core so canonical
+//! runtime execution keeps the same revision CAS, active-Job fence, capability
+//! check, uncertain-delivery semantics, and
 //! server inventory update. The Runner remains authoritative for its local
 //! project registration records in the Runner project registry.
 //!
@@ -512,7 +512,7 @@ impl ToolRuntime {
     /// Remove only one exact Runner project registration. The caller supplies
     /// the revision observed from `list_projects`; the shared lifecycle core
     /// keeps CAS, active-Job fencing, owner filtering, and uncertain-delivery
-    /// semantics identical to `POST /api/projects/unregister`.
+    /// semantics in one canonical runtime path.
     pub(crate) async fn unregister_project(
         &self,
         project: String,
@@ -1163,7 +1163,7 @@ fn truncate_for_error(s: &str) -> String {
 /// Parse a `RunnerProjectSummary` from the Runner's project-op JSON
 /// response so the server can upsert it into the cached project list. The
 /// response includes `agent_project_id`, `client_id`, `name`, `path`, and
-/// `allow_patch` — enough to build a summary that `listProjects` can show
+/// `allow_patch` — enough to build a summary that `list_projects` can show
 /// immediately.
 fn parse_project_summary_from_result(
     result: &Value,

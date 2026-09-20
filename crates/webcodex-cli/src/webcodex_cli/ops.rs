@@ -483,14 +483,9 @@ async fn fetch_projects(
     server_http: &ServerHttpOptions,
     token: Option<&str>,
 ) -> Result<Value, OpsHttpFailure> {
-    fetch_ops_json_output(
-        server_url,
-        server_http,
-        "/api/projects/list",
-        token,
-        json!({}),
-    )
-    .await
+    call_runtime_tool(server_url, server_http, token, "list_projects", json!({}))
+        .await
+        .map(|output| output.unwrap_or(Value::Null))
 }
 
 fn ops_http_failure_report(

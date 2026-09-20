@@ -19,14 +19,9 @@ use std::sync::Arc;
 
 mod import_http;
 mod projects;
-mod runner_config;
 
 pub use import_http::import_conversation_files_to_project;
-pub use projects::{
-    projects_create, projects_list, projects_register, projects_resolve_or_register,
-    projects_unregister,
-};
-pub use runner_config::{runner_config_check, runner_config_reload};
+pub use projects::projects_resolve_or_register;
 
 fn runtime(depot: &Depot) -> Option<Arc<ToolRuntime>> {
     depot.obtain::<Arc<ToolRuntime>>().ok().cloned()

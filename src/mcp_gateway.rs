@@ -801,6 +801,22 @@ mod tests {
                 is_error: false,
             },
             McpGatewayToolResult {
+                content: vec![
+                    McpGatewayContent::Text {
+                        text: "before".to_string(),
+                    },
+                    McpGatewayContent::Image {
+                        data: "iVBORw0KGgo=".to_string(),
+                        mime_type: "image/png".to_string(),
+                    },
+                    McpGatewayContent::Text {
+                        text: "after".to_string(),
+                    },
+                ],
+                structured_content: Some(json!({"kind": "mixed"})),
+                is_error: false,
+            },
+            McpGatewayToolResult {
                 content: vec![McpGatewayContent::Text {
                     text: "provider-error".to_string(),
                 }],

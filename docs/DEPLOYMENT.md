@@ -531,7 +531,7 @@ Recommended production smoke sequence:
 2. `POST /api/runtime/status` returns `service=webcodex` and the expected
    public URL.
 3. `list_runners` shows at least one online Runner.
-4. `listProjects` shows `agent:<client_id>:<project_id>` ids.
+4. `list_projects` shows `agent:<client_id>:<project_id>` ids.
 5. Read-only project tools work on a known project.
 6. Write/replace/validate tests are limited to disposable smoke projects.
 

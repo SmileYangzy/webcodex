@@ -376,30 +376,6 @@ only for local/trusted-network demos."
                 .post(runtime_http::import_conversation_files_to_project),
         )
         .push(
-            Router::with_path(route_metadata::api_path(RouteId::RunnerConfigCheck))
-                .post(runtime_http::runner_config_check),
-        )
-        .push(
-            Router::with_path(route_metadata::api_path(RouteId::RunnerConfigReload))
-                .post(runtime_http::runner_config_reload),
-        )
-        .push(
-            Router::with_path(route_metadata::api_path(RouteId::ProjectsList))
-                .post(runtime_http::projects_list),
-        )
-        .push(
-            Router::with_path(route_metadata::api_path(RouteId::ProjectsRegister))
-                .post(runtime_http::projects_register),
-        )
-        .push(
-            Router::with_path(route_metadata::api_path(RouteId::ProjectsCreate))
-                .post(runtime_http::projects_create),
-        )
-        .push(
-            Router::with_path(route_metadata::api_path(RouteId::ProjectsUnregister))
-                .post(runtime_http::projects_unregister),
-        )
-        .push(
             Router::with_path(route_metadata::api_path(RouteId::ProjectsResolveOrRegister))
                 .post(runtime_http::projects_resolve_or_register),
         )

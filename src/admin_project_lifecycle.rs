@@ -221,25 +221,6 @@ impl AdminProjectLifecycleService {
         .await
     }
 
-    /// Narrow project-authorized unregister entry used by ordinary runtime
-    /// callers such as the hosted `webcodex disconnect` flow. Authorization is
-    /// still resolved through the caller-visible Runner/project inventory; this
-    /// does not grant access to any other admin lifecycle operation.
-    pub(crate) async fn unregister_authorized(
-        &self,
-        auth: &AuthContext,
-        project: &str,
-        expected_revision: &str,
-    ) -> ServiceResponse {
-        unregister_project_runtime(
-            self.runtime.as_ref(),
-            Some(auth),
-            project,
-            expected_revision,
-        )
-        .await
-    }
-
     async fn mutate_authorized_core(
         runtime: &ToolRuntime,
         auth: Option<&AuthContext>,
@@ -542,8 +523,8 @@ impl AdminProjectLifecycleService {
     }
 }
 
-/// Shared ordinary-runtime unregister path used by both the dedicated HTTP
-/// endpoint and the model-facing runtime tool. The lifecycle core owns exact
+/// Shared ordinary-runtime unregister path used by the canonical runtime tool.
+/// The lifecycle core owns exact
 /// revision validation, owner filtering, active-Job fencing, Runner capability
 /// checks, uncertain delivery semantics, and Server inventory removal.
 pub(crate) async fn unregister_project_runtime(
@@ -977,11 +958,9 @@ mod tests {
         let runtime = Arc::new(ToolRuntime::new_for_tests_with_runner_registry(
             registry.clone(),
         ));
-        let (_tmp, db) = crate::test_support::test_db();
-        let service = AdminProjectLifecycleService::new(runtime, db);
         let response = tokio::time::timeout(
             Duration::from_millis(250),
-            service.unregister_authorized(&bob, target, &revision),
+            unregister_project_runtime(runtime.as_ref(), Some(&bob), target, &revision),
         )
         .await
         .expect(

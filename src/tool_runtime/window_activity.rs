@@ -123,6 +123,14 @@ pub(crate) struct ActiveWindowSummary {
 #[derive(Debug, Default)]
 struct WindowActivityRegistryInner {
     by_trace: BTreeMap<String, ActiveWindowRequest>,
+    // A process-local synchronization fence, not an activity clock or authority.
+    // No asynchronous visibility check may commit stall attention across a change.
+    meaningful_revision: u64,
+    meaningful_revision_exhausted: bool,
+    // Missing completion evidence extends the existing bounded coverage model.
+    // A later fully recorded meaningful call in the same principal+Window clears it.
+    completion_coverage_gaps: BTreeMap<WindowContinuityKey, i64>,
+    completion_coverage_overflow: bool,
     previous_meaningful: BTreeMap<WindowContinuityKey, CompletedMeaningfulCall>,
     // Active requests evicted by the global bounded registry are still owned by
     // their RAII guards. Keep a bounded principal-scoped count so one caller's
@@ -176,6 +184,39 @@ pub(crate) struct WindowActivityRegistry {
     inner: Arc<Mutex<WindowActivityRegistryInner>>,
 }
 
+impl WindowActivityRegistryInner {
+    fn advance_meaningful_revision(&mut self) {
+        match self.meaningful_revision.checked_add(1) {
+            Some(revision) => self.meaningful_revision = revision,
+            None => self.meaningful_revision_exhausted = true,
+        }
+    }
+
+    fn coverage_partial_for(&self, principal: Option<(&str, &str)>) -> bool {
+        if self.meaningful_revision_exhausted || self.completion_coverage_overflow {
+            return true;
+        }
+        match principal {
+            None => {
+                self.untracked_unscoped_count > 0
+                    || self.untracked_principal_overflow_count > 0
+                    || !self.untracked_active_by_principal.is_empty()
+                    || !self.completion_coverage_gaps.is_empty()
+            }
+            Some(principal) => {
+                self.untracked_principal_overflow_count > 0
+                    || self
+                        .untracked_active_by_principal
+                        .keys()
+                        .any(|key| key.matches(principal))
+                    || self.completion_coverage_gaps.keys().any(|key| {
+                        key.principal_kind == principal.0 && key.principal_id == principal.1
+                    })
+            }
+        }
+    }
+}
+
 impl WindowActivityRegistry {
     #[cfg(test)]
     pub(crate) fn start(
@@ -214,6 +255,9 @@ impl WindowActivityRegistry {
             principal_kind: kind.to_string(),
             principal_id: id.to_string(),
         });
+        if meaningful {
+            inner.advance_meaningful_revision();
+        }
         let (transition, overlapped) = if meaningful {
             continuity_key
                 .as_ref()
@@ -317,21 +361,39 @@ impl WindowActivityRegistry {
     }
 
     pub(crate) fn coverage_partial_for(&self, principal: Option<(&str, &str)>) -> bool {
-        let inner = self.inner.lock().expect("Window activity mutex poisoned");
-        match principal {
-            None => {
-                inner.untracked_unscoped_count > 0
-                    || inner.untracked_principal_overflow_count > 0
-                    || !inner.untracked_active_by_principal.is_empty()
-            }
-            Some(principal) => {
-                inner.untracked_principal_overflow_count > 0
-                    || inner
-                        .untracked_active_by_principal
-                        .keys()
-                        .any(|key| key.matches(principal))
-            }
+        self.inner
+            .lock()
+            .map(|inner| inner.coverage_partial_for(principal))
+            .unwrap_or(true)
+    }
+
+    pub(crate) fn meaningful_revision(&self) -> Option<u64> {
+        self.inner.lock().ok().and_then(|inner| {
+            (!inner.meaningful_revision_exhausted).then_some(inner.meaningful_revision)
+        })
+    }
+
+    /// Linearize a narrow Goal attention commit against meaningful request start
+    /// and finish. The callback is synchronous and must never reenter this registry.
+    /// Principal-local active requests and bounded observation gaps fail closed.
+    pub(crate) fn with_goal_stall_fence<T>(
+        &self,
+        expected_revision: u64,
+        principal: (&str, &str),
+        commit: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let inner = self.inner.lock().ok()?;
+        if inner.meaningful_revision != expected_revision
+            || inner.coverage_partial_for(Some(principal))
+            || inner.by_trace.values().any(|request| {
+                principal_visible(request, Some(principal))
+                    && (request.is_meaningful()
+                        || (request.method == "tools/call" && request.tool_name.is_none()))
+            })
+        {
+            return None;
         }
+        Some(commit())
     }
 
     pub(crate) fn active_windows(
@@ -393,6 +455,7 @@ impl WindowActivityRegistry {
         request_observed_at_ms: i64,
         completion: Option<RequestCompletionTiming>,
         continuity_eligible: bool,
+        evidence_recorded: bool,
     ) {
         let Ok(mut inner) = self.inner.lock() else {
             tracing::warn!(
@@ -401,6 +464,35 @@ impl WindowActivityRegistry {
             );
             return;
         };
+        if meaningful {
+            inner.advance_meaningful_revision();
+            if let Some(key) = continuity_key {
+                if evidence_recorded && completion.is_some() {
+                    if inner
+                        .completion_coverage_gaps
+                        .get(key)
+                        .is_some_and(|gap| request_observed_at_ms >= *gap)
+                    {
+                        inner.completion_coverage_gaps.remove(key);
+                    }
+                } else {
+                    let missing_at = completion
+                        .map(|timing| timing.response_handed_at_ms)
+                        .unwrap_or(request_observed_at_ms);
+                    if let Some(gap) = inner.completion_coverage_gaps.get_mut(key) {
+                        *gap = (*gap).max(missing_at);
+                    } else if inner.completion_coverage_gaps.len() < MAX_WINDOW_LOOP_CONTINUITIES {
+                        inner
+                            .completion_coverage_gaps
+                            .insert(key.clone(), missing_at);
+                    } else {
+                        inner.completion_coverage_overflow = true;
+                    }
+                }
+            } else if !evidence_recorded {
+                inner.completion_coverage_overflow = true;
+            }
+        }
         let finished_request = inner.by_trace.remove(server_trace_id);
         if finished_request.is_none() {
             if let Some(key) = continuity_key.map(PrincipalCoverageKey::from_continuity) {
@@ -598,7 +690,12 @@ impl WindowActivityGuard {
         self.transition
     }
 
-    pub(crate) fn complete(mut self, timing: RequestCompletionTiming, continuity_eligible: bool) {
+    pub(crate) fn complete(
+        mut self,
+        timing: RequestCompletionTiming,
+        continuity_eligible: bool,
+        evidence_recorded: bool,
+    ) {
         if self.active {
             self.registry.finish(
                 &self.server_trace_id,
@@ -607,6 +704,7 @@ impl WindowActivityGuard {
                 self.request_observed_at_ms,
                 Some(timing),
                 continuity_eligible,
+                evidence_recorded,
             );
             self.active = false;
         }
@@ -622,6 +720,7 @@ impl Drop for WindowActivityGuard {
                 self.meaningful,
                 self.request_observed_at_ms,
                 None,
+                false,
                 false,
             );
             self.active = false;
@@ -799,7 +898,7 @@ mod tests {
             1_000,
         );
         assert_eq!(first.transition(), WindowLoopTransition::Unavailable);
-        first.complete(completion(1_000, 1_125), true);
+        first.complete(completion(1_000, 1_125), true, true);
 
         let second = meaningful_start(
             &registry,
@@ -823,7 +922,7 @@ mod tests {
             ("username", "alice"),
             1_000,
         )
-        .complete(completion(1_000, 1_050), true);
+        .complete(completion(1_000, 1_050), true, true);
 
         let different_principal = meaningful_start(
             &registry,
@@ -862,7 +961,7 @@ mod tests {
             ("username", "alice"),
             1_000,
         )
-        .complete(completion(1_000, 1_100), true);
+        .complete(completion(1_000, 1_100), true, true);
 
         let discovery = registry.start_observed(
             &window,
@@ -873,7 +972,7 @@ mod tests {
             1_200,
         );
         assert_eq!(discovery.transition(), WindowLoopTransition::Unavailable);
-        discovery.complete(completion(1_200, 1_225), true);
+        discovery.complete(completion(1_200, 1_225), true, true);
 
         let second = meaningful_start(
             &registry,
@@ -896,7 +995,7 @@ mod tests {
             ("username", "alice"),
             1_000,
         )
-        .complete(completion(1_000, 1_100), true);
+        .complete(completion(1_000, 1_100), true, true);
 
         let observation = registry.start_observed(
             &window,
@@ -916,7 +1015,7 @@ mod tests {
             .find(|request| request.server_trace_id == "trace-observe-jobs")
             .expect("observe_jobs request")
             .is_meaningful());
-        observation.complete(completion(1_200, 1_225), true);
+        observation.complete(completion(1_200, 1_225), true, true);
 
         let followup = meaningful_start(
             &registry,
@@ -948,8 +1047,8 @@ mod tests {
         );
         assert_eq!(second.transition(), WindowLoopTransition::Overlap);
         assert_eq!(second.transition().gap_ms(), None);
-        first.complete(completion(1_000, 1_200), true);
-        second.complete(completion(1_050, 1_250), true);
+        first.complete(completion(1_000, 1_200), true, true);
+        second.complete(completion(1_050, 1_250), true, true);
 
         let after_overlap = meaningful_start(
             &registry,
@@ -963,7 +1062,7 @@ mod tests {
             WindowLoopTransition::Unavailable,
             "an overlap group must invalidate the serial anchor instead of leaking WebCodex overlap time into an outside gap"
         );
-        after_overlap.complete(completion(1_500, 1_550), true);
+        after_overlap.complete(completion(1_500, 1_550), true, true);
 
         let clean_followup = meaningful_start(
             &registry,
@@ -981,18 +1080,21 @@ mod tests {
             let registry = WindowActivityRegistry::default();
             let window = window("interrupted");
             let principal = ("username", "alice");
-            meaningful_start(&registry, &window, "first", principal, 1_000)
-                .complete(completion(1_000, 1_100), true);
+            meaningful_start(&registry, &window, "first", principal, 1_000).complete(
+                completion(1_000, 1_100),
+                true,
+                true,
+            );
             let interrupted = meaningful_start(&registry, &window, "interrupted", principal, 1_200);
             assert_eq!(interrupted.transition().gap_ms(), Some(100));
             if complete_ineligible {
-                interrupted.complete(completion(1_200, 1_400), false);
+                interrupted.complete(completion(1_200, 1_400), false, true);
             } else {
                 drop(interrupted);
             }
             let next = meaningful_start(&registry, &window, "next", principal, 1_500);
             assert_eq!(next.transition(), WindowLoopTransition::Unavailable);
-            next.complete(completion(1_500, 1_600), true);
+            next.complete(completion(1_500, 1_600), true, true);
             let recovered = meaningful_start(&registry, &window, "recovered", principal, 1_700);
             assert_eq!(recovered.transition().gap_ms(), Some(100));
         }
@@ -1056,7 +1158,9 @@ mod tests {
             registry.active_windows(None).len(),
             MAX_ACTIVE_WINDOW_REQUESTS
         );
-        drop(guards.remove(0));
+        guards
+            .remove(0)
+            .complete(completion(1_000, 10_000), true, true);
         assert!(!registry.coverage_partial_for(Some(("username", "alice"))));
         drop(guards);
     }
@@ -1072,7 +1176,7 @@ mod tests {
             ("username", "alice"),
             1_000,
         )
-        .complete(completion(1_000, 1_100), false);
+        .complete(completion(1_000, 1_100), false, true);
         let after_stream = meaningful_start(
             &registry,
             &window,
@@ -1081,7 +1185,7 @@ mod tests {
             1_300,
         );
         assert_eq!(after_stream.transition(), WindowLoopTransition::Unavailable);
-        after_stream.complete(completion(1_300, 1_350), true);
+        after_stream.complete(completion(1_300, 1_350), true, true);
 
         let restarted_registry = WindowActivityRegistry::default();
         let after_restart = meaningful_start(
@@ -1095,5 +1199,91 @@ mod tests {
             after_restart.transition(),
             WindowLoopTransition::Unavailable
         );
+    }
+
+    #[test]
+    fn goal_stall_fence_rejects_new_work_across_snapshot_and_unrecorded_completion() {
+        let registry = WindowActivityRegistry::default();
+        let window = window("goal-stall-fence");
+        let principal = ("username", "alice");
+        let before = registry.meaningful_revision().unwrap();
+        let request = meaningful_start(&registry, &window, "new-work", principal, 100);
+        assert!(registry
+            .with_goal_stall_fence(before, principal, || panic!("stale snapshot committed"))
+            .is_none());
+        let during = registry.meaningful_revision().unwrap();
+        assert!(registry
+            .with_goal_stall_fence(during, principal, || panic!("active request committed"))
+            .is_none());
+        request.complete(completion(100, 200), true, true);
+        assert!(registry
+            .with_goal_stall_fence(before, principal, || panic!("completed new work was lost"))
+            .is_none());
+        let current = registry.meaningful_revision().unwrap();
+        assert_eq!(
+            registry.with_goal_stall_fence(current, principal, || 1),
+            Some(1)
+        );
+        let missing = meaningful_start(&registry, &window, "missing-audit", principal, 300);
+        missing.complete(completion(300, 400), true, false);
+        assert!(registry.coverage_partial_for(Some(principal)));
+        assert!(!registry.coverage_partial_for(Some(("username", "bob"))));
+        assert!(registry
+            .with_goal_stall_fence(
+                registry.meaningful_revision().unwrap(),
+                principal,
+                || panic!("missing audit treated as silence")
+            )
+            .is_none());
+        meaningful_start(&registry, &window, "fresh-work", principal, 500).complete(
+            completion(500, 600),
+            true,
+            true,
+        );
+        assert_eq!(
+            registry.with_goal_stall_fence(
+                registry.meaningful_revision().unwrap(),
+                principal,
+                || 2
+            ),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn goal_stall_commit_and_new_request_start_have_a_single_linearization_order() {
+        let registry = WindowActivityRegistry::default();
+        let window = window("goal-stall-linearization");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel();
+        let registry2 = registry.clone();
+        let handle = std::thread::spawn(move || {
+            go_rx.recv().unwrap();
+            ready_tx.send(()).unwrap();
+            let request = meaningful_start(
+                &registry2,
+                &window,
+                "concurrent-work",
+                ("username", "alice"),
+                100,
+            );
+            request.complete(completion(100, 200), true, true);
+        });
+        let revision = registry.meaningful_revision().unwrap();
+        assert_eq!(
+            registry.with_goal_stall_fence(revision, ("username", "alice"), || {
+                go_tx.send(()).unwrap();
+                ready_rx.recv().unwrap();
+                // The request start must wait for this commit boundary to release.
+                3
+            }),
+            Some(3)
+        );
+        handle.join().unwrap();
+        assert!(registry
+            .with_goal_stall_fence(revision, ("username", "alice"), || panic!(
+                "old snapshot committed after request"
+            ))
+            .is_none());
     }
 }

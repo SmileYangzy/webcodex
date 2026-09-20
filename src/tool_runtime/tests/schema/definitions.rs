@@ -90,6 +90,7 @@ fn tool_call_parser_name_gate_matches_tool_definitions() {
         "start_session",
         "job_tail",
         "goal_plan_state",
+        "goal_plan_recheck_attention",
         "work_result_state",
         "changes_file_diff",
         "agent_continuation_bind",
@@ -124,7 +125,7 @@ fn tool_call_parser_name_gate_matches_tool_definitions() {
     assert_eq!(
         model_hidden_tool_names().collect::<BTreeSet<_>>(),
         expected_hidden,
-        "hidden ToolDefinitions must match the documented compatibility batch"
+        "hidden ToolDefinitions must match the documented App-only and compatibility inventory"
     );
 }
 

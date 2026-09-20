@@ -108,7 +108,7 @@ fn instruction_source<'a>(output: &'a Value, path: &str) -> &'a Value {
 fn assert_builtin_workflow(output: &Value) {
     let workflow = &output["workflow"];
     assert_eq!(workflow["contract"], "webcodex.coding_workflow");
-    assert_eq!(workflow["version"], 14);
+    assert_eq!(workflow["version"], 15);
     assert_eq!(workflow["authority"], "model_guidance_only");
     assert!(workflow["role_selection"]
         .as_str()
@@ -219,6 +219,48 @@ fn assert_builtin_workflow(output: &Value) {
     assert!(closeout_guidance.contains("finish_coding_task(summary_only=true)"));
     assert!(closeout_guidance.contains("Read/planning/artifact"));
     assert!(closeout_guidance.contains("finalize directly"));
+    assert!(closeout_guidance.contains("goal_follow_up"));
+    assert!(closeout_guidance.contains("never completes a Goal"));
+    let goal_workflow = workflow["model_protocol"]["goal_workflow"]
+        .as_str()
+        .unwrap();
+    for phrase in [
+        "substantial multi-step/cross-turn",
+        "create or reuse a durable Goal",
+        "completion_conditions",
+        "current Workflow Session",
+        "Tiny one-step",
+        "independently of AGENTS.md",
+    ] {
+        assert!(goal_workflow.contains(phrase), "{phrase}");
+    }
+    let continuation = workflow["model_protocol"]["goal_continuation"]
+        .as_str()
+        .unwrap();
+    for phrase in [
+        "exact explicit durable controller Agent",
+        "Reuse the same Agent",
+        "never infer Agent identity from a Window",
+        "both Task assignee and Goal controller",
+        "separate Agent Continuation",
+        "Stalled is not offline",
+        "never retry an uncertain prior effect",
+    ] {
+        assert!(continuation.contains(phrase), "{phrase}");
+    }
+    let checkpoint = workflow["model_protocol"]["goal_checkpoint"]
+        .as_str()
+        .unwrap();
+    for phrase in [
+        "recovery-worthy milestones",
+        "not after every call",
+        "completed_step_ids/current_step_id",
+        "explicitly update_goal",
+        "cannot judge natural-language conditions",
+    ] {
+        assert!(checkpoint.contains(phrase), "{phrase}");
+    }
+    assert!(goal_workflow.len() <= 720 && continuation.len() <= 720 && checkpoint.len() <= 480);
     let roles = workflow["roles"]
         .as_object()
         .expect("workflow roles object");
@@ -236,7 +278,7 @@ fn assert_builtin_workflow(output: &Value) {
         review_guidance.len()
             <= crate::tool_runtime::startup_brief::BUILTIN_CODING_WORKFLOW_MAX_GUIDANCE_ITEMS
     );
-    let serialized = workflow.to_string();
+    let serialized = workflow.to_string().replace("Stalled is not offline", "");
     for forbidden in ["ChatGPT", "browser", "another window", "online", "offline"] {
         assert!(
             !serialized.contains(forbidden),

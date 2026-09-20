@@ -12,7 +12,9 @@ body { margin: 0; padding: 12px; color: CanvasText; background: Canvas; }
 .header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
 h1 { margin: 0; font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
 .badge { padding: 2px 7px; border: 1px solid color-mix(in srgb, CanvasText 22%, transparent); border-radius: 999px; font-size: 11px; white-space: nowrap; }
-.objective { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 11em; overflow: auto; }
+.steps { margin: 0; font: inherit; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 19em; overflow: auto; }
+.checkpoint { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 7em; overflow: auto; }
+.progress { font-weight: 600; }
 .meta { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 6px 14px; font-size: 12px; color: color-mix(in srgb, CanvasText 72%, transparent); }
 .meta b { color: CanvasText; font-weight: 600; }
 .status { min-height: 1.4em; font-size: 11px; color: color-mix(in srgb, CanvasText 60%, transparent); }
@@ -24,11 +26,13 @@ h1 { margin: 0; font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
 <body>
 <main class="card" aria-live="polite">
   <div class="header"><h1 id="title">Goal</h1><span id="lifecycle" class="badge">Loading</span></div>
-  <p id="objective" class="objective">Waiting for Goal state…</p>
+  <div id="progress" class="progress">Waiting for Goal state…</div>
+  <pre id="steps" class="steps"></pre>
+  <p id="checkpoint" class="checkpoint"></p>
   <div id="meta" class="meta" hidden>
     <span>Agent Tasks <b id="tasks">0</b></span>
     <span>Workflow Sessions <b id="sessions">0</b></span>
-    <span>Controller <b id="controller">Worker fallback</b></span>
+    <span>Controller <b id="controller">Not configured</b></span>
     <span>Revision <b id="revision">—</b></span>
     <span>Updated <b id="updated">—</b></span>
   </div>
@@ -40,6 +44,8 @@ h1 { margin: 0; font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
   "use strict";
   const GOAL_ID = /^wc_goal_[A-Za-z0-9_-]{16}$/;
   const AGENT_ID = /^wc_dagent_[A-Za-z0-9_-]{16}$/;
+  const STEP_ID = /^[A-Za-z0-9_-]{1,32}$/;
+  const STEP_STATES = new Set(["pending", "in_progress", "completed"]);
   const APP_PROTOCOL = "2026-01-26";
   const LIFECYCLES = new Set(["active", "completed", "cancelled"]);
   const ACTIVITY_STATES = new Set(["active", "attention_needed", "unobserved", "not_applicable"]);
@@ -53,6 +59,7 @@ h1 { margin: 0; font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
   let hostInitialized = false;
   let pollTimer = null;
   let pollInFlight = false;
+  let handledWorkEpoch = null;
   let tornDown = false;
   const pending = new Map();
   const utf8Encoder = new TextEncoder();
@@ -110,9 +117,30 @@ h1 { margin: 0; font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
 
   function validPlan(value) {
     if (!value || typeof value !== "object") return null;
-    if (value.version !== 1 || !validGoalId(value.goal_id)) return null;
+    if (value.version !== 2 || !validGoalId(value.goal_id)) return null;
     if (typeof value.title !== "string" || Array.from(value.title).length < 1 || Array.from(value.title).length > 200) return null;
-    if (typeof value.objective !== "string" || utf8Encoder.encode(value.objective).length < 1 || utf8Encoder.encode(value.objective).length > 8192) return null;
+    if (!Array.isArray(value.steps) || value.steps.length > 32 || value.total_step_count !== value.steps.length) return null;
+    const ids = new Set();
+    let completed = 0;
+    let current = null;
+    for (const step of value.steps) {
+      if (!step || typeof step !== "object" || typeof step.id !== "string" || !STEP_ID.test(step.id) || ids.has(step.id)) return null;
+      ids.add(step.id);
+      if (typeof step.title !== "string" || Array.from(step.title).length < 1 || Array.from(step.title).length > 120) return null;
+      if (!STEP_STATES.has(step.status) || !Number.isSafeInteger(step.updated_at_unix_ms)) return null;
+      if (step.status === "completed") completed++;
+      if (step.status === "in_progress") {
+        if (current !== null) return null;
+        current = step.id;
+      }
+    }
+    if (value.completed_step_count !== completed || value.current_step_id !== current) return null;
+    if (value.lifecycle === "completed" && completed !== value.steps.length) return null;
+    if (value.progress_summary === null) {
+      if (value.checkpoint_at_unix_ms !== null) return null;
+    } else if (typeof value.progress_summary !== "string" || !value.progress_summary.trim()
+      || utf8Encoder.encode(value.progress_summary).length > 2048 || !Number.isSafeInteger(value.checkpoint_at_unix_ms)) return null;
+    if (utf8Encoder.encode(JSON.stringify(value)).length > 40960) return null;
     if (!(value.controller_agent_id === null || (typeof value.controller_agent_id === "string" && AGENT_ID.test(value.controller_agent_id)))) return null;
     if (!LIFECYCLES.has(value.lifecycle) || !Number.isSafeInteger(value.revision) || value.revision < 1) return null;
     if (!Number.isSafeInteger(value.updated_at_unix_ms)) return null;
@@ -140,6 +168,7 @@ h1 { margin: 0; font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
     const callResult = callToolResultOf(result);
     const structured = callResult && (callResult.structuredContent || callResult.structured_content || callResult);
     const output = structured && (structured.output || structured);
+    if (!callResult || callResult.isError || !structured || structured.success === false) return null;
     return validPlan(output && output.goal_plan);
   }
 
@@ -182,21 +211,24 @@ h1 { margin: 0; font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
       return;
     }
     const quiet = formatQuiet(activity.quiet_for_ms);
-    node.textContent = activity.last_seen_at_ms !== null
-      && activity.last_meaningful_activity_at_ms !== null
-      && activity.last_seen_at_ms > activity.last_meaningful_activity_at_ms
-      ? `Window still recently observed; no meaningful WebCodex work for ${quiet}. This Goal may need attention.`
-      : `No meaningful WebCodex activity for ${quiet}. This Goal may need attention.`;
+    // A historical observation does not establish that a card is still alive.
+    // Only the Server's detector recheck may decide continuation eligibility.
+    node.textContent = `No meaningful WebCodex activity for ${quiet}. This Goal may need attention; this does not establish that the Window is offline.`;
   }
 
   function render(plan) {
     if (tornDown) return;
     el("title").textContent = plan.title;
     el("lifecycle").textContent = labelLifecycle(plan.lifecycle);
-    el("objective").textContent = plan.objective;
+    const currentIndex = plan.steps.findIndex(step => step.id === plan.current_step_id);
+    el("progress").textContent = currentIndex >= 0
+      ? `Step ${currentIndex + 1} / ${plan.total_step_count}`
+      : `${plan.completed_step_count} / ${plan.total_step_count} steps complete`;
+    el("steps").textContent = plan.steps.map(step => `${step.status === "completed" ? "✓" : step.status === "in_progress" ? "→" : "  "} ${step.title}`).join("\n");
+    el("checkpoint").textContent = plan.progress_summary === null ? "No checkpoint yet" : `Last checkpoint: ${plan.progress_summary}`;
     el("tasks").textContent = String(plan.agent_task_count);
     el("sessions").textContent = String(plan.workflow_session_count);
-    el("controller").textContent = plan.controller_agent_id || "Worker fallback";
+    el("controller").textContent = plan.controller_agent_id || "Not configured";
     el("revision").textContent = String(plan.revision);
     const date = new Date(plan.updated_at_unix_ms);
     el("updated").textContent = Number.isNaN(date.getTime()) ? "—" : date.toLocaleString();
@@ -219,6 +251,28 @@ h1 { margin: 0; font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
     pollTimer = null;
   }
 
+  async function detectAttention(plan) {
+    const activity = plan.activity;
+    const epoch = activity.last_meaningful_activity_at_ms;
+    if (tornDown || isTerminal() || !plan.controller_agent_id || !activity.available
+      || activity.coverage_partial || activity.state !== "attention_needed"
+      || activity.active_meaningful_request_count !== 0 || epoch === null || epoch === handledWorkEpoch) return;
+    // Only the selector is sent. Server-owned observation and Session authority
+    // determine eligibility; the separate Agent Continuation card carries turns.
+    const response = callToolResultOf(await send("tools/call", {
+      name: "goal_plan_recheck_attention", arguments: { goal_id: goalId },
+    }));
+    if (tornDown || isTerminal()) return;
+    const structured = response && (response.structuredContent || response.structured_content || response);
+    const output = structured && (structured.output || structured);
+    if (!response || response.isError || !structured || structured.success === false || !output) throw new Error("Attention recheck unavailable");
+    if (typeof output.state_changed !== "boolean" || !(output.attention === null || (
+      typeof output.attention === "object" && /^wc_attention_event_[A-Za-z0-9_-]{16}$/.test(output.attention.event_id)
+      && /^wc_wake_[A-Za-z0-9_-]{16}$/.test(output.attention.wake_id) && typeof output.attention.created === "boolean"
+    ))) throw new Error("Invalid attention recheck");
+    if (output.attention !== null) handledWorkEpoch = epoch;
+  }
+
   async function poll() {
     if (tornDown || !hostInitialized || !goalId || isTerminal() || pollInFlight) return;
     pollInFlight = true;
@@ -233,6 +287,7 @@ h1 { margin: 0; font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
       lastLifecycle = plan.lifecycle;
       render(plan);
       if (isTerminal()) stopPolling();
+      else await detectAttention(plan);
     } catch (_) {
       if (!tornDown) el("status").textContent = "State refresh pending";
     } finally {
@@ -312,7 +367,7 @@ h1 { margin: 0; font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
   addEventListener("pagehide", teardown, { once: true });
   addEventListener("beforeunload", teardown, { once: true });
 
-  send("ui/initialize", { protocolVersion: APP_PROTOCOL, appInfo: { name: "webcodex-goal-plan-app", title: "WebCodex Goal Plan", version: "2.0.0" }, appCapabilities: {} })
+  send("ui/initialize", { protocolVersion: APP_PROTOCOL, appInfo: { name: "webcodex-goal-plan-app", title: "WebCodex Goal Plan", version: "3.0.0" }, appCapabilities: {} })
     .then(() => {
       if (tornDown) return;
       hostInitialized = true;

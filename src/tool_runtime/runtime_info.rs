@@ -1,6 +1,6 @@
 //! Runtime observability metadata injected into `ToolRuntime`.
 
-use super::registry::registered_tool_specs;
+use super::tool_definition::model_visible_tool_definitions;
 use super::{permissions, ToolResult, ToolRuntime};
 use crate::auth::AuthContext;
 use crate::runner_protocol::{RunnerView, ShellJobInfo};
@@ -259,7 +259,18 @@ impl ToolRuntime {
     /// tokens, api keys, full env, complete project path lists, or
     /// stdout/stderr. Returns a structured JSON object with service metadata,
     /// Runner-registered Project status, Runner summaries, and Job counts.
-    pub(crate) async fn runtime_status(&self, auth: Option<&AuthContext>) -> ToolResult {
+    pub(crate) fn runtime_status<'a>(
+        &'a self,
+        auth: Option<&'a AuthContext>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolResult> + Send + 'a>> {
+        // Runtime status aggregates fleet, project, Job, connection, build, and
+        // configuration state. Keep that aggregate future off caller stacks so
+        // nested startup/admin/status flows remain bounded under workspace-wide
+        // dependency feature unification.
+        Box::pin(async move { self.runtime_status_inner(auth).await })
+    }
+
+    async fn runtime_status_inner(&self, auth: Option<&AuthContext>) -> ToolResult {
         let access = crate::runner_http::runner_access_from_auth(auth);
         let clients = self
             .runner_registry
@@ -328,40 +339,15 @@ impl ToolRuntime {
         let stale_count = runner_count.saturating_sub(online_count);
         let clients_summary: Vec<Value> = clients
             .iter()
-            .map(|c| {
-                json!({
-                    "client_id": c.client_id,
-                    "agent_instance_id": c.runner_instance_id,
-                    "display_name": c.display_name,
-                    "owner": c.owner,
-                    "status": c.status,
-                    "host_context": host_context_projection(c.host_context.as_ref()),
-                    "connected": c.connected,
-                    "agent_protocol_generation": c.runner_protocol_generation.get(),
-                    "transport": c.transport,
-                    "last_seen": c.last_seen,
-                    "last_seen_age_secs": last_seen_age_secs(c, now),
-                    "pending_requests": c.pending_requests,
-                    "active_jobs": active_jobs_for_client(&runner_jobs, &c.client_id),
-                    "job_concurrency": job_concurrency_for_client(c, &runner_jobs),
-                    "capabilities": c.capabilities,
-                    "projects_count": enabled_projects_count(c),
-                    "project_inventory": c.project_inventory,
-                    "policy": sanitized_policy_summary(c.policy.as_ref()),
-                    "shell_profiles": sanitized_shell_profiles_summary(
-                        c.policy.as_ref().and_then(|p| p.shell_profiles.as_ref())
-                    ),
-                    "tool_providers": c.policy.as_ref().and_then(|p| p.tool_providers.as_ref()),
-                })
-            })
+            .map(|client| runtime_status_client_summary(client, &runner_jobs, now))
             .collect();
-        let runners = json!({
-            "count": runner_count,
-            "online_count": online_count,
-            "stale_count": stale_count,
-            "clients": clients_summary,
-            "summary": runner_health_summary(&clients, &runner_jobs, now),
-        });
+        let runners = runtime_status_runners_summary(
+            runner_count,
+            online_count,
+            stale_count,
+            clients_summary,
+            runner_health_summary(&clients, &runner_jobs, now),
+        );
         let connection_layers = connection_layers(
             &clients,
             runner_registered_count,
@@ -421,9 +407,10 @@ impl ToolRuntime {
         });
 
         // -- tools summary ----------------------------------------------------
-        let specs = registered_tool_specs();
-        let tools_count = specs.len();
-        let tools_names: Vec<String> = specs.iter().map(|s| s.name.clone()).collect();
+        let tools_names: Vec<String> = model_visible_tool_definitions()
+            .map(|definition| definition.name.to_string())
+            .collect();
+        let tools_count = tools_names.len();
         let tools = json!({
             "count": tools_count,
             "names": tools_names,
@@ -440,32 +427,52 @@ impl ToolRuntime {
             })
         });
 
-        let mut output = json!({
-            "service": "webcodex",
-            "mcp_compact_schemas": crate::model_surface::effective_mcp_compact_schemas(
+        // Keep the top-level status assembly incremental. A single large `json!`
+        // here materially inflates the debug async poll frame on fresh builds and
+        // can overflow the default Tokio worker stack once a Runner is registered.
+        let mut output = serde_json::Map::with_capacity(18);
+        output.insert("service".to_string(), json!("webcodex"));
+        output.insert(
+            "mcp_compact_schemas".to_string(),
+            json!(crate::model_surface::effective_mcp_compact_schemas(
                 crate::config::mcp_compact_schemas_override(),
-            ),
-            "effective_config": self.effective_config_status(),
-            "version": env!("CARGO_PKG_VERSION"),
-            "build": crate::build_info::runtime_build_info(),
-            "server_time": now,
-            "pid": std::process::id(),
-            "auth_enabled": self.runtime_info.auth_enabled,
-            "configured_public_url": self.runtime_info.configured_public_url,
-            "projects": projects,
-            // Runtime Console, admin HTTP, and CLI ops consume this established key.
-            "agents": runners,
-            "connection_layers": connection_layers,
-            "version_compatibility": version_compatibility,
-            "jobs": jobs,
-            "tools": tools,
-            "authority": permissions::authority_profile_payload(),
-            "session_store": self.sessions.status(),
-        });
+            )),
+        );
+        output.insert(
+            "effective_config".to_string(),
+            self.effective_config_status(),
+        );
+        output.insert("version".to_string(), json!(env!("CARGO_PKG_VERSION")));
+        output.insert(
+            "build".to_string(),
+            json!(crate::build_info::runtime_build_info()),
+        );
+        output.insert("server_time".to_string(), json!(now));
+        output.insert("pid".to_string(), json!(std::process::id()));
+        output.insert(
+            "auth_enabled".to_string(),
+            json!(self.runtime_info.auth_enabled),
+        );
+        output.insert(
+            "configured_public_url".to_string(),
+            json!(self.runtime_info.configured_public_url),
+        );
+        output.insert("projects".to_string(), projects);
+        // Runtime Console, admin HTTP, and CLI ops consume this established key.
+        output.insert("agents".to_string(), runners);
+        output.insert("connection_layers".to_string(), connection_layers);
+        output.insert("version_compatibility".to_string(), version_compatibility);
+        output.insert("jobs".to_string(), jobs);
+        output.insert("tools".to_string(), tools);
+        output.insert(
+            "authority".to_string(),
+            permissions::authority_profile_payload(),
+        );
+        output.insert("session_store".to_string(), json!(self.sessions.status()));
         if let Some(quic) = quic {
-            output["quic"] = quic;
+            output.insert("quic".to_string(), quic);
         }
-        ToolResult::ok(output)
+        ToolResult::ok(Value::Object(output))
     }
 
     pub(crate) async fn runtime_status_with_options(
@@ -633,53 +640,75 @@ impl ToolRuntime {
             "reconciled_count": reconciled_count,
             "lost_after_reconcile_count": lost_after_reconcile_count,
         });
-        let specs = registered_tool_specs();
+        let tool_names: Vec<String> = model_visible_tool_definitions()
+            .map(|definition| definition.name.to_string())
+            .collect();
         let tools = json!({
-            "count": specs.len(),
-            "names": specs.iter().map(|spec| spec.name.clone()).collect::<Vec<_>>(),
+            "count": tool_names.len(),
+            "names": tool_names,
         });
         let server_build = crate::build_info::runtime_build_info();
-        ToolResult::ok(json!({
-            "service": "webcodex",
-            "mcp_compact_schemas": crate::model_surface::effective_mcp_compact_schemas(
-                crate::config::mcp_compact_schemas_override(),
-            ),
-            "effective_config": self.effective_config_status(),
+        let focus = json!({
+            "client_id": client.client_id,
+            "connected": client.connected,
+            "status": client.status,
+            "agent_instance_id": client.runner_instance_id,
+            "build": client.build,
+            "project_count": project_count,
+            "active_jobs": runner_active,
+            "job_concurrency": job_concurrency_for_client(&client, &selected_jobs),
+            "compatibility_status": target_runner.get("status").cloned().unwrap_or(Value::Null),
+            "source_alignment": source_alignment,
+        });
+        let server = json!({
             "version": env!("CARGO_PKG_VERSION"),
             "build": server_build,
-            "server_time": now,
-            "pid": std::process::id(),
-            "auth_enabled": self.runtime_info.auth_enabled,
-            "configured_public_url": self.runtime_info.configured_public_url,
-            "focus": {
-                "client_id": client.client_id,
-                "connected": client.connected,
-                "status": client.status,
-                "agent_instance_id": client.runner_instance_id,
-                "build": client.build,
-                "project_count": project_count,
-                "active_jobs": runner_active,
-                "job_concurrency": job_concurrency_for_client(&client, &selected_jobs),
-                "compatibility_status": target_runner.get("status").cloned().unwrap_or(Value::Null),
-                "source_alignment": source_alignment,
-            },
-            "server": {
-                "version": env!("CARGO_PKG_VERSION"),
-                "build": server_build,
-            },
-            "fleet_summary": {
-                "visible_runner_count": visible_clients.len(),
-                "mismatched_agents_count": mismatched_agents_count,
-                "source_mismatched_agents_count": source_mismatched_agents_count,
-                "mixed_builds_present": mismatched_agents_count > 0 || source_mismatched_agents_count > 0,
-            },
-            "projects": projects,
-            "agents": runners,
-            "version_compatibility": target_compatibility,
-            "jobs": jobs,
-            "tools": tools,
-            "authority": permissions::authority_profile_payload(),
-        }))
+        });
+        let fleet_summary = json!({
+            "visible_runner_count": visible_clients.len(),
+            "mismatched_agents_count": mismatched_agents_count,
+            "source_mismatched_agents_count": source_mismatched_agents_count,
+            "mixed_builds_present": mismatched_agents_count > 0 || source_mismatched_agents_count > 0,
+        });
+        // As above, avoid one large `json!` in this async poll frame so focused
+        // status requests retain the same bounded worker-stack behavior.
+        let mut output = serde_json::Map::with_capacity(17);
+        output.insert("service".to_string(), json!("webcodex"));
+        output.insert(
+            "mcp_compact_schemas".to_string(),
+            json!(crate::model_surface::effective_mcp_compact_schemas(
+                crate::config::mcp_compact_schemas_override(),
+            )),
+        );
+        output.insert(
+            "effective_config".to_string(),
+            self.effective_config_status(),
+        );
+        output.insert("version".to_string(), json!(env!("CARGO_PKG_VERSION")));
+        output.insert("build".to_string(), json!(server_build));
+        output.insert("server_time".to_string(), json!(now));
+        output.insert("pid".to_string(), json!(std::process::id()));
+        output.insert(
+            "auth_enabled".to_string(),
+            json!(self.runtime_info.auth_enabled),
+        );
+        output.insert(
+            "configured_public_url".to_string(),
+            json!(self.runtime_info.configured_public_url),
+        );
+        output.insert("focus".to_string(), focus);
+        output.insert("server".to_string(), server);
+        output.insert("fleet_summary".to_string(), fleet_summary);
+        output.insert("projects".to_string(), projects);
+        output.insert("agents".to_string(), runners);
+        output.insert("version_compatibility".to_string(), target_compatibility);
+        output.insert("jobs".to_string(), jobs);
+        output.insert("tools".to_string(), tools);
+        output.insert(
+            "authority".to_string(),
+            permissions::authority_profile_payload(),
+        );
+        ToolResult::ok(Value::Object(output))
     }
 }
 
@@ -1335,6 +1364,99 @@ fn runner_health_summary(clients: &[RunnerView], runner_jobs: &[ShellJobInfo], n
         "stale": stale,
         "clients": runner_health_clients(clients, runner_jobs, now),
     })
+}
+
+fn runtime_status_client_summary(
+    client: &RunnerView,
+    runner_jobs: &[ShellJobInfo],
+    now: i64,
+) -> Value {
+    // Build this projection incrementally rather than through one large `json!`
+    // expression. A current Runner carries a wide capability set plus nested
+    // policy/provider metadata, and materializing the whole object in one macro
+    // can exceed the default Tokio worker stack in debug builds.
+    let mut value = serde_json::Map::with_capacity(22);
+    value.insert("client_id".to_string(), json!(client.client_id));
+    value.insert(
+        "agent_instance_id".to_string(),
+        json!(client.runner_instance_id),
+    );
+    value.insert("display_name".to_string(), json!(client.display_name));
+    value.insert("owner".to_string(), json!(client.owner));
+    value.insert("status".to_string(), json!(client.status));
+    value.insert(
+        "host_context".to_string(),
+        host_context_projection(client.host_context.as_ref()),
+    );
+    value.insert("connected".to_string(), json!(client.connected));
+    value.insert(
+        "agent_protocol_generation".to_string(),
+        json!(client.runner_protocol_generation.get()),
+    );
+    value.insert("transport".to_string(), json!(client.transport));
+    value.insert("last_seen".to_string(), json!(client.last_seen));
+    value.insert(
+        "last_seen_age_secs".to_string(),
+        json!(last_seen_age_secs(client, now)),
+    );
+    value.insert(
+        "pending_requests".to_string(),
+        json!(client.pending_requests),
+    );
+    value.insert(
+        "active_jobs".to_string(),
+        json!(active_jobs_for_client(runner_jobs, &client.client_id)),
+    );
+    value.insert(
+        "job_concurrency".to_string(),
+        job_concurrency_for_client(client, runner_jobs),
+    );
+    value.insert("capabilities".to_string(), json!(client.capabilities));
+    value.insert(
+        "projects_count".to_string(),
+        json!(enabled_projects_count(client)),
+    );
+    value.insert(
+        "project_inventory".to_string(),
+        json!(client.project_inventory),
+    );
+    value.insert(
+        "policy".to_string(),
+        sanitized_policy_summary(client.policy.as_ref()),
+    );
+    value.insert(
+        "shell_profiles".to_string(),
+        sanitized_shell_profiles_summary(
+            client
+                .policy
+                .as_ref()
+                .and_then(|policy| policy.shell_profiles.as_ref()),
+        ),
+    );
+    value.insert(
+        "tool_providers".to_string(),
+        json!(client
+            .policy
+            .as_ref()
+            .and_then(|policy| policy.tool_providers.as_ref())),
+    );
+    Value::Object(value)
+}
+
+fn runtime_status_runners_summary(
+    count: usize,
+    online_count: usize,
+    stale_count: usize,
+    clients: Vec<Value>,
+    health_summary: Value,
+) -> Value {
+    let mut value = serde_json::Map::with_capacity(5);
+    value.insert("count".to_string(), json!(count));
+    value.insert("online_count".to_string(), json!(online_count));
+    value.insert("stale_count".to_string(), json!(stale_count));
+    value.insert("clients".to_string(), Value::Array(clients));
+    value.insert("summary".to_string(), health_summary);
+    Value::Object(value)
 }
 
 /// Build the sanitized policy summary JSON exposed in `runtime_status` and

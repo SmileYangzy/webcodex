@@ -459,12 +459,7 @@ mod tests {
         assert!(ids.contains(ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME));
         assert!(ids.len() < GPT_ACTION_OPERATION_LIMIT);
         assert!(ids.iter().all(|name| !name.chars().any(char::is_uppercase)));
-        for legacy in [
-            "listRuntimeTools",
-            "listProjects",
-            "getRuntimeStatus",
-            "callRuntimeTool",
-        ] {
+        for legacy in ["listRuntimeTools", "getRuntimeStatus", "callRuntimeTool"] {
             assert!(!ids.contains(legacy));
         }
         for path in spec["paths"].as_object().unwrap().keys() {

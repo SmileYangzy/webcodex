@@ -424,15 +424,17 @@ pub fn output_schema_for_tool(name: &str) -> Option<Value> {
                                 "latest_message_id": nullable_string("Latest Message id represented by an inbox_changed Wake; null for task and attention sources and no Message body is included."),
                                 "queued_delivery_count": nullable_integer("Bounded queued count snapshot for an inbox_changed Wake; null for task and attention sources."),
                                 "inbox_high_watermark": nullable_integer("Durable delivery high-watermark for an inbox_changed Wake; null for task and attention sources."),
-                                "task_id": nullable_string("Exact durable AgentTask id for agent_task_attempt or attention_event; null for inbox_changed."),
-                                "task_attempt_id": nullable_string("Exact durable AgentTaskAttempt id for agent_task_attempt or attention_event; null for inbox_changed."),
+                                "task_id": nullable_string("Exact AgentTask id for Task-attempt or Task-terminal attention; null for Goal workflow stall attention and non-Task sources."),
+                                "task_attempt_id": nullable_string("Exact AgentTaskAttempt id for Task sources; null for Goal workflow stall attention and non-Task sources."),
                                 "event_id": nullable_string("Exact durable semantic attention Event id for attention_event; null for other Wake sources."),
-                                "goal_id": nullable_string("Exact correlated Goal id for attention_event; null for other Wake sources. Identity grants no Goal authority.")
+                                "goal_id": nullable_string("Exact correlated Goal id for attention_event; null for other Wake sources. Identity grants no Goal authority."),
+                                "attention_kind": {"anyOf": [{"type": "string", "enum": ["agent_task_terminal", "goal_workflow_stalled"]}, {"type": "null"}]},
+                                "workflow_session_id": nullable_string("Exact explicitly correlated Workflow Session for a Goal workflow stall. Identity grants no Session authority.")
                             },
                             "required": [
                                 "wake_id", "state", "revision", "trigger_kind", "conversation_id",
                                 "latest_message_id", "queued_delivery_count", "inbox_high_watermark",
-                                "task_id", "task_attempt_id", "event_id", "goal_id"
+                                "task_id", "task_attempt_id", "event_id", "goal_id", "attention_kind", "workflow_session_id"
                             ]
                         },
                         {"type": "null"}

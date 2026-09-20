@@ -62,14 +62,45 @@ fn correlation_schema() -> Value {
     })
 }
 
+pub(super) fn goal_step_schema() -> Value {
+    json!({
+        "type": "object", "additionalProperties": false,
+        "properties": {
+            "id": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,32}$"},
+            "title": {"type": "string", "minLength": 1, "maxLength": 120},
+            "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
+            "updated_at_unix_ms": {"type": "integer"}
+        },
+        "required": ["id", "title", "status", "updated_at_unix_ms"]
+    })
+}
+
+fn progress_summary_schema() -> Value {
+    json!({"anyOf": [{"type": "string", "minLength": 1, "maxLength": 2048}, {"type": "null"}]})
+}
+
+fn mechanical_plan_schema() -> Value {
+    json!({
+        "type": "object", "additionalProperties": false,
+        "properties": {
+            "completion_conditions": {"type": "array", "maxItems": 8, "items": {"type": "string", "minLength": 1, "maxLength": 512}, "description": "Fixed durable completion intent, not Server-evaluated predicates."},
+            "steps": {"type": "array", "maxItems": 32, "items": goal_step_schema()},
+            "progress_summary": progress_summary_schema(),
+            "checkpoint_at_unix_ms": nullable_integer("Last committed recovery checkpoint, or null before the first checkpoint.")
+        },
+        "required": ["completion_conditions", "steps", "progress_summary", "checkpoint_at_unix_ms"]
+    })
+}
+
 fn goal_detail_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
         "properties": {
             "summary": goal_summary_schema(),
+            "plan": mechanical_plan_schema(),
             "objective": {"type": "string", "minLength": 1, "maxLength": 8192, "description": "Bounded authoritative high-level objective/instruction; the Store enforces the same 8192-byte UTF-8 ceiling."},
-            "controller_agent_id": nullable_controller_agent_id("Exact durable Goal attention-routing Agent, or null for the legacy worker fallback. Identity only; it grants no Goal, Task, Project, Session, Runner, Endpoint, or execution authority."),
+            "controller_agent_id": nullable_controller_agent_id("Exact durable Goal attention-routing Agent, or null when no workflow-stall controller was specified. Identity only; it grants no Goal, Task, Project, Session, Runner, Endpoint, or execution authority."),
             "terminal_reason": {
                 "anyOf": [
                     {"type": "string", "minLength": 1, "maxLength": 4096},
@@ -84,7 +115,7 @@ fn goal_detail_schema() -> Value {
                 "description": "Bounded explicit AgentTask and Workflow Session correlations only. No target-domain authority or private target state is projected."
             }
         },
-        "required": ["summary", "objective", "controller_agent_id", "terminal_reason", "correlations"]
+        "required": ["summary", "plan", "objective", "controller_agent_id", "terminal_reason", "correlations"]
     })
 }
 
@@ -117,11 +148,16 @@ fn goal_plan_schema() -> Value {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-            "version": {"type": "integer", "const": 1, "description": "Backward-compatible Goal Plan presentation projection version; live activity is an additive observation field."},
+            "version": {"type": "integer", "const": 2, "description": "Current bounded Goal workflow plan projection."},
             "goal_id": {"type": "string", "pattern": "^wc_goal_[A-Za-z0-9_-]{16}$", "description": "Exact durable Goal identity used for refresh/rehydration and app-only polling. Identity is never authority."},
             "title": {"type": "string", "minLength": 1, "maxLength": 200, "description": "Bounded Goal title."},
-            "objective": {"type": "string", "minLength": 1, "maxLength": 8192, "description": "Bounded authoritative Goal objective; the Store enforces the same 8192-byte UTF-8 ceiling."},
-            "controller_agent_id": nullable_controller_agent_id("Exact durable Goal attention-routing Agent, or null when terminal attention uses the backward-compatible Task worker fallback. Endpoint/window bindings are never projected."),
+            "total_step_count": {"type": "integer", "minimum": 0, "maximum": 32},
+            "completed_step_count": {"type": "integer", "minimum": 0, "maximum": 32},
+            "current_step_id": {"anyOf": [{"type": "string", "pattern": "^[A-Za-z0-9_-]{1,32}$"}, {"type": "null"}]},
+            "steps": {"type": "array", "maxItems": 32, "items": goal_step_schema()},
+            "progress_summary": progress_summary_schema(),
+            "checkpoint_at_unix_ms": nullable_integer("Last committed Goal recovery checkpoint."),
+            "controller_agent_id": nullable_controller_agent_id("Exact durable Goal attention-routing Agent, or null when workflow-stall continuation is unavailable. Endpoint/window bindings are never projected."),
             "lifecycle": lifecycle_schema(),
             "revision": {"type": "integer", "minimum": 1, "description": "Monotonic authoritative Goal revision."},
             "updated_at_unix_ms": schema_type("integer", "Latest authoritative Goal mutation time."),
@@ -131,7 +167,7 @@ fn goal_plan_schema() -> Value {
             "activity": goal_activity_schema()
         },
         "required": [
-            "version", "goal_id", "title", "objective", "controller_agent_id", "lifecycle", "revision",
+            "version", "goal_id", "title", "total_step_count", "completed_step_count", "current_step_id", "steps", "progress_summary", "checkpoint_at_unix_ms", "controller_agent_id", "lifecycle", "revision",
             "updated_at_unix_ms", "terminal_at_unix_ms", "agent_task_count",
             "workflow_session_count", "activity"
         ],
@@ -157,13 +193,55 @@ fn goal_mutation_schema() -> Value {
     ])
 }
 
+pub(super) fn goal_follow_up_schema() -> Value {
+    json!({
+        "type": "object", "additionalProperties": false,
+        "description": "Owned active Goals explicitly correlated to the authorized Workflow Session. Progress follow-up only; no automatic completion. When incomplete, checkpoint_goal with this exact revision; otherwise freshly verify/review completion intent and explicitly update_goal to completed. Missing authority omits this field; unavailable evidence never implies no active Goal.",
+        "properties": {
+            "available": {"type": "boolean"},
+            "truncated": {"type": "boolean"},
+            "goals": {"type": "array", "maxItems": 8, "items": {
+                "type": "object", "additionalProperties": false,
+                "properties": {
+                    "goal_id": {"type": "string", "pattern": "^wc_goal_[A-Za-z0-9_-]{16}$"},
+                    "revision": {"type": "integer", "minimum": 1},
+                    "incomplete_step_count": {"type": "integer", "minimum": 0, "maximum": 32},
+                    "current_step": {"anyOf": [{"type": "null"}, {
+                        "type": "object", "additionalProperties": false,
+                        "properties": {"id": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,32}$"}, "title": {"type": "string", "minLength": 1, "maxLength": 120}},
+                        "required": ["id", "title"]
+                    }]},
+                    "next_action": {"type": "string", "enum": ["checkpoint_goal", "update_goal"]}
+                },
+                "required": ["goal_id", "revision", "incomplete_step_count", "current_step", "next_action"]
+            }}
+        },
+        "required": ["available", "truncated", "goals"]
+    })
+}
+
 pub fn output_schema_for_tool(name: &str) -> Option<Value> {
     let schema = match name {
         "create_goal"
         | "update_goal"
+        | "checkpoint_goal"
         | "associate_goal_agent_task"
         | "associate_goal_workflow_session" => goal_mutation_schema(),
         "get_goal" => wrapped_output_schema(vec![("goal", goal_detail_schema())]),
+        "goal_plan_recheck_attention" => wrapped_output_schema(vec![
+            ("state_changed", json!({"type": "boolean"})),
+            (
+                "attention",
+                json!({"anyOf": [
+                    {"type": "null"},
+                    {"type": "object", "additionalProperties": false, "properties": {
+                        "event_id": {"type": "string", "pattern": "^wc_attention_event_[A-Za-z0-9_-]{16}$"},
+                        "wake_id": {"type": "string", "pattern": "^wc_wake_[A-Za-z0-9_-]{16}$"},
+                        "created": {"type": "boolean"}
+                    }, "required": ["event_id", "wake_id", "created"]}
+                ]}),
+            ),
+        ]),
         "present_goal_plan" | "goal_plan_state" => {
             wrapped_output_schema(vec![("goal_plan", goal_plan_schema())])
         }

@@ -348,7 +348,7 @@ async fn ops_projects_http_401_uses_ops_report() {
     let output = run_ops_with_routes(
         OpsCommand::Projects(ops_common_opts(String::new())),
         vec![(
-            "/api/projects/list",
+            "/api/tools/call",
             json_http_response(401, json!({"error": "missing token"})),
         )],
     )
@@ -375,7 +375,7 @@ async fn ops_smoke_preflight_projects_401_uses_ops_report() {
                 ),
             ),
             (
-                "/api/projects/list",
+                "/api/tools/call",
                 json_http_response(401, json!({"error": "missing token"})),
             ),
         ],
@@ -794,7 +794,7 @@ fn spawn_smoke_preflight_server(
                     let first_line = request.lines().next().unwrap_or_default().to_string();
                     let body = if first_line.starts_with("POST /api/runtime/status ") {
                         json!({"success": true, "output": runtime_status_fixture()})
-                    } else if first_line.starts_with("POST /api/projects/list ") {
+                    } else if request.contains(r#""tool":"list_projects""#) {
                         json!({"success": true, "output": projects.clone()})
                     } else if request.contains(r#""tool":"show_changes""#) {
                         json!({"success": true, "output": clean_show_changes_fixture()})
@@ -849,8 +849,8 @@ fn smoke_request_kinds(requests: &[String]) -> Vec<&'static str> {
             let first_line = request.lines().next().unwrap_or_default();
             if first_line.starts_with("POST /api/runtime/status ") {
                 "runtime_status"
-            } else if first_line.starts_with("POST /api/projects/list ") {
-                "projects_list"
+            } else if request.contains(r#""tool":"list_projects""#) {
+                "list_projects"
             } else if request.contains(r#""tool":"show_changes""#) {
                 "show_changes"
             } else if request.contains(r#""tool":"workspace_hygiene_check""#) {
@@ -1236,14 +1236,14 @@ async fn ops_smoke_preflight_calls_only_read_only_endpoints() {
         smoke_request_kinds(&requests),
         vec![
             "runtime_status",
-            "projects_list",
+            "list_projects",
             "show_changes",
             "workspace_hygiene_check"
         ]
     );
     let joined = requests.join("\n---\n");
     assert!(joined.contains("POST /api/runtime/status "));
-    assert!(joined.contains("POST /api/projects/list "));
+    assert!(joined.contains(r#""tool":"list_projects""#));
     assert!(joined.contains(r#""tool":"show_changes""#));
     assert!(joined.contains(r#""tool":"workspace_hygiene_check""#));
     assert!(!joined.contains(r#""tool":"run_shell""#));
@@ -1258,7 +1258,7 @@ async fn ops_smoke_preflight_project_missing_short_circuits() {
         run_smoke_preflight_with_projects(projects_fixture(true), "agent:ops:missing").await;
     assert_eq!(
         smoke_request_kinds(&requests),
-        vec!["runtime_status", "projects_list"]
+        vec!["runtime_status", "list_projects"]
     );
     assert_no_workspace_preflight_tools(&requests);
     assert!(output.contains("Overall: FAIL"));
@@ -1275,7 +1275,7 @@ async fn ops_smoke_preflight_disconnected_project_short_circuits() {
     let (output, requests) = run_smoke_preflight_with_projects(projects, "agent:ops:smoke").await;
     assert_eq!(
         smoke_request_kinds(&requests),
-        vec!["runtime_status", "projects_list"]
+        vec!["runtime_status", "list_projects"]
     );
     assert_no_workspace_preflight_tools(&requests);
     assert!(output.contains("Overall: FAIL"));
@@ -1300,7 +1300,7 @@ async fn ops_smoke_preflight_non_git_project_short_circuits() {
     let (output, requests) = run_smoke_preflight_with_projects(projects, "agent:ops:smoke").await;
     assert_eq!(
         smoke_request_kinds(&requests),
-        vec!["runtime_status", "projects_list"]
+        vec!["runtime_status", "list_projects"]
     );
     assert_no_workspace_preflight_tools(&requests);
     assert!(output.contains("Overall: FAIL"));

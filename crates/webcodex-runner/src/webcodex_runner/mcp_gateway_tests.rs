@@ -1,7 +1,8 @@
 use super::*;
 use crate::mcp_gateway::{
     McpGatewayContent, McpGatewayResponsePayload, McpGatewaySchemaObservation,
-    MCP_GATEWAY_MAX_MESSAGE_BYTES, MCP_GATEWAY_MAX_RESULT_BYTES,
+    MCP_GATEWAY_MAX_IMAGE_BASE64_BYTES, MCP_GATEWAY_MAX_IMAGE_BYTES, MCP_GATEWAY_MAX_MESSAGE_BYTES,
+    MCP_GATEWAY_MAX_PROVIDER_MESSAGE_BYTES, MCP_GATEWAY_MAX_RESULT_BYTES,
 };
 use std::env;
 use std::fs;
@@ -429,6 +430,131 @@ fn large_tool_result_crosses_local_mcp_bridge_below_result_and_message_bounds() 
 }
 
 #[test]
+fn image_only_result_succeeds_with_standard_wire_fields() {
+    let fixture = Fixture::new("image_result", 3);
+    let provider = fixture.provider();
+    assert!(fixture.list(&provider).error.is_none());
+    let response = fixture.call(&provider);
+    let Some(McpGatewayResponsePayload::ToolResult { result }) = response.payload else {
+        panic!("image tool result missing: {:?}", response.error);
+    };
+    assert_eq!(
+        result.content,
+        vec![McpGatewayContent::Image {
+            data: "iVBORw0KGgo=".to_string(),
+            mime_type: "image/png".to_string(),
+        }]
+    );
+    assert!(!result.is_error);
+}
+
+#[test]
+fn image_result_crosses_expanded_provider_wire_bound_and_reuses_connection() {
+    assert_eq!(MCP_GATEWAY_MAX_IMAGE_BYTES, 1024 * 1024);
+    assert_eq!(MCP_GATEWAY_MAX_IMAGE_BASE64_BYTES, 1_398_104);
+    assert!(MCP_GATEWAY_MAX_PROVIDER_MESSAGE_BYTES > MCP_GATEWAY_MAX_MESSAGE_BYTES);
+    assert!(MCP_GATEWAY_MAX_PROVIDER_MESSAGE_BYTES < 2 * 1024 * 1024);
+
+    let fixture = Fixture::new("max_image_result", 3);
+    let provider = fixture.provider();
+    assert!(fixture.list(&provider).error.is_none());
+    let response = fixture.call(&provider);
+    let Some(McpGatewayResponsePayload::ToolResult { result }) = response.payload else {
+        panic!("image tool result missing: {:?}", response.error);
+    };
+    let [McpGatewayContent::Image { data, mime_type }] = result.content.as_slice() else {
+        panic!("unexpected image result content");
+    };
+    assert_eq!(data.len(), MCP_GATEWAY_MAX_IMAGE_BASE64_BYTES);
+    assert_eq!(mime_type, "image/png");
+    assert!(fixture.list(&provider).error.is_none());
+    assert_eq!(fixture.marker_count("start"), 1);
+    assert_eq!(fixture.marker_count("initialize"), 1);
+    assert_eq!(fixture.marker_count("call"), 1);
+}
+
+#[test]
+fn mixed_text_image_text_result_preserves_order_and_structured_content() {
+    let fixture = Fixture::new("mixed_content_result", 3);
+    let provider = fixture.provider();
+    assert!(fixture.list(&provider).error.is_none());
+    let response = fixture.call(&provider);
+    let Some(McpGatewayResponsePayload::ToolResult { result }) = response.payload else {
+        panic!("mixed tool result missing: {:?}", response.error);
+    };
+    assert_eq!(
+        result.content,
+        vec![
+            McpGatewayContent::Text {
+                text: "before".to_string(),
+            },
+            McpGatewayContent::Image {
+                data: "iVBORw0KGgo=".to_string(),
+                mime_type: "image/png".to_string(),
+            },
+            McpGatewayContent::Text {
+                text: "after".to_string(),
+            },
+        ]
+    );
+    assert_eq!(result.structured_content.unwrap()["kind"], "mixed");
+    assert!(!result.is_error);
+}
+
+#[test]
+fn image_result_preserves_provider_is_error_semantics() {
+    let fixture = Fixture::new("image_error_result", 3);
+    let provider = fixture.provider();
+    assert!(fixture.list(&provider).error.is_none());
+    let response = fixture.call(&provider);
+    let Some(McpGatewayResponsePayload::ToolResult { result }) = response.payload else {
+        panic!("image error result missing: {:?}", response.error);
+    };
+    assert!(result.is_error);
+    assert_eq!(
+        result.structured_content.as_ref().unwrap()["code"],
+        "IMAGE_ERROR"
+    );
+    assert_eq!(
+        result.content,
+        vec![McpGatewayContent::Image {
+            data: "/9j/".to_string(),
+            mime_type: "image/jpeg".to_string(),
+        }]
+    );
+}
+
+#[test]
+fn malformed_and_oversized_images_fail_as_invalid_results_without_hidden_retry() {
+    for scenario in [
+        "invalid_image_base64",
+        "missing_image_data",
+        "missing_image_mime",
+        "invalid_image_mime",
+        "mismatched_image_mime",
+        "oversized_image",
+    ] {
+        let fixture = Fixture::new(scenario, 3);
+        let provider = fixture.provider();
+        assert!(fixture.list(&provider).error.is_none());
+        let response = fixture.call(&provider);
+        assert_eq!(
+            response.dispatch_state,
+            McpGatewayDispatchState::Completed,
+            "{scenario}"
+        );
+        assert_eq!(
+            response.error.as_ref().map(|error| error.code.as_str()),
+            Some("invalid_provider_result"),
+            "{scenario}"
+        );
+        assert_eq!(fixture.marker_count("call"), 1, "{scenario}");
+        assert!(fixture.list(&provider).error.is_none(), "{scenario}");
+        assert_eq!(fixture.marker_count("start"), 1, "{scenario}");
+    }
+}
+
+#[test]
 fn schema_change_blocks_effectful_call_without_retiring_provider() {
     let fixture = Fixture::new("schema_change", 3);
     let provider = fixture.provider();
@@ -827,6 +953,24 @@ fn timeout_and_invalid_untrusted_outputs_are_bounded() {
             McpGatewayDispatchState::Completed,
         ),
         (
+            "resource_result",
+            "call",
+            "unsupported_provider_content",
+            McpGatewayDispatchState::Completed,
+        ),
+        (
+            "resource_link_result",
+            "call",
+            "unsupported_provider_content",
+            McpGatewayDispatchState::Completed,
+        ),
+        (
+            "unknown_content_result",
+            "call",
+            "unsupported_provider_content",
+            McpGatewayDispatchState::Completed,
+        ),
+        (
             "oversized_result",
             "call",
             "invalid_provider_result",
@@ -871,6 +1015,7 @@ fn correlated_invalid_result_does_not_retire_provider_instance() {
     assert!(fixture.list(&provider).error.is_none());
     assert_eq!(fixture.marker_count("start"), 1);
     assert_eq!(fixture.marker_count("initialize"), 1);
+    assert_eq!(fixture.marker_count("call"), 1);
 }
 
 #[test]

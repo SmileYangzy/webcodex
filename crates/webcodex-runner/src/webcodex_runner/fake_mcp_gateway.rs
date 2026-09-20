@@ -125,7 +125,7 @@ fn main() -> io::Result<()> {
                         &mut writer,
                         &format!(
                             r#"{{"jsonrpc":"2.0","id":{id},"result":{{"padding":"{}","tools":[]}}}}"#,
-                            "x".repeat(1024 * 1024)
+                            "x".repeat(2 * 1024 * 1024)
                         ),
                     )?;
                     continue;
@@ -252,10 +252,94 @@ fn main() -> io::Result<()> {
                             "y".repeat(192 * 1024)
                         ),
                     )?,
+                    "image_result" => send(
+                        &mut writer,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"image","data":"iVBORw0KGgo=","mimeType":"image/png"}}],"isError":false}}}}"#
+                        ),
+                    )?,
+                    "mixed_content_result" => send(
+                        &mut writer,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"text","text":"before"}},{{"type":"image","data":"iVBORw0KGgo=","mimeType":"image/png"}},{{"type":"text","text":"after"}}],"structuredContent":{{"kind":"mixed"}},"isError":false}}}}"#
+                        ),
+                    )?,
+                    "image_error_result" => send(
+                        &mut writer,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"image","data":"/9j/","mimeType":"image/jpeg"}}],"structuredContent":{{"code":"IMAGE_ERROR"}},"isError":true}}}}"#
+                        ),
+                    )?,
+                    "max_image_result" => {
+                        let data = format!("iVBORw0KGgoA{}AA==", "AAAA".repeat(349_522));
+                        send(
+                            &mut writer,
+                            &format!(
+                                r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"image","data":"{data}","mimeType":"image/png"}}],"isError":false}}}}"#
+                            ),
+                        )?;
+                    }
+                    "oversized_image" => {
+                        let data = "AAAA".repeat(349_526);
+                        send(
+                            &mut writer,
+                            &format!(
+                                r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"image","data":"{data}","mimeType":"image/png"}}],"isError":false}}}}"#
+                            ),
+                        )?;
+                    }
+                    "invalid_image_base64" => send(
+                        &mut writer,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"image","data":"%%%","mimeType":"image/png"}}]}}}}"#
+                        ),
+                    )?,
+                    "missing_image_data" => send(
+                        &mut writer,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"image","mimeType":"image/png"}}]}}}}"#
+                        ),
+                    )?,
+                    "missing_image_mime" => send(
+                        &mut writer,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"image","data":"AA=="}}]}}}}"#
+                        ),
+                    )?,
+                    "invalid_image_mime" => send(
+                        &mut writer,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"image","data":"AA==","mimeType":"text/plain"}}]}}}}"#
+                        ),
+                    )?,
+                    "mismatched_image_mime" => send(
+                        &mut writer,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"image","data":"iVBORw0KGgo=","mimeType":"image/jpeg"}}]}}}}"#
+                        ),
+                    )?,
                     "bad_result" => send(
                         &mut writer,
                         &format!(
-                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"image","data":"AA==","mimeType":"image/png"}}]}}}}"#
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"audio","data":"AA==","mimeType":"audio/wav"}}]}}}}"#
+                        ),
+                    )?,
+                    "resource_result" => send(
+                        &mut writer,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"resource","resource":{{"uri":"file:///tmp/x","text":"x"}}}}]}}}}"#
+                        ),
+                    )?,
+                    "resource_link_result" => send(
+                        &mut writer,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"resource_link","uri":"file:///tmp/x","name":"x"}}]}}}}"#
+                        ),
+                    )?,
+                    "unknown_content_result" => send(
+                        &mut writer,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"video","data":"AA==","mimeType":"video/mp4"}}]}}}}"#
                         ),
                     )?,
                     "oversized_result" => send(

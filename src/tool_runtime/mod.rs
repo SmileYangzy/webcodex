@@ -150,12 +150,12 @@ pub(crate) use webcodex_tool_contracts::tool_call::{
 pub use webcodex_tool_contracts::tool_inputs::ApplyFileChangeInput;
 #[cfg(all(test, feature = "workspace-checkpoints"))]
 pub use webcodex_tool_contracts::tool_inputs::CheckpointValidationInput;
-pub use webcodex_tool_contracts::tool_inputs::{
-    default_true, ExecutionPurpose, ExecutionShell, ListToolsOptions,
-};
 #[cfg(test)]
 pub use webcodex_tool_contracts::tool_inputs::{
     ApplyFileChangeKind, ApplyTextEditInput, ApplyTextEditKind, SessionMode, StartupDetail,
+};
+pub use webcodex_tool_contracts::tool_inputs::{
+    ExecutionPurpose, ExecutionShell, ListToolsOptions,
 };
 pub use webcodex_tool_contracts::ToolSpec;
 pub use webcodex_tool_runtime_contracts::tool_result::ToolResult;

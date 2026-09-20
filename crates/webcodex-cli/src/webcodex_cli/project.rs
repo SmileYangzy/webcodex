@@ -4,7 +4,10 @@ use std::path::{Path, PathBuf};
 use webcodex_admin::ServerHttpOptions;
 
 use super::connect::profile::{atomic_write, render_project_file, resolve_project};
-use super::{http_post_json_status, read_optional_token, shell_command, validate_user_api_token};
+use super::{
+    call_runtime_tool_status, http_post_json_status, read_optional_token, shell_command,
+    validate_user_api_token,
+};
 
 #[cfg(test)]
 #[path = "tests/project_activation_identity.rs"]
@@ -445,6 +448,40 @@ async fn operator_tool_call(
         .map_err(|_| format!("operator endpoint returned an unexpected response (HTTP {status})"))
 }
 
+async fn runtime_tool_call(
+    server_url: &str,
+    token: &str,
+    tool: &str,
+    params: Value,
+) -> Result<OperatorToolResult, String> {
+    let server_http = ServerHttpOptions {
+        no_system_proxy: server_url_is_loopback(server_url),
+        ..ServerHttpOptions::default()
+    };
+    let (status, content_type, value) =
+        call_runtime_tool_status(server_url, &server_http, Some(token), tool, params).await?;
+    if matches!(status, 404 | 405) {
+        return Ok(OperatorToolResult {
+            success: false,
+            output: json!({
+                "failure_kind": "capability_unavailable",
+                "error_code": "runtime_tool_endpoint_unavailable",
+                "http_status": status,
+            }),
+            error: Some(
+                "canonical runtime tool endpoint is unavailable on this Server version".to_string(),
+            ),
+        });
+    }
+    let Some(value) = value else {
+        return Err(format!(
+            "runtime tool {tool} returned HTTP {status} without JSON ({content_type})"
+        ));
+    };
+    serde_json::from_value(value)
+        .map_err(|_| format!("runtime tool {tool} returned an unexpected response (HTTP {status})"))
+}
+
 fn operator_error_code(result: &OperatorToolResult) -> Option<&str> {
     result
         .output
@@ -493,10 +530,10 @@ async fn reconcile_project_from_inventory(
     client_id: &str,
     canonical_project: &Path,
 ) -> Result<Option<Value>, String> {
-    let listed = operator_tool_call(
+    let listed = runtime_tool_call(
         server_url,
         token,
-        "/api/projects/list",
+        "list_projects",
         json!({"client_id": client_id, "limit": 100}),
     )
     .await?;
@@ -544,10 +581,10 @@ async fn reconcile_reload_generation(
     if !runner_config_candidate_unchanged(config_path, expected_candidate)? {
         return Err("project_activation_config_conflict: Runner config changed while reload outcome was uncertain; re-observe the current operator configuration".to_string());
     }
-    let checked = operator_tool_call(
+    let checked = runtime_tool_call(
         server_url,
         token,
-        "/api/runners/config/check",
+        "runner_config_check",
         json!({"client_id": client_id}),
     )
     .await
@@ -749,10 +786,10 @@ pub(crate) async fn run_project_activate(opts: ProjectActivateOptions) -> Result
             authority_changed = true;
         }
 
-        let checked = operator_tool_call(
+        let checked = runtime_tool_call(
             &server_url,
             &token,
-            "/api/runners/config/check",
+            "runner_config_check",
             json!({"client_id": client_id}),
         )
         .await?;
@@ -805,10 +842,10 @@ pub(crate) async fn run_project_activate(opts: ProjectActivateOptions) -> Result
             continue;
         }
 
-        let reload = operator_tool_call(
+        let reload = runtime_tool_call(
             &server_url,
             &token,
-            "/api/runners/config/reload",
+            "runner_config_reload",
             json!({"client_id": client_id, "expected_generation": generation}),
         )
         .await;
@@ -1074,15 +1111,23 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let handle = thread::spawn(move || {
             let mut requests = Vec::new();
-            for (expected_path, body) in responses {
+            for (expected_target, body) in responses {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut request = vec![0u8; 64 * 1024];
                 let read = stream.read(&mut request).unwrap();
                 let request = String::from_utf8_lossy(&request[..read]).to_string();
-                assert!(
-                    request.starts_with(&format!("POST {expected_path} ")),
-                    "unexpected request: {request}"
-                );
+                if let Some(expected_tool) = expected_target.strip_prefix("tool:") {
+                    assert!(
+                        request.starts_with("POST /api/tools/call "),
+                        "unexpected request: {request}"
+                    );
+                    assert_eq!(request_json(&request)["tool"], expected_tool);
+                } else {
+                    assert!(
+                        request.starts_with(&format!("POST {expected_target} ")),
+                        "unexpected request: {request}"
+                    );
+                }
                 assert!(
                     request.contains(&format!("Authorization: Bearer {TEST_USER_TOKEN}"))
                         || request.contains(&format!("authorization: Bearer {TEST_USER_TOKEN}")),
@@ -1309,19 +1354,19 @@ mod tests {
         let canonical_project = project.canonicalize().unwrap();
         let responses = vec![
             (
-                "/api/runners/config/check",
+                "tool:runner_config_check",
                 json!({"success":true,"output":{"valid":true,"current_generation":1,"restart_required":false}}),
             ),
             (
-                "/api/runners/config/reload",
+                "tool:runner_config_reload",
                 json!({"success":false,"output":{"execution_state":"not_started","error_code":"config_generation_conflict","current_generation":2},"error":"generation changed"}),
             ),
             (
-                "/api/runners/config/check",
+                "tool:runner_config_check",
                 json!({"success":true,"output":{"valid":true,"current_generation":2,"restart_required":false}}),
             ),
             (
-                "/api/runners/config/reload",
+                "tool:runner_config_reload",
                 json!({"success":true,"output":{"execution_state":"completed","valid":true,"current_generation":3,"restart_required":false}}),
             ),
             (
@@ -1350,8 +1395,14 @@ mod tests {
 
         let requests = server.join().unwrap();
         assert_eq!(requests.len(), 5);
-        assert_eq!(request_json(&requests[1])["expected_generation"], 1);
-        assert_eq!(request_json(&requests[3])["expected_generation"], 2);
+        assert_eq!(
+            request_json(&requests[1])["params"]["expected_generation"],
+            1
+        );
+        assert_eq!(
+            request_json(&requests[3])["params"]["expected_generation"],
+            2
+        );
         let parsed: toml::Value =
             toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
         let roots = parsed["policy"]["allowed_roots"].as_array().unwrap();
@@ -1370,15 +1421,15 @@ mod tests {
         let canonical_project = project.canonicalize().unwrap();
         let responses = vec![
             (
-                "/api/runners/config/check",
+                "tool:runner_config_check",
                 json!({"success":true,"output":{"valid":true,"current_generation":7,"restart_required":false}}),
             ),
             (
-                "/api/runners/config/reload",
+                "tool:runner_config_reload",
                 json!({"success":false,"output":{"execution_state":"outcome_unknown","error_code":"operation_indeterminate"},"error":"response lost"}),
             ),
             (
-                "/api/runners/config/check",
+                "tool:runner_config_check",
                 json!({"success":true,"output":{"valid":true,"current_generation":8,"restart_required":false}}),
             ),
             (
@@ -1412,11 +1463,11 @@ mod tests {
         assert_eq!(
             requests
                 .iter()
-                .filter(|request| request.starts_with("POST /api/runners/config/reload "))
+                .filter(|request| request_json(request)["tool"] == "runner_config_reload")
                 .count(),
             1
         );
-        assert!(requests[2].starts_with("POST /api/runners/config/check "));
+        assert_eq!(request_json(&requests[2])["tool"], "runner_config_check");
         assert!(requests[3].starts_with("POST /api/projects/resolve-or-register "));
     }
 
@@ -1427,15 +1478,15 @@ mod tests {
         std::fs::create_dir_all(&project).unwrap();
         let responses = vec![
             (
-                "/api/runners/config/check",
+                "tool:runner_config_check",
                 json!({"success":true,"output":{"valid":true,"current_generation":7,"restart_required":false}}),
             ),
             (
-                "/api/runners/config/reload",
+                "tool:runner_config_reload",
                 json!({"success":false,"output":{"execution_state":"outcome_unknown","error_code":"operation_indeterminate"},"error":"response lost"}),
             ),
             (
-                "/api/runners/config/check",
+                "tool:runner_config_check",
                 json!({"success":true,"output":{"valid":true,"current_generation":7,"restart_required":false}}),
             ),
         ];
@@ -1462,7 +1513,7 @@ mod tests {
         assert_eq!(
             requests
                 .iter()
-                .filter(|request| request.starts_with("POST /api/runners/config/reload "))
+                .filter(|request| request_json(request)["tool"] == "runner_config_reload")
                 .count(),
             1,
             "uncertain reload with unchanged generation must never be retried"
@@ -1487,7 +1538,7 @@ mod tests {
                 json!({"success":false,"output":{"execution_state":"outcome_unknown","error_code":"operation_indeterminate","state_changed":true},"error":"response lost"}),
             ),
             (
-                "/api/projects/list",
+                "tool:list_projects",
                 json!({"success":true,"output":{"projects":[{"id":"agent:client:demo","agent_project_id":"demo","client_id":"client","path":canonical_project.to_string_lossy()}]}}),
             ),
         ];

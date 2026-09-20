@@ -528,7 +528,7 @@ fn generic_agent_task_read_schema_never_exposes_attempt_fence_or_active_turn_tok
 fn goal_plan_activity_schema_is_bounded_soft_and_payload_free() {
     let schema = output_schema_for_tool("present_goal_plan");
     let plan = &schema["properties"]["output"]["properties"]["goal_plan"];
-    assert_eq!(plan["properties"]["version"]["const"], 1);
+    assert_eq!(plan["properties"]["version"]["const"], 2);
     assert!(plan["required"]
         .as_array()
         .unwrap()

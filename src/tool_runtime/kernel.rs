@@ -227,17 +227,23 @@ fn check_session_message_resolution_scope(
 }
 
 impl ToolRuntime {
-    pub(crate) async fn call_tool_with_context(
-        &self,
+    pub(crate) fn call_tool_with_context<'a>(
+        &'a self,
         request: ToolCallRequest,
-        context: ToolCallContext<'_>,
-    ) -> ToolCallOutcome {
-        self.call_tool_with_protocol_capabilities(
-            request,
-            context,
-            ToolProtocolCapabilities::default(),
-        )
-        .await
+        context: ToolCallContext<'a>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolCallOutcome> + Send + 'a>> {
+        // Keep the large canonical kernel/dispatch future off adapter thread
+        // stacks. Workspace-wide dependency feature unification can enlarge
+        // serde-backed state enough for ordinary REST/Host calls to overflow the
+        // default libtest/worker stack even though the selected tool is bounded.
+        Box::pin(async move {
+            self.call_tool_with_protocol_capabilities(
+                request,
+                context,
+                ToolProtocolCapabilities::default(),
+            )
+            .await
+        })
     }
 
     /// Test-only compatibility shim for Phase-2/3 fixtures that predate the
@@ -284,20 +290,24 @@ impl ToolRuntime {
         .await
     }
 
-    pub(crate) async fn call_tool_with_invocation_metadata(
-        &self,
+    pub(crate) fn call_tool_with_invocation_metadata<'a>(
+        &'a self,
         request: ToolCallRequest,
-        context: ToolCallContext<'_>,
+        context: ToolCallContext<'a>,
         invocation_metadata: ToolInvocationMetadata,
         capabilities: ToolProtocolCapabilities,
-    ) -> ToolCallOutcome {
-        let telemetry =
-            ModelErgonomicsTimer::start_with_arguments(&request.tool_name, &request.arguments);
-        let mut outcome = self
-            .call_tool_with_context_inner(request, context, invocation_metadata, capabilities)
-            .await;
-        outcome.model_ergonomics = telemetry.map(ModelErgonomicsTimer::finish);
-        outcome
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolCallOutcome> + Send + 'a>> {
+        // MCP enters the kernel here directly rather than through
+        // call_tool_with_context, so give it the same bounded adapter future.
+        Box::pin(async move {
+            let telemetry =
+                ModelErgonomicsTimer::start_with_arguments(&request.tool_name, &request.arguments);
+            let mut outcome = self
+                .call_tool_with_context_inner(request, context, invocation_metadata, capabilities)
+                .await;
+            outcome.model_ergonomics = telemetry.map(ModelErgonomicsTimer::finish);
+            outcome
+        })
     }
 
     async fn call_tool_with_context_inner(
@@ -333,7 +343,11 @@ impl ToolRuntime {
                 correlation: Default::default(),
             };
         }
-        if request.tool_name == "goal_plan_state" && !capabilities.goal_plan_app {
+        if matches!(
+            request.tool_name.as_str(),
+            "goal_plan_state" | "goal_plan_recheck_attention"
+        ) && !capabilities.goal_plan_app
+        {
             return ToolCallOutcome {
                 success: false,
                 result: None,

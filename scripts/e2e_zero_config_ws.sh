@@ -16,7 +16,7 @@ set -euo pipefail
 #   - Canonical read_files / git_status route to the agent.
 #   - Canonical run_job starts an async job on the agent and Job observation
 #     round-trip.
-#   - MCP initialize / tools/list / tools/call(list_projects) work.
+#   - MCP initialize / tools/list / call_runtime_tool(list_projects) work.
 #   - /openapi.json still exposes the expected GPT Actions operation set and
 #     omits legacy/admin paths.
 #
@@ -172,7 +172,24 @@ show_changes_call() {
 observe_one_job_call() {
     local job_id="$1"
     local tail_lines="${2:-40}"
-    runtime_tool_call "observe_jobs" "{\"items\":[{\"job_id\":\"${job_id}\"}],\"tail_lines\":${tail_lines}}"
+    local observation_token="${3:-}"
+    local wait_secs="${4:-}"
+    local wake_on="${5:-change}"
+    local params
+    params="$(python3 - "$job_id" "$tail_lines" "$observation_token" "$wait_secs" "$wake_on" <<'PY'
+import json, sys
+job_id, tail_lines, token, wait_secs, wake_on = sys.argv[1:]
+item = {"job_id": job_id}
+if token and token != "None":
+    item["after_observation_token"] = token
+params = {"items": [item], "tail_lines": int(tail_lines)}
+if wait_secs:
+    params["wait_secs"] = int(wait_secs)
+    params["wake_on"] = wake_on
+print(json.dumps(params))
+PY
+)"
+    runtime_tool_call "observe_jobs" "$params"
 }
 
 api_get() {
@@ -478,15 +495,15 @@ log "---- GPT Actions surface ----"
 body="$(api_post /api/runtime/status '{}')"
 assert_success "getRuntimeStatus" "$body" || true
 
-# listProjects — must include the agent-registered project id.
-body="$(api_post /api/projects/list '{}')"
-assert_success "listProjects" "$body" || true
+# list_projects — must include the agent-registered project id.
+body="$(runtime_tool_call "list_projects" '{}')"
+assert_success "list_projects" "$body" || true
 # Verify the runtime project id appears in the list.
 list_json="$(json_get "$body" output)"
 if echo "$list_json" | grep -q "\"$RUNTIME_PROJECT_ID\""; then
-    pass "listProjects contains $RUNTIME_PROJECT_ID"
+    pass "list_projects contains $RUNTIME_PROJECT_ID"
 else
-    fail "listProjects did not contain $RUNTIME_PROJECT_ID (got: ${list_json:0:200})"
+    fail "list_projects did not contain $RUNTIME_PROJECT_ID (got: ${list_json:0:200})"
 fi
 
 # git_status — routes to the agent through the canonical runtime tool path.
@@ -534,37 +551,32 @@ if [ -z "$JOB_ID" ] || [ "$JOB_ID" = "" ] || [ "$JOB_ID" = "None" ]; then
 else
     pass "run_job returned job_id=$JOB_ID"
 
-    # Poll job status until terminal.
-    JOB_TERMINAL=0
-    for _ in $(seq 1 40); do
-        check_deadline
-        body="$(observe_one_job_call "$JOB_ID" 1)"
-        status="$(json_get "$body" output.items.0.output.status)"
-        case "$status" in
-            completed|failed|stopped|lost)
-                JOB_TERMINAL=1
-                break
-                ;;
-            *)
-                sleep 1
-                ;;
-        esac
-    done
+    # Establish one observation baseline, then use the returned token for one
+    # bounded terminal wait instead of mechanically polling once per second.
+    body="$(observe_one_job_call "$JOB_ID" 50)"
+    assert_success "observe_jobs baseline" "$body" || true
+    status="$(json_get "$body" output.items.0.status)"
+    observation_token="$(json_get "$body" output.items.0.observation_token)"
+    case "$status" in
+        completed|failed|stopped|lost)
+            ;;
+        *)
+            if [ -n "$observation_token" ] && [ "$observation_token" != "None" ]; then
+                check_deadline
+                body="$(observe_one_job_call "$JOB_ID" 50 "$observation_token" 8 terminal)"
+                assert_success "observe_jobs terminal wait" "$body" || true
+                status="$(json_get "$body" output.items.0.status)"
+            fi
+            ;;
+    esac
 
-    if [ "$JOB_TERMINAL" -ne 1 ]; then
-        fail "job $JOB_ID did not reach a terminal status in time"
+    if [ "$status" = "completed" ]; then
+        pass "job $JOB_ID reached terminal status: $status"
     else
-        if [ "$status" = "completed" ]; then
-            pass "job $JOB_ID reached terminal status: $status"
-        else
-            fail "job $JOB_ID reached terminal status: $status (expected completed)"
-        fi
+        fail "job $JOB_ID terminal observation status=$status (expected completed)"
     fi
 
-    # observe_jobs — read bounded stdout for the job through the canonical observer.
-    body="$(observe_one_job_call "$JOB_ID" 50)"
-    assert_success "observe_jobs" "$body" || true
-    log_stdout="$(json_get "$body" output.items.0.output.stdout_tail)"
+    log_stdout="$(json_get "$body" output.items.0.stdout_tail)"
     if echo "$log_stdout" | grep -q "job-log-ok"; then
         pass "observe_jobs contains async job output"
     else
@@ -602,11 +614,7 @@ fi
 body="$(api_post /mcp '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}')"
 TOOLS_LIST_BODY="$body"
 tools_count="$(echo "$body" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(len(d.get("result",{}).get("tools",[])))' 2>/dev/null || echo 0)"
-if [ "${tools_count:-0}" -ge 21 ]; then
-    pass "MCP tools/list returned $tools_count Adaptive tools"
-else
-    fail "MCP tools/list returned too few Adaptive tools (got $tools_count; body: ${body:0:300})"
-fi
+log "MCP tools/list returned $tools_count Adaptive tools; validating explicit route invariants"
 # Extract exact names; descriptions/schemas may mention other tools.
 mcp_tool_names() {
     echo "$TOOLS_LIST_BODY" | python3 -c '
@@ -627,15 +635,16 @@ adaptive_present=1
 for tname in work_on_project runtime_status tool_manifest \
     search_project_texts read_files apply_text_edits run_process run_shell observe_jobs list_jobs \
     cargo_check cargo_test git_review_summary git_diff_hunks \
-    show_changes workspace_hygiene_check finish_coding_task call_runtime_tool; do
+    show_changes call_runtime_tool; do
     if ! mcp_tool_present "$tname"; then
         adaptive_present=0
         fail "MCP tools/list missing Adaptive direct tool $tname"
     fi
 done
-for tname in list_tools list_projects project_overview apply_patch run_script apply_unified_diff \
-    go_test validation_summary git_status goto_definition computer_observe computer_control computer_save_snapshot \
-    post_session_message coding_agent_start artifact_upload_begin; do
+for tname in list_tools list_projects workspace_hygiene_check finish_coding_task \
+    project_overview apply_patch run_script apply_unified_diff go_test validation_summary git_status \
+    goto_definition computer_observe computer_control computer_save_snapshot post_session_message \
+    coding_agent_start artifact_upload_begin; do
     if mcp_tool_present "$tname"; then
         adaptive_present=0
         fail "MCP tools/list must keep long-tail tool $tname behind call_runtime_tool"
@@ -651,20 +660,21 @@ if [ "$adaptive_present" = "1" ]; then
     pass "MCP tools/list exposes canonical Adaptive direct tools plus gateway"
 fi
 
-# tools/call list_projects — must return structuredContent with the agent project.
-body="$(api_post /mcp '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_projects","arguments":{}}}')"
+# list_projects is model-visible gateway-only. Invoke it through the exposed
+# call_runtime_tool MCP gateway and verify the agent project is visible.
+body="$(api_post /mcp '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"call_runtime_tool","arguments":{"tool":"list_projects","arguments":{}}}}')"
 sc="$(json_get "$body" result.structuredContent)"
 sc_success="$(json_get "$sc" success)"
 if [ "$sc_success" = "True" ]; then
-    pass "MCP tools/call(list_projects) returns structuredContent.success=true"
+    pass "MCP call_runtime_tool(list_projects) returns structuredContent.success=true"
 else
-    fail "MCP tools/call(list_projects) structuredContent not success (body: ${body:0:300})"
+    fail "MCP call_runtime_tool(list_projects) structuredContent not success (body: ${body:0:300})"
 fi
 sc_output="$(json_get "$sc" output)"
 if echo "$sc_output" | grep -q "$RUNTIME_PROJECT_ID"; then
-    pass "MCP list_projects sees agent project $RUNTIME_PROJECT_ID"
+    pass "MCP gateway list_projects sees agent project $RUNTIME_PROJECT_ID"
 else
-    fail "MCP list_projects did not see $RUNTIME_PROJECT_ID (got: ${sc_output:0:200})"
+    fail "MCP gateway list_projects did not see $RUNTIME_PROJECT_ID (got: ${sc_output:0:200})"
 fi
 
 # tools/call read_files — exercise the real bounded batch path through MCP and
@@ -775,10 +785,11 @@ fi
 # observe_jobs for the completed async shell job — bounded tail through the canonical observer.
 if [ -n "$JOB_ID" ]; then
     body="$(observe_one_job_call "$JOB_ID" 50)"
-    if [ "$(json_get "$body" success)" = "True" ] && [ "$(json_get "$body" output.items.0.success)" = "True" ]; then
-        pass "observe_jobs tail returns success"
+    if [ "$(json_get "$body" success)" = "True" ] && \
+       [ "$(json_get "$body" output.items.0.job_id)" = "$JOB_ID" ]; then
+        pass "observe_jobs tail returns current flattened Job projection"
     else
-        fail "observe_jobs tail did not return success (body: ${body:0:300})"
+        fail "observe_jobs tail did not return the current Job projection (body: ${body:0:300})"
     fi
 else
     fail "observe_jobs tail skipped: no JOB_ID available"
@@ -901,7 +912,7 @@ forbidden = ["/api/audit/sessions", "/api/audit/session", "/api/audit/stats",
              "/api/projects/apply_patch", "/api/projects/apply_patch_checked", "/api/projects/validate_patch",
              "/api/messages", "/api/files", "/api/desktop/task_op", "/api/desktop/task",
              "/api/shell/run", "/api/shell/job", "/api/shell/file",
-             "/mcp", "/openapi.json", "/console", "/console/app.js", "/console/styles.css"]
+             "/mcp", "/openapi.json", "/runtime", "/runtime/app.js", "/runtime/styles.css"]
 paths = set(schema.get("paths", {}).keys())
 for path in paths:
     if not path.startswith("/api/actions/"):
@@ -960,48 +971,47 @@ fi
 # 7b. MCP App console (Phase B) — public static entry + protected data API
 # ----------------------------------------------------------------------------
 
-log "---- MCP App console (/console) ----"
+log "---- Runtime Console (/runtime) ----"
 
-# The console HTML shell is public (no Bearer auth) and must reference the
-# bundled assets. It never embeds the token.
-console_html="$(curl -sS --max-time 10 "http://127.0.0.1:${PORT}/console" 2>/dev/null)"
-if echo "$console_html" | grep -q "WebCodex" && \
-   echo "$console_html" | grep -q "/console/app.js"; then
-    pass "GET /console serves public HTML shell"
+# The Runtime Console HTML shell is public (no Bearer auth) and must reference
+# the bundled assets. It never embeds the token.
+console_html="$(curl -sS --max-time 10 "http://127.0.0.1:${PORT}/runtime" 2>/dev/null)"
+if [[ "$console_html" == *"WebCodex"* && "$console_html" == *"/runtime/app.js"* ]]; then
+    pass "GET /runtime serves public HTML shell"
 else
-    fail "GET /console did not return expected HTML shell (got: ${console_html:0:200})"
+    fail "GET /runtime did not return expected HTML shell (got: ${console_html:0:200})"
 fi
 
 # The bundled JS is public. Assert on stable properties (non-empty resource,
 # correct content type, no token/credential material) rather than any specific
 # JavaScript implementation text, which may be refactored. The console page is
 # already verified above to reference the bundle and embed no token literal.
-console_js="$(curl -sS --max-time 10 "http://127.0.0.1:${PORT}/console/app.js")"
+console_js="$(curl -sS --max-time 10 "http://127.0.0.1:${PORT}/runtime/app.js")"
 js_bytes="${#console_js}"
-js_type="$(curl -sS -o /dev/null -w '%{content_type}' --max-time 10 "http://127.0.0.1:${PORT}/console/app.js")"
+js_type="$(curl -sS -o /dev/null -w '%{content_type}' --max-time 10 "http://127.0.0.1:${PORT}/runtime/app.js")"
 console_js_ok=1
 if [ "$js_bytes" -le 0 ]; then
     console_js_ok=0
-    fail "GET /console/app.js returned an empty resource"
+    fail "GET /runtime/app.js returned an empty resource"
 fi
 case "$js_type" in
     application/javascript*|text/javascript*|application/x-javascript*)
         ;;
     *)
         console_js_ok=0
-        fail "GET /console/app.js content-type '$js_type' is not a JS type"
+        fail "GET /runtime/app.js content-type '$js_type' is not a JS type"
         ;;
 esac
-if echo "$console_js" | grep -qi "WEBCODEX_TOKEN\|wc_agent_secret"; then
+if grep -qi "WEBCODEX_TOKEN\|wc_agent_secret" <<<"$console_js"; then
     console_js_ok=0
-    fail "GET /console/app.js contains token or credential material"
+    fail "GET /runtime/app.js contains token or credential material"
 fi
 if [ "$console_js_ok" = "1" ]; then
-    pass "GET /console/app.js returns a non-empty JS resource (${js_bytes} bytes) without token material"
+    pass "GET /runtime/app.js returns a non-empty JS resource (${js_bytes} bytes) without token material"
 fi
 
 # The bundle must never embed the token key in the DOM.
-if echo "$console_html" | grep -qi "webcodex_token"; then
+if grep -qi "webcodex_token" <<<"$console_html"; then
     fail "console HTML leaked WEBCODEX_TOKEN literal"
 else
     pass "console HTML does not leak WEBCODEX_TOKEN literal"
@@ -1137,7 +1147,7 @@ log "---- Deterministic workflow tool smoke ----"
 
 workflow_session_id=""
 body="$(api_post /api/tools/call "{\"tool\":\"work_on_project\",\"project\":\"$RUNTIME_PROJECT_ID\",\"instruction\":\"e2e deterministic coding task smoke\"}")"
-if workflow_session_id="$(python3 - "$body" <<'PY'
+if workflow_session_id="$(python3 - "$body" "$RUNTIME_PROJECT_ID" <<'PY'
 import json, sys
 
 try:
@@ -1146,6 +1156,7 @@ except Exception as exc:
     print(f"invalid JSON: {exc}", file=sys.stderr)
     sys.exit(1)
 
+expected_project = sys.argv[2]
 errors = []
 output = data.get("output") if isinstance(data, dict) else None
 output = output if isinstance(output, dict) else {}
@@ -1155,11 +1166,20 @@ if data.get("success") is not True:
     errors.append("success must be true")
 if not isinstance(session_id, str) or not session_id.startswith("wc_sess_"):
     errors.append("output.session_id must start with wc_sess_")
+if output.get("project") != expected_project:
+    errors.append("output.project must preserve the requested Project")
+if output.get("resolved_project") != expected_project:
+    errors.append("output.resolved_project must match the canonical Project")
+project_ref = output.get("project_ref")
+if project_ref is not None and (not isinstance(project_ref, str) or not project_ref):
+    errors.append("output.project_ref must be a non-empty string when present")
 if output.get("continuation") != "created":
     errors.append("output.continuation must be created")
-for field in ["workspace", "workflow", "instructions", "semantic_navigation"]:
+for field in ["workspace", "instructions", "semantic_navigation"]:
     if not isinstance(output.get(field), dict):
         errors.append(f"output.{field} must be an object")
+if "workflow" in output:
+    errors.append("compact work_on_project output must omit workflow guidance")
 if "readiness" in output and not isinstance(output.get("readiness"), dict):
     errors.append("output.readiness must be an object when present")
 for retired in [
@@ -1419,23 +1439,19 @@ if [ "$wpf_success" = "True" ] && [ "$wpf_created" = "True" ]; then
 else
     fail "callRuntimeTool(write_project_file) did not create probe (success=$wpf_success created=$wpf_created body=${body:0:300})"
 fi
-wpf_sha="$(json_get "$body" output.sha256)"
-if [ -n "$wpf_sha" ] && [ "$wpf_sha" != "None" ] && [ ${#wpf_sha} -eq 64 ]; then
-    pass "write_project_file returns 64-char sha256"
-else
-    fail "write_project_file missing sha256 (got: $wpf_sha)"
-fi
-
-# read_files confirms the probe content.
+# read_files confirms the probe content and returns the model-facing mutation
+# fence used by apply_text_edits.
 body="$(api_post /api/tools/call "{\"tool\":\"read_files\",\"params\":{\"project\":\"$RUNTIME_PROJECT_ID\",\"items\":[{\"path\":\"EDIT_PROBE.txt\"}]}}")"
-if echo "$(json_get "$body" output.items.0.output.text)" | grep -q "hello world"; then
-    pass "read_files confirms EDIT_PROBE.txt content"
+edit_probe_revision="$(json_get "$body" output.items.0.output.read_revision)"
+if echo "$(json_get "$body" output.items.0.output.text)" | grep -q "hello world" && \
+   [[ "$edit_probe_revision" =~ ^[0-9]+$ ]]; then
+    pass "read_files confirms EDIT_PROBE.txt content and returns read_revision"
 else
-    fail "read_files did not confirm probe content (got: ${body:0:200})"
+    fail "read_files did not return probe content/read_revision (revision=$edit_probe_revision body: ${body:0:200})"
 fi
 
 # apply_text_edits via callRuntimeTool — replace_exact "world" -> "rust" on
-# EDIT_PROBE.txt, guarded by the create-time sha256.
+# EDIT_PROBE.txt, guarded by the read_revision returned above.
 ate_body="$(python3 -c '
 import json, sys
 print(json.dumps({
@@ -1445,12 +1461,12 @@ print(json.dumps({
         "changes": [{
             "kind": "edit",
             "path": "EDIT_PROBE.txt",
-            "expected_sha256": sys.argv[2],
+            "expected_read_revision": int(sys.argv[2]),
             "edits": [{"kind": "replace_exact", "old_text": "world", "new_text": "rust"}]
         }]
     }
 }))
-' "$RUNTIME_PROJECT_ID" "$wpf_sha")"
+' "$RUNTIME_PROJECT_ID" "$edit_probe_revision")"
 body="$(api_post /api/tools/call "$ate_body")"
 ate_success="$(json_get "$body" success)"
 ate_changed="$(json_get "$body" output.changed)"
@@ -1460,16 +1476,18 @@ else
     fail "callRuntimeTool(apply_text_edits) did not edit probe (success=$ate_success changed=$ate_changed body=${body:0:300})"
 fi
 
-# read_files confirms the edited content.
+# read_files confirms the edited content and establishes the new current revision.
 body="$(api_post /api/tools/call "{\"tool\":\"read_files\",\"params\":{\"project\":\"$RUNTIME_PROJECT_ID\",\"items\":[{\"path\":\"EDIT_PROBE.txt\"}]}}")"
-if echo "$(json_get "$body" output.items.0.output.text)" | grep -q "hello rust"; then
-    pass "read_files confirms apply_text_edits edit"
+edit_probe_current_revision="$(json_get "$body" output.items.0.output.read_revision)"
+if echo "$(json_get "$body" output.items.0.output.text)" | grep -q "hello rust" && \
+   [[ "$edit_probe_current_revision" =~ ^[0-9]+$ ]]; then
+    pass "read_files confirms apply_text_edits edit and returns a fresh read_revision"
 else
-    fail "read_files did not confirm edit (got: ${body:0:200})"
+    fail "read_files did not confirm edit/current revision (got: ${body:0:200})"
 fi
 
-# apply_text_edits with a stale expected_sha256 (the create-time hash no longer
-# matches the edited file) must reject the whole batch WITHOUT modifying it.
+# Reusing the pre-edit read_revision is deterministic stale-fence failure. The
+# batch must fail closed, expose read_files recovery, and leave the file unchanged.
 ate_miss="$(python3 -c '
 import json, sys
 print(json.dumps({
@@ -1479,24 +1497,28 @@ print(json.dumps({
         "changes": [{
             "kind": "edit",
             "path": "EDIT_PROBE.txt",
-            "expected_sha256": sys.argv[2],
+            "expected_read_revision": int(sys.argv[2]),
             "edits": [{"kind": "replace_exact", "old_text": "rust", "new_text": "x"}]
         }]
     }
 }))
-' "$RUNTIME_PROJECT_ID" "$wpf_sha")"
+' "$RUNTIME_PROJECT_ID" "$edit_probe_revision")"
 body="$(api_post /api/tools/call "$ate_miss")"
 ate_error_kind="$(json_get "$body" output.error_kind)"
-if [ "$(json_get "$body" success)" = "False" ] && [ "$ate_error_kind" = "sha256_conflict" ]; then
-    pass "apply_text_edits(stale sha guard) fails with sha256_conflict"
+if [ "$(json_get "$body" success)" = "False" ] && \
+   [ "$ate_error_kind" = "stale_file_revision" ] && \
+   [ "$(json_get "$body" output.state_changed)" = "False" ] && \
+   [ "$(json_get "$body" output.recovery.tool)" = "read_files" ] && \
+   [ "$(json_get "$body" output.recovery.arguments.items.0.path)" = "EDIT_PROBE.txt" ]; then
+    pass "apply_text_edits(stale read_revision) fails closed with read_files recovery"
 else
-    fail "apply_text_edits(stale sha guard) did not report sha256_conflict (error_kind=$ate_error_kind body: ${body:0:200})"
+    fail "apply_text_edits(stale read_revision) contract mismatch (error_kind=$ate_error_kind body: ${body:0:300})"
 fi
 body="$(api_post /api/tools/call "{\"tool\":\"read_files\",\"params\":{\"project\":\"$RUNTIME_PROJECT_ID\",\"items\":[{\"path\":\"EDIT_PROBE.txt\"}]}}")"
 if echo "$(json_get "$body" output.items.0.output.text)" | grep -q "hello rust"; then
-    pass "apply_text_edits(stale sha guard) left file unchanged"
+    pass "apply_text_edits(stale read_revision) left file unchanged"
 else
-    fail "apply_text_edits(stale sha guard) modified the file (got: ${body:0:200})"
+    fail "apply_text_edits(stale read_revision) modified the file (got: ${body:0:200})"
 fi
 
 # Canonical runtime delete removes the probe so the worktree returns to clean.
@@ -1660,7 +1682,7 @@ fi
 # a custom GPT can complete a small edit → verify → cleanup cycle through the
 # recommended flow:
 #
-#   1. listProjects              — find the agent project
+#   1. list_projects              — find the agent project
 #   2. callRuntimeTool(read_files) — read a tracked file (README.md)
 #   3. callRuntimeTool(search_project_texts) — locate the target substring
 #   4. callRuntimeTool(show_changes) — confirm initial clean state
@@ -1681,28 +1703,28 @@ log "---- full-auto coding loop smoke (dedicated actions plus callRuntimeTool) -
 LOOP_MARKER_OLD="Smoke Project"
 LOOP_MARKER_NEW="Smoke Project [auto-loop]"
 
-# Step 1: listProjects — find the agent project (re-check as part of the loop).
-body="$(api_post /api/projects/list '{}')"
+# Step 1: list_projects — find the agent project (re-check as part of the loop).
+body="$(runtime_tool_call "list_projects" '{}')"
 loop_list_json="$(json_get "$body" output)"
 if echo "$loop_list_json" | grep -q "\"$RUNTIME_PROJECT_ID\""; then
-    pass "loop: listProjects found $RUNTIME_PROJECT_ID"
+    pass "loop: list_projects found $RUNTIME_PROJECT_ID"
 else
-    fail "loop: listProjects did not find $RUNTIME_PROJECT_ID (got: ${loop_list_json:0:200})"
+    fail "loop: list_projects did not find $RUNTIME_PROJECT_ID (got: ${loop_list_json:0:200})"
 fi
 
 # Step 2: read_files — read README.md.
 body="$(api_post /api/tools/call "{\"tool\":\"read_files\",\"params\":{\"project\":\"$RUNTIME_PROJECT_ID\",\"items\":[{\"path\":\"README.md\"}]}}")"
 loop_readme="$(json_get "$body" output.items.0.output.text)"
-loop_readme_sha="$(json_get "$body" output.items.0.output.sha256)"
+loop_readme_revision="$(json_get "$body" output.items.0.output.read_revision)"
 if echo "$loop_readme" | grep -q "$LOOP_MARKER_OLD"; then
     pass "loop: read_files sees README.md with target marker"
 else
     fail "loop: read_files did not find marker in README.md (got: ${loop_readme:0:120})"
 fi
-if [ -n "$loop_readme_sha" ] && [ "$loop_readme_sha" != "None" ] && [ ${#loop_readme_sha} -eq 64 ]; then
-    pass "loop: read_files returns README.md sha256 guard"
+if [[ "$loop_readme_revision" =~ ^[0-9]+$ ]]; then
+    pass "loop: read_files returns README.md read_revision guard"
 else
-    fail "loop: read_files did not return a valid README.md sha256 (got: $loop_readme_sha)"
+    fail "loop: read_files did not return a valid README.md read_revision (got: $loop_readme_revision)"
 fi
 
 # Step 3: search_project_texts — locate the target substring through the canonical
@@ -1724,7 +1746,7 @@ else
 fi
 
 # Step 5: callRuntimeTool(apply_text_edits) — small reversible edit on
-# README.md, guarded by the sha256 returned by Step 2 for this fixture.
+# README.md, guarded by the read_revision returned by Step 2 for this fixture.
 loop_replace_body="$(python3 -c '
 import json, sys
 print(json.dumps({
@@ -1734,7 +1756,7 @@ print(json.dumps({
         "changes": [{
             "kind": "edit",
             "path": "README.md",
-            "expected_sha256": sys.argv[2],
+            "expected_read_revision": int(sys.argv[2]),
             "edits": [{
                 "kind": "replace_exact",
                 "old_text": sys.argv[3],
@@ -1743,7 +1765,7 @@ print(json.dumps({
         }]
     }
 }))
-' "$RUNTIME_PROJECT_ID" "$loop_readme_sha" "$LOOP_MARKER_OLD" "$LOOP_MARKER_NEW")"
+' "$RUNTIME_PROJECT_ID" "$loop_readme_revision" "$LOOP_MARKER_OLD" "$LOOP_MARKER_NEW")"
 body="$(api_post /api/tools/call "$loop_replace_body")"
 if [ "$(json_get "$body" success)" = "True" ] && [ "$(json_get "$body" output.changed)" = "True" ]; then
     pass "loop: callRuntimeTool(apply_text_edits) edited README.md"
@@ -1847,7 +1869,7 @@ fi
 #
 #   1. callRuntimeTool(write_project_file) — create WRITE_ACTION_PROBE.txt
 #   2. callRuntimeTool(read_files)        — confirm content
-#   3. callRuntimeTool(write_project_file) — overwrite with an expected_sha256 guard
+#   3. callRuntimeTool(write_project_file) — overwrite with an expected_read_revision guard
 #   4. callRuntimeTool(read_files) — confirm overwritten content
 #   5. callRuntimeTool(delete_project_files) — cleanup the probe file
 #   6. run_job             — start `printf job-ok` asynchronously
@@ -1874,23 +1896,18 @@ if [ "$(json_get "$body" success)" = "True" ] && [ "$(json_get "$body" output.cr
 else
     fail "callRuntimeTool(write_project_file) did not create probe (body: ${body:0:300})"
 fi
-waf_sha="$(json_get "$body" output.sha256)"
-if [ -n "$waf_sha" ] && [ "$waf_sha" != "None" ] && [ ${#waf_sha} -eq 64 ]; then
-    pass "write_project_file returns 64-char sha256 for new file"
-else
-    fail "write_project_file missing sha256 (got: $waf_sha)"
-fi
-
-# Step 2: read_files — confirm content.
+# Step 2: read_files — confirm content and obtain the overwrite fence.
 body="$(api_post /api/tools/call "{\"tool\":\"read_files\",\"params\":{\"project\":\"$RUNTIME_PROJECT_ID\",\"items\":[{\"path\":\"WRITE_ACTION_PROBE.txt\"}]}}")"
-if echo "$(json_get "$body" output.items.0.output.text)" | grep -q "write-action-probe-v1"; then
-    pass "read_files confirms WRITE_ACTION_PROBE.txt content"
+waf_revision_v1="$(json_get "$body" output.items.0.output.read_revision)"
+if echo "$(json_get "$body" output.items.0.output.text)" | grep -q "write-action-probe-v1" && \
+   [[ "$waf_revision_v1" =~ ^[0-9]+$ ]]; then
+    pass "read_files confirms WRITE_ACTION_PROBE.txt content and returns read_revision"
 else
-    fail "read_files did not confirm probe content (got: ${body:0:200})"
+    fail "read_files did not confirm probe content/read_revision (revision=$waf_revision_v1 body: ${body:0:200})"
 fi
 
-# Step 3: callRuntimeTool(write_project_file) — overwrite with an expected_sha256
-# guard. Use the sha256 returned by the create step so the guard matches exactly.
+# Step 3: callRuntimeTool(write_project_file) — overwrite with the read revision
+# returned by Step 2. The model-facing contract never requires a digest copy.
 waf_overwrite_body="$(python3 -c '
 import json, sys
 print(json.dumps({
@@ -1900,23 +1917,55 @@ print(json.dumps({
         "path": "WRITE_ACTION_PROBE.txt",
         "content": "write-action-probe-v2\n",
         "overwrite": True,
-        "expected_sha256": sys.argv[2]
+        "expected_read_revision": int(sys.argv[2])
     }
 }))
-' "$RUNTIME_PROJECT_ID" "$waf_sha")"
+' "$RUNTIME_PROJECT_ID" "$waf_revision_v1")"
 body="$(api_post /api/tools/call "$waf_overwrite_body")"
 if [ "$(json_get "$body" success)" = "True" ]; then
-    pass "callRuntimeTool(write_project_file) overwrites with matching expected_sha256 guard"
+    pass "callRuntimeTool(write_project_file) overwrites with matching expected_read_revision"
 else
-    fail "callRuntimeTool(write_project_file) overwrite with guard failed (body: ${body:0:300})"
+    fail "callRuntimeTool(write_project_file) overwrite with read revision failed (body: ${body:0:300})"
 fi
 
-# Step 4: read_files — confirm overwritten content.
+# Step 4: read_files — confirm overwritten content and establish the new revision.
+body="$(api_post /api/tools/call "{\"tool\":\"read_files\",\"params\":{\"project\":\"$RUNTIME_PROJECT_ID\",\"items\":[{\"path\":\"WRITE_ACTION_PROBE.txt\"}]}}")"
+waf_revision_v2="$(json_get "$body" output.items.0.output.read_revision)"
+if echo "$(json_get "$body" output.items.0.output.text)" | grep -q "write-action-probe-v2" && \
+   [[ "$waf_revision_v2" =~ ^[0-9]+$ ]]; then
+    pass "read_files confirms overwritten content and fresh read_revision"
+else
+    fail "read_files did not confirm overwritten content/read_revision (body: ${body:0:200})"
+fi
+
+# The old v1 revision must now be stale and must not mutate the v2 content.
+waf_stale_body="$(python3 -c '
+import json, sys
+print(json.dumps({
+    "tool": "write_project_file",
+    "params": {
+        "project": sys.argv[1],
+        "path": "WRITE_ACTION_PROBE.txt",
+        "content": "write-action-probe-v3\n",
+        "overwrite": True,
+        "expected_read_revision": int(sys.argv[2])
+    }
+}))
+' "$RUNTIME_PROJECT_ID" "$waf_revision_v1")"
+body="$(api_post /api/tools/call "$waf_stale_body")"
+if [ "$(json_get "$body" success)" = "False" ] && \
+   [ "$(json_get "$body" output.error_kind)" = "stale_file_revision" ] && \
+   [ "$(json_get "$body" output.state_changed)" = "False" ] && \
+   [ "$(json_get "$body" output.recovery.tool)" = "read_files" ]; then
+    pass "write_project_file(stale read_revision) fails closed with read_files recovery"
+else
+    fail "write_project_file(stale read_revision) contract mismatch (body: ${body:0:300})"
+fi
 body="$(api_post /api/tools/call "{\"tool\":\"read_files\",\"params\":{\"project\":\"$RUNTIME_PROJECT_ID\",\"items\":[{\"path\":\"WRITE_ACTION_PROBE.txt\"}]}}")"
 if echo "$(json_get "$body" output.items.0.output.text)" | grep -q "write-action-probe-v2"; then
-    pass "read_files confirms overwritten content"
+    pass "write_project_file(stale read_revision) left file unchanged"
 else
-    fail "read_files did not confirm overwritten content (got: ${body:0:200})"
+    fail "write_project_file(stale read_revision) modified the file (body: ${body:0:200})"
 fi
 
 # Step 5: callRuntimeTool(delete_project_files) — cleanup the probe.
@@ -1945,33 +1994,34 @@ else
     fail "run_job did not start a job (success=$sjr_success body=${body:0:300})"
 fi
 
-# Step 7: observe_jobs — poll until completed.
-sj_done=0
-sj_poll_tries=0
-sj_status=""
-while [ "$sj_poll_tries" -lt 20 ]; do
-    check_deadline
-    body="$(observe_one_job_call "$SJ_JOB_ID" 1)"
-    sj_status="$(json_get "$body" output.items.0.output.status)"
-    case "$sj_status" in
-        completed|failed|stopped|lost)
-            sj_done=1
-            break
-            ;;
-    esac
-    sj_poll_tries=$((sj_poll_tries + 1))
-    sleep 1
-done
-if [ "$sj_done" = "1" ] && [ "$sj_status" = "completed" ]; then
+# Step 7: observe_jobs — establish a baseline and, when needed, use its token
+# for one bounded terminal wait.
+body="$(observe_one_job_call "$SJ_JOB_ID" 50)"
+assert_success "observe_jobs job baseline" "$body" || true
+sj_status="$(json_get "$body" output.items.0.status)"
+sj_token="$(json_get "$body" output.items.0.observation_token)"
+case "$sj_status" in
+    completed|failed|stopped|lost)
+        ;;
+    *)
+        if [ -n "$sj_token" ] && [ "$sj_token" != "None" ]; then
+            check_deadline
+            body="$(observe_one_job_call "$SJ_JOB_ID" 50 "$sj_token" 8 terminal)"
+            assert_success "observe_jobs job terminal wait" "$body" || true
+            sj_status="$(json_get "$body" output.items.0.status)"
+        fi
+        ;;
+esac
+if [ "$sj_status" = "completed" ]; then
     pass "observe_jobs confirms async job completed"
 else
-    fail "observe_jobs did not confirm completion (status=$sj_status tries=$sj_poll_tries body=${body:0:200})"
+    fail "observe_jobs did not confirm completion (status=$sj_status body=${body:0:200})"
 fi
 
-# Step 8: observe_jobs — confirm the bounded output contains job-ok.
-body="$(observe_one_job_call "$SJ_JOB_ID" 50)"
-sj_tail="$(json_get "$body" output.items.0.output.stdout_tail)"
-if [ "$(json_get "$body" output.items.0.success)" = "True" ] && echo "$sj_tail" | grep -q "job-ok"; then
+# Step 8: the same current projection carries the bounded stdout directly on
+# the item; there is no compatibility item.output wrapper.
+sj_tail="$(json_get "$body" output.items.0.stdout_tail)"
+if [ "$(json_get "$body" success)" = "True" ] && echo "$sj_tail" | grep -q "job-ok"; then
     pass "observe_jobs confirms async job output (job-ok)"
 else
     fail "observe_jobs did not show job-ok (stdout=$sj_tail body=${body:0:200})"

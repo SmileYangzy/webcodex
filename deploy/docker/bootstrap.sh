@@ -626,7 +626,7 @@ Installation receipt:    $RECEIPT_FILE
 
 Reverse-proxy upstream: http://127.0.0.1:$HOST_PORT
 Public URL:            $PUBLIC_URL
-Console:               $PUBLIC_URL/console
+Console:               $PUBLIC_URL/runtime
 OpenAPI:               $PUBLIC_URL/openapi.json
 MCP:                   $PUBLIC_URL/mcp
 

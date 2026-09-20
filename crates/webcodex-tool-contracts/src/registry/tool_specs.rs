@@ -27,14 +27,19 @@ fn operator_extension_specs(
         .collect()
 }
 
-/// Fixed read-only Goal Plan polling contract for MCP App Views. The canonical
-/// ToolDefinition remains globally ModelHidden; only a UI-capable MCP adapter may
-/// project this spec with app-only visibility.
+/// Goal Plan observation and narrow inactivity detector contract. Both tools
+/// remain globally ModelHidden; only the MCP Apps adapter may project them.
 pub fn goal_plan_app_tool_specs() -> Vec<ToolSpec> {
-    vec![tool_spec(
-        "goal_plan_state",
-        "App-only exact read of the current bounded Goal Plan projection. Requires explicit goal_id, re-authorizes the Goal on every call, grants no execution authority, and never mutates Goal state.",
-    )]
+    vec![
+        tool_spec(
+            "goal_plan_state",
+            "App-only exact read of the current bounded Goal Plan projection. Requires explicit goal_id, re-authorizes the Goal on every call, grants no execution authority, and never mutates Goal state.",
+        ),
+        tool_spec(
+            "goal_plan_recheck_attention",
+            "App-only authoritative Goal stall recheck from the current Window. Accepts only goal_id; recomputes activity and authorization, commits at most one durable attention/Wake per meaningful-work epoch, and never dispatches a Host turn directly.",
+        ),
+    ]
 }
 
 /// Read-only Work Result App primitives. Canonical definitions stay ModelHidden;

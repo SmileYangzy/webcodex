@@ -11,6 +11,9 @@ use crate::tool_runtime::{registered_tool_specs, ToolCall, ToolRuntime};
 use serde_json::json;
 use std::sync::Arc;
 
+#[path = "goal_workflow.rs"]
+mod workflow;
+
 fn runtime_with_goal_db() -> (tempfile::TempDir, Arc<crate::db::Database>, ToolRuntime) {
     let temp = tempfile::tempdir().unwrap();
     let db = Arc::new(crate::db::Database::open(&temp.path().join("goals.db")).unwrap());
@@ -336,7 +339,7 @@ fn goal_schemas_are_bounded_private_and_existing_coding_tools_do_not_accept_goal
     let present = spec("present_goal_plan");
     assert_eq!(present.input_schema["required"], json!(["goal_id"]));
     let plan = &present.output_schema["properties"]["output"]["properties"]["goal_plan"];
-    assert_eq!(plan["properties"]["version"]["const"], 1);
+    assert_eq!(plan["properties"]["version"]["const"], 2);
     assert_eq!(
         plan["properties"]["activity"]["additionalProperties"],
         false
@@ -346,7 +349,8 @@ fn goal_schemas_are_bounded_private_and_existing_coding_tools_do_not_accept_goal
         300_000
     );
     assert_eq!(plan["properties"]["title"]["maxLength"], 200);
-    assert_eq!(plan["properties"]["objective"]["maxLength"], 8192);
+    assert!(plan["properties"].get("objective").is_none());
+    assert_eq!(plan["properties"]["steps"]["maxItems"], 32);
     assert_eq!(
         plan["properties"]["controller_agent_id"]["anyOf"][0]["pattern"],
         "^wc_dagent_[A-Za-z0-9_-]{16}$"
@@ -376,12 +380,22 @@ fn goal_schemas_are_bounded_private_and_existing_coding_tools_do_not_accept_goal
         );
     }
     let app_specs = crate::tool_runtime::goal_plan_app_tool_specs();
-    assert_eq!(app_specs.len(), 1);
+    assert_eq!(app_specs.len(), 2);
     assert_eq!(app_specs[0].name, "goal_plan_state");
-    assert_eq!(app_specs[0].input_schema["required"], json!(["goal_id"]));
-    assert!(!registered_tool_names()
-        .iter()
-        .any(|name| name == "goal_plan_state"));
+    assert_eq!(app_specs[1].name, "goal_plan_recheck_attention");
+    for app_spec in &app_specs {
+        assert_eq!(app_spec.input_schema["required"], json!(["goal_id"]));
+        assert_eq!(
+            app_spec.input_schema["properties"]
+                .as_object()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(!registered_tool_names()
+            .iter()
+            .any(|name| name == &app_spec.name));
+    }
 
     let list_summary =
         &spec("list_goals").output_schema["properties"]["output"]["properties"]["goals"]["items"];
@@ -416,13 +430,15 @@ fn goal_schemas_are_bounded_private_and_existing_coding_tools_do_not_accept_goal
         "^wc_dagent_[A-Za-z0-9_-]{16}$"
     );
     let correlation = &detail["properties"]["correlations"]["items"];
+    let mut correlation_fields = correlation["properties"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    correlation_fields.sort();
     assert_eq!(
-        correlation["properties"]
-            .as_object()
-            .unwrap()
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>(),
+        correlation_fields,
         vec![
             "created_at_unix_ms".to_string(),
             "kind".to_string(),
@@ -757,7 +773,7 @@ async fn goal_plan_projection_is_exact_pure_revisioned_terminal_and_existence_hi
     let initial = runtime.present_goal_plan(Some(&bob), goal_id.clone()).await;
     assert!(initial.success, "{:?}", initial.output);
     let plan = &initial.output["goal_plan"];
-    assert_eq!(plan["version"], 1);
+    assert_eq!(plan["version"], 2);
     assert_eq!(plan["goal_id"], goal_id);
     assert_eq!(plan["lifecycle"], "active");
     assert_eq!(plan["revision"], 1);
@@ -781,7 +797,12 @@ async fn goal_plan_projection_is_exact_pure_revisioned_terminal_and_existence_hi
             "controller_agent_id",
             "goal_id",
             "lifecycle",
-            "objective",
+            "total_step_count",
+            "completed_step_count",
+            "current_step_id",
+            "steps",
+            "progress_summary",
+            "checkpoint_at_unix_ms",
             "revision",
             "terminal_at_unix_ms",
             "title",
@@ -829,8 +850,9 @@ async fn goal_plan_projection_is_exact_pure_revisioned_terminal_and_existence_hi
         after_update.output["goal_plan"]["controller_agent_id"],
         controller_id
     );
+    assert!(after_update.output["goal_plan"].get("objective").is_none());
     assert_eq!(
-        after_update.output["goal_plan"]["objective"],
+        runtime.get_goal(Some(&bob), goal_id.clone()).output["goal"]["objective"],
         "Updated durable plan objective"
     );
 
@@ -1123,7 +1145,8 @@ async fn goal_activity_respects_principal_project_visibility_and_runtime_read_sc
     let projected = runtime
         .goal_plan_state_at(Some(&alice), goal_id.clone(), now)
         .await;
-    assert_eq!(goal_activity(&projected)["state"], "attention_needed");
+    assert_eq!(goal_activity(&projected)["state"], "unobserved");
+    assert_eq!(goal_activity(&projected)["coverage_partial"], true);
     assert_eq!(goal_activity(&projected)["last_seen_at_ms"], old + 1);
     assert_eq!(
         goal_activity(&projected)["last_meaningful_activity_at_ms"],
@@ -1516,6 +1539,16 @@ async fn workflow_session_link_is_identity_only_and_finish_coding_task_does_not_
     .await;
     let finish = task.await.unwrap();
     assert!(finish.success, "{:?}", finish.error);
+    assert_eq!(finish.output["goal_follow_up"]["available"], true);
+    assert_eq!(
+        finish.output["goal_follow_up"]["goals"][0]["goal_id"],
+        goal_id
+    );
+    assert_eq!(finish.output["goal_follow_up"]["goals"][0]["revision"], 2);
+    assert_eq!(
+        finish.output["goal_follow_up"]["goals"][0]["next_action"],
+        "update_goal"
+    );
 
     let goal = runtime.get_goal(Some(&auth), goal_id);
     assert!(goal.success, "{:?}", goal.output);

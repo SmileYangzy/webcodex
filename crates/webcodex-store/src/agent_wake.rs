@@ -1,4 +1,4 @@
-use super::agent_attention::require_agent_attention_event_for_wake;
+use super::agent_attention::{require_agent_attention_event_for_wake, AgentAttentionSource};
 use super::agent_task::{
     replace_agent_task_attempt_controller_in_transaction, AGENT_TASK_ENDPOINT_DISPATCH_GRACE_MS,
     AGENT_TASK_ENDPOINT_TAKEOVER_LEASE_MS,
@@ -212,6 +212,8 @@ pub struct AgentWakeBootstrapSummary {
     pub task_id: Option<String>,
     pub task_attempt_id: Option<String>,
     pub event_id: Option<String>,
+    pub attention_kind: Option<String>,
+    pub workflow_session_id: Option<String>,
     pub goal_id: Option<String>,
     pub wait_id: Option<String>,
     pub wait_match_count: Option<i64>,
@@ -2061,13 +2063,17 @@ impl Database {
                     inbox_high_watermark: wake.inbox_high_watermark,
                     task_id: attention_event
                         .as_ref()
-                        .map(|event| event.task_id.clone())
+                        .and_then(|event| event.task_id().map(str::to_string))
                         .or(wake.source_task_id),
                     task_attempt_id: attention_event
                         .as_ref()
-                        .map(|event| event.task_attempt_id.clone())
+                        .and_then(|event| event.task_attempt_id().map(str::to_string))
                         .or(wake.source_task_attempt_id),
                     event_id: attention_event.as_ref().map(|event| event.event_id.clone()),
+                    attention_kind: attention_event.as_ref().map(|event| event.kind.clone()),
+                    workflow_session_id: attention_event
+                        .as_ref()
+                        .and_then(|event| event.workflow_session_id().map(str::to_string)),
                     goal_id: attention_event.map(|event| event.goal_id),
                     wait_id: wait_snapshot
                         .as_ref()
@@ -3234,7 +3240,8 @@ fn wake_envelope(
             wake.source_event_id.as_deref(),
             &wake.target_agent_id,
         )?;
-        let resume_hint = format!(
+        let resume_hint = match &event.source {
+            AgentAttentionSource::AgentTaskTerminal { task_id, task_attempt_id, terminal_task_state } => format!(
             "WebCodex Goal attention continuation.\n\nagent_id={}\nendpoint_id={}\ncontroller_generation={}\nwake_id={}\nconsume_token={}\nevent_id={}\ngoal_id={}\ntask_id={}\nattempt_id={}\nterminal_task_state={}\n\nBootstrap this exact Wake with bootstrap_agent_conversation, then consume it immediately with consume_agent_wake. Call get_goal(goal_id) and read_agent_task(task_id), then make an explicit next Goal decision from authoritative state. Never rerun the terminal Task or reopen a terminal Goal.\n",
             wake.target_agent_id,
             endpoint_id,
@@ -3243,10 +3250,16 @@ fn wake_envelope(
             consume_token,
             event.event_id,
             event.goal_id,
-            event.task_id,
-            event.task_attempt_id,
-            event.terminal_task_state.as_str(),
-        );
+            task_id,
+            task_attempt_id,
+            terminal_task_state.as_str(),
+        ),
+            AgentAttentionSource::GoalWorkflowStalled { workflow_session_id, .. } => format!(
+                "WebCodex Goal workflow stall continuation.\nagent_id={}\nendpoint_id={}\ncontroller_generation={}\nwake_id={}\nconsume_token={}\ngoal_id={}\nsession_id={}\n\nBootstrap this exact Wake with bootstrap_agent_conversation; immediately consume_agent_wake. Then get_goal(goal_id) and session_handoff_summary(session_id) for the exact correlated Workflow Session. Continue the latest checkpoint/current step using current authorized Job/Project state as needed. A vanished turn does not prove failure: never repeat an uncertain effect. Checkpoint with checkpoint_goal as work progresses; fresh verification/review precedes explicit update_goal completion. Stop if terminal or its controller changed.\n",
+                wake.target_agent_id, endpoint_id, controller_generation, wake.wake_id,
+                consume_token, event.goal_id, workflow_session_id,
+            ),
+        };
         (0, 0, resume_hint)
     } else if wake.trigger_kind == WAKE_TRIGGER_AGENT_WAIT_EVENTS {
         let wait = require_agent_wait_for_wake(
