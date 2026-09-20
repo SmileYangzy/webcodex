@@ -98,15 +98,18 @@ impl ToolRuntime {
         limit: usize,
         auth: Option<&AuthContext>,
     ) -> Value {
-        self.materialize_session_validation_job_terminals(summary, auth)
+        let retained = self
+            .sessions
+            .retained_evidence_summary(&summary.session_id)
+            .filter(|retained| retained.project == summary.project)
+            .unwrap_or_else(|| summary.clone());
+        self.materialize_session_validation_job_terminals(&retained, auth)
             .await;
         let refreshed = self
             .sessions
-            .summary(
-                &summary.session_id,
-                Some(PUBLIC_VALIDATION_SESSION_EVENT_LIMIT),
-            )
-            .unwrap_or_else(|| summary.clone());
+            .retained_evidence_summary(&summary.session_id)
+            .filter(|refreshed| refreshed.project == summary.project)
+            .unwrap_or(retained);
         let mut events = refreshed.events.clone();
         self.append_terminal_generic_job_validation_events(&refreshed, &mut events, auth)
             .await;
@@ -152,7 +155,11 @@ impl ToolRuntime {
         &self,
         summary: &SessionSummary,
     ) -> SessionSummary {
-        let mut refreshed = summary.clone();
+        let mut refreshed = self
+            .sessions
+            .retained_evidence_summary(&summary.session_id)
+            .filter(|retained| retained.project == summary.project)
+            .unwrap_or_else(|| summary.clone());
         self.refresh_validation_source_states(&mut refreshed.events);
         refreshed
     }

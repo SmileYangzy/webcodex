@@ -1250,7 +1250,7 @@ async fn public_failure_expectation_preserves_raw_cargo_failure_as_expected_vali
 }
 
 #[tokio::test]
-async fn closeout_boundary_gap_keeps_historical_validation_visible_without_current_proof() {
+async fn closeout_uses_retained_attempt_beyond_public_summary_window() {
     let tmp = tempfile::tempdir().unwrap();
     let runtime = test_runtime();
     let project =
@@ -1311,15 +1311,15 @@ async fn closeout_boundary_gap_keeps_historical_validation_visible_without_curre
     assert_eq!(handoff.output["validation"]["events_total"], 1);
     assert_eq!(
         handoff.output["validation"]["current_evidence"]["status"],
-        "unknown"
+        "unproven"
     );
     assert_eq!(
         handoff.output["validation"]["current_evidence"]["reason"],
-        "attempt_boundary_unavailable"
+        "validation_source_unproven"
     );
     assert_eq!(
         handoff.output["validation"]["current_evidence"]["events_total"],
-        0
+        1
     );
 
     let finish = finish_coding_task_summary_only_no_hygiene(
@@ -1338,12 +1338,12 @@ async fn closeout_boundary_gap_keeps_historical_validation_visible_without_curre
         finish.output["validation"]["reason"],
         "no_validation_tool_invoked"
     );
-    assert_eq!(finish.output["validation"]["current_status"], "unknown");
+    assert_eq!(finish.output["validation"]["current_status"], "unproven");
     assert_eq!(
         finish.output["validation"]["current_reason"],
-        "attempt_boundary_unavailable"
+        "validation_source_unproven"
     );
-    assert_eq!(finish.output["validation"]["current_validation_events"], 0);
+    assert_eq!(finish.output["validation"]["current_validation_events"], 1);
     assert_eq!(finish.output["validation"]["current_successes"], 0);
 }
 

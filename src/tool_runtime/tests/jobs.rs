@@ -154,6 +154,104 @@ fn compact_validation_job_summary_reobserves_missing_crossed_and_restart_fences(
 }
 
 #[tokio::test]
+async fn validation_source_reconciles_only_authorized_proven_terminal_jobs() {
+    let runtime = test_runtime();
+    let auth = shared_key_auth_context("validation-source-owner");
+    let other_auth = shared_key_auth_context("validation-source-other");
+    let client_id = "validation-source-jobs";
+    let project_name = "demo";
+    let project = format!("agent:{client_id}:{project_name}");
+    register_job_agent_for_auth(&runtime, client_id, project_name, &auth).await;
+
+    let completed_job = start_agent_runtime_job(&runtime, client_id, project_name, &auth).await;
+    assert_eq!(
+        runtime.validation_sources.pending_jobs(&project),
+        [completed_job.clone()]
+    );
+    runtime
+        .reconcile_validation_source_jobs(&project, Some(&other_auth))
+        .await;
+    assert_eq!(
+        runtime.validation_sources.pending_jobs(&project),
+        [completed_job.clone()]
+    );
+    runtime
+        .reconcile_validation_source_jobs(&project, Some(&auth))
+        .await;
+    assert_eq!(
+        runtime.validation_sources.pending_jobs(&project),
+        [completed_job.clone()]
+    );
+
+    let completed_request = wait_for_runner_request_for_instance(&runtime, client_id, "inst").await;
+    assert_eq!(
+        completed_request.job_id.as_deref(),
+        Some(completed_job.as_str())
+    );
+    let before_completion = runtime.validation_sources.capture(&project).unwrap();
+    update_agent_shell_job(
+        &runtime,
+        client_id,
+        &completed_request.request_id,
+        &completed_job,
+        "completed",
+        Some(ShellCommandExecutionState::Completed),
+        Some(0),
+        None,
+        None,
+        None,
+        true,
+    )
+    .await;
+    runtime
+        .reconcile_validation_source_jobs(&project, Some(&auth))
+        .await;
+    assert!(runtime.validation_sources.pending_jobs(&project).is_empty());
+    let settled = runtime.validation_sources.capture(&project).unwrap();
+    assert!(settled.quiescent);
+    assert!(settled.generation > before_completion.generation);
+    assert_eq!(
+        runtime
+            .validation_sources
+            .observe(&project, Some(&settled))
+            .freshness,
+        webcodex_core::validation_source::ValidationFreshness::Unproven
+    );
+
+    let legacy_terminal_job =
+        start_agent_runtime_job(&runtime, client_id, project_name, &auth).await;
+    let legacy_request = wait_for_runner_request_for_instance(&runtime, client_id, "inst").await;
+    update_agent_shell_job(
+        &runtime,
+        client_id,
+        &legacy_request.request_id,
+        &legacy_terminal_job,
+        "completed",
+        None,
+        Some(0),
+        None,
+        None,
+        None,
+        true,
+    )
+    .await;
+    runtime
+        .reconcile_validation_source_jobs(&project, Some(&auth))
+        .await;
+    assert_eq!(
+        runtime.validation_sources.pending_jobs(&project),
+        [legacy_terminal_job]
+    );
+    assert!(
+        !runtime
+            .validation_sources
+            .capture(&project)
+            .unwrap()
+            .quiescent
+    );
+}
+
+#[tokio::test]
 async fn run_shell_session_events_record_exit_without_stdio_bodies() {
     let runtime = runtime_with_agent_project("telemetry-shell");
     let caps = RunnerCapabilities {

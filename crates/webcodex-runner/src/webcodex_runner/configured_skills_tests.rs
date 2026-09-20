@@ -21,6 +21,66 @@ fn configured_skill_scan_triggers_are_closed_and_identity_free() {
         ConfiguredSkillScanTrigger::ExactReadResolution.as_str(),
         "exact_read_resolution"
     );
+    assert_eq!(
+        ConfiguredSkillScanTrigger::ExactNameResolution.as_str(),
+        "exact_name_resolution"
+    );
+}
+
+#[test]
+fn exact_name_resolution_bypasses_catalog_projection_but_preserves_bounds() {
+    let temp = tempfile::tempdir().unwrap();
+    for index in 0..MAX_CONFIGURED_SKILL_PACKAGES {
+        write_skill(
+            temp.path(),
+            &format!("a-filler-{index:03}"),
+            &format!("filler-{index:03}"),
+            "body",
+        );
+    }
+    write_skill(temp.path(), "z-git-workflow", "git-workflow", "target");
+    let config = SkillsConfig {
+        roots: vec![temp.path().to_path_buf()],
+    };
+
+    let catalog = discover(&config).unwrap();
+    assert!(catalog.discovery_truncated);
+    assert!(catalog
+        .skills
+        .iter()
+        .all(|skill| skill.descriptor.name() != "git-workflow"));
+
+    let exact = resolve_live_skills_by_name(&config, "GIT-WORKFLOW").unwrap();
+    assert!(!exact.discovery_truncated);
+    assert_eq!(exact.skills.len(), 1);
+    assert_eq!(exact.skills[0].descriptor.name(), "git-workflow");
+
+    write_skill(
+        temp.path(),
+        "z-git-workflow-duplicate",
+        "Git-Workflow",
+        "duplicate",
+    );
+    let duplicate = resolve_live_skills_by_name(&config, "git-workflow").unwrap();
+    assert!(!duplicate.discovery_truncated);
+    assert_eq!(duplicate.skills.len(), 2);
+}
+
+#[test]
+fn exact_name_resolution_rejects_a_real_root_scan_limit() {
+    let temp = tempfile::tempdir().unwrap();
+    write_skill(temp.path(), "a-target", "git-workflow", "target");
+    for index in 0..MAX_CONFIGURED_SKILL_ROOT_SCAN_ENTRIES {
+        fs::create_dir_all(temp.path().join(format!("z-filler-{index:04}"))).unwrap();
+    }
+    let exact = resolve_live_skills_by_name(
+        &SkillsConfig {
+            roots: vec![temp.path().to_path_buf()],
+        },
+        "git-workflow",
+    )
+    .unwrap();
+    assert!(exact.discovery_truncated);
 }
 
 #[test]

@@ -8,7 +8,9 @@ use crate::runner_protocol::{
     PROCESS_ARGV_MAX_BYTES, PROCESS_ARG_MAX_BYTES, PROCESS_ARG_MAX_COUNT,
 };
 use crate::runtime_contract::{MAX_SKILL_READ_LINES, MAX_SKILL_RESOURCE_PATH_CHARS};
-use crate::skill_metadata::{MAX_SKILL_DESCRIPTION_CHARS, MAX_SKILL_NAME_CHARS};
+use crate::skill_metadata::{
+    skill_name_eq, valid_skill_name, MAX_SKILL_DESCRIPTION_CHARS, MAX_SKILL_NAME_CHARS,
+};
 use crate::skill_store::{
     valid_lower_sha256, valid_package_revision, valid_skill_key, MAX_SKILL_STORE_VERSIONS_LIMIT,
 };
@@ -22,6 +24,7 @@ pub const RUNNER_SKILL_RESPONSE_MAX_BYTES: usize = 512 * 1024;
 pub const RUNNER_SKILL_EXECUTION_REQUEST_KIND: &str = "skill_resource_execution";
 pub const RUNNER_SKILL_EXECUTION_REQUEST_MAX_BYTES: usize = 128 * 1024;
 pub const MAX_RUNNER_SKILLS: usize = 512;
+pub const MAX_RUNNER_SKILL_NAME_MATCHES: usize = 2;
 pub const MAX_RUNNER_SKILL_DIAGNOSTICS: usize = 8;
 pub const MAX_RUNNER_SKILL_READ_TEXT_BYTES: usize = 48 * 1024;
 
@@ -198,6 +201,9 @@ pub enum RunnerSkillRequest {
     Resolve {
         skill_id: String,
     },
+    ResolveName {
+        name: String,
+    },
     Read {
         skill_id: String,
         expected_source: RunnerSkillSource,
@@ -267,6 +273,13 @@ impl RunnerSkillRequest {
                     Ok(())
                 } else {
                     Err("invalid Runner Skill id")
+                }
+            }
+            Self::ResolveName { name } => {
+                if valid_skill_name(name) {
+                    Ok(())
+                } else {
+                    Err("invalid Runner Skill name")
                 }
             }
             Self::Read {
@@ -367,6 +380,35 @@ pub struct RunnerSkillResolveResponse {
     pub format: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skill: Option<RunnerSkillDescriptor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunnerSkillNameResolveResponse {
+    pub format: String,
+    pub skills: Vec<RunnerSkillDescriptor>,
+    pub discovery_truncated: bool,
+}
+
+impl RunnerSkillNameResolveResponse {
+    pub fn validate_for_request(&self, name: &str) -> Result<(), &'static str> {
+        if self.format != RUNNER_SKILL_RESPONSE_FORMAT
+            || self.skills.len() > MAX_RUNNER_SKILL_NAME_MATCHES
+        {
+            return Err("invalid Runner Skill name resolve response");
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for skill in &self.skills {
+            skill.validate()?;
+            if !skill_name_eq(skill.name(), name) {
+                return Err("Runner Skill name resolve mismatch");
+            }
+            if !seen.insert(skill.skill_id()) {
+                return Err("duplicate Runner Skill id");
+            }
+        }
+        Ok(())
+    }
 }
 
 impl RunnerSkillResolveResponse {
@@ -508,6 +550,9 @@ mod tests {
             RunnerSkillRequest::Resolve {
                 skill_id: configured_id.clone(),
             },
+            RunnerSkillRequest::ResolveName {
+                name: "Configured".to_string(),
+            },
             RunnerSkillRequest::Read {
                 skill_id: configured_id,
                 expected_source: RunnerSkillSource::Configured,
@@ -563,9 +608,9 @@ mod tests {
             assert_eq!(decoded, request);
             assert_eq!(
                 decoded.requires_management_capability(),
-                (3..=6).contains(&index)
+                (4..=7).contains(&index)
             );
-            assert_eq!(decoded.is_mutation(), (4..=6).contains(&index));
+            assert_eq!(decoded.is_mutation(), (5..=7).contains(&index));
         }
     }
 
@@ -679,6 +724,14 @@ mod tests {
         assert!(resolve
             .validate_for_request(configured().skill_id())
             .is_err());
+
+        let by_name = RunnerSkillNameResolveResponse {
+            format: RUNNER_SKILL_RESPONSE_FORMAT.to_string(),
+            skills: vec![configured()],
+            discovery_truncated: false,
+        };
+        by_name.validate_for_request("CONFIGURED").unwrap();
+        assert!(by_name.validate_for_request("managed").is_err());
     }
 
     #[test]

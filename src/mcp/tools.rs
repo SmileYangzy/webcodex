@@ -469,6 +469,7 @@ pub(super) fn add_stateless_workflow_recorder_metadata(payload: &mut Value) {
         {
             continue;
         }
+        let is_plugin_tool = tool_name == Some(crate::plugin_gateway::PLUGIN_TOOL_NAME);
         let Some(properties) = tool
             .pointer_mut("/inputSchema/properties")
             .and_then(Value::as_object_mut)
@@ -484,26 +485,29 @@ pub(super) fn add_stateless_workflow_recorder_metadata(payload: &mut Value) {
             }),
         );
         insert_stateless_collaboration_ack_property(properties);
-        properties.insert(
-            crate::tool_runtime::sessions::TOOL_CALL_SESSION_MESSAGE_RESOLUTION_FIELD.to_string(),
-            json!({
-                "type": "object",
-                "description": "After handling one non-todo message in the explicit recording Session, attach its id and bounded resolution text here to resolve it on the same WebCodex call. Any ACK-required Session message also needs request-scoped ACK. Applies only to that exact recording Session; removed before concrete parsing; does not apply to Peer messages and does not predict call success. Todos use the atomic completion path.",
-                "properties": {
-                    "message_id": {
-                        "type": "string",
-                        "pattern": "^wc_msg_([A-Za-z0-9_-]{16}|[0-9a-f]{32})$"
+        if !is_plugin_tool {
+            properties.insert(
+                crate::tool_runtime::sessions::TOOL_CALL_SESSION_MESSAGE_RESOLUTION_FIELD
+                    .to_string(),
+                json!({
+                    "type": "object",
+                    "description": "After handling one non-todo message in the explicit recording Session, attach its id and bounded resolution text here to resolve it on the same WebCodex call. Any ACK-required Session message also needs request-scoped ACK. Applies only to that exact recording Session; removed before concrete parsing; does not apply to Peer messages and does not predict call success. Todos use the atomic completion path.",
+                    "properties": {
+                        "message_id": {
+                            "type": "string",
+                            "pattern": "^wc_msg_([A-Za-z0-9_-]{16}|[0-9a-f]{32})$"
+                        },
+                        "resolution": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": crate::tool_runtime::sessions::MAX_MESSAGE_RESOLUTION_CHARS
+                        }
                     },
-                    "resolution": {
-                        "type": "string",
-                        "minLength": 1,
-                        "maxLength": crate::tool_runtime::sessions::MAX_MESSAGE_RESOLUTION_CHARS
-                    }
-                },
-                "required": ["message_id", "resolution"],
-                "additionalProperties": false
-            }),
-        );
+                    "required": ["message_id", "resolution"],
+                    "additionalProperties": false
+                }),
+            );
+        }
         properties.insert(
                 crate::tool_runtime::context_projection::TOOL_CALL_CONTEXT_REQUEST_FIELD
                     .to_string(),
@@ -520,6 +524,41 @@ pub(super) fn add_stateless_workflow_recorder_metadata(payload: &mut Value) {
                 }),
             );
         add_stateless_context_projection_output_schema(tool);
+    }
+}
+
+pub(crate) fn merge_context_projection_into_mcp_call_result(
+    call_result: &mut Value,
+    context_projection: Value,
+) {
+    let Some(call_result) = call_result.as_object_mut() else {
+        return;
+    };
+    let structured = call_result
+        .entry("structuredContent".to_string())
+        .or_insert_with(|| json!({}));
+    if !structured.is_object() {
+        let provider_structured_content = std::mem::replace(structured, json!({}));
+        *structured = json!({
+            "providerStructuredContent": provider_structured_content,
+            "context_projection": context_projection,
+        });
+        return;
+    }
+
+    let structured = structured
+        .as_object_mut()
+        .expect("structuredContent was normalized to an object");
+    let standard_tool_result = structured.get("success").is_some_and(Value::is_boolean)
+        && structured.get("output").is_some_and(Value::is_object);
+    if standard_tool_result {
+        structured
+            .get_mut("output")
+            .and_then(Value::as_object_mut)
+            .expect("standard ToolResult output must be an object")
+            .insert("context_projection".to_string(), context_projection);
+    } else {
+        structured.insert("context_projection".to_string(), context_projection);
     }
 }
 
@@ -1606,6 +1645,20 @@ pub(super) async fn handle_call(
         ));
     }
     if params.name == crate::plugin_gateway::PLUGIN_TOOL_NAME {
+        let context_request = if stateless_2026 {
+            match strip_stateless_context_request(&mut params.arguments) {
+                Ok(keys) => keys,
+                Err(message) => {
+                    if let Some(lc) = lifecycle.as_deref() {
+                        lc.dispatch_failed("invalid_arguments");
+                        lc.dispatch_finished(false, Some(false), "invalid_arguments");
+                    }
+                    return McpOutcome::BadRequest(rpc_error(id, -32602, message));
+                }
+            }
+        } else {
+            Vec::new()
+        };
         let recording_session_id = match strip_recording_session_id(&mut params.arguments) {
             Ok(session_id) => session_id,
             Err(message) => {
@@ -1659,19 +1712,51 @@ pub(super) async fn handle_call(
                     lc.dispatch_failed("specialized_governance_denied");
                     lc.dispatch_finished(true, Some(false), "tool_error");
                 }
-                let mut result = result;
                 let project = recording_session_id
                     .as_deref()
                     .and_then(|session_id| runtime.sessions.session_project(session_id).flatten());
-                runtime.add_peer_collaboration_projection(
+                let mut result = mcp_runtime_tool_result_fallback(result, result_presentation);
+                if !context_request.is_empty() {
+                    let resolved_project = match project.as_deref() {
+                        Some(project) => runtime
+                            .resolve_project_input_for_auth(project, auth)
+                            .await
+                            .ok(),
+                        None => None,
+                    };
+                    let mut projection = ToolResult::ok(json!({}));
+                    runtime
+                        .add_requested_context_projection_with_guidance(
+                            &mut projection,
+                            &context_request,
+                            resolved_project.as_ref(),
+                            auth,
+                            crate::tool_runtime::context_projection::ContextMaterialCapabilities {
+                                skill_runtime: true,
+                                memory_surface: true,
+                            },
+                            crate::tool_runtime::tool_inputs::CodingGuidanceProfile::default(),
+                            window,
+                        )
+                        .await;
+                    if let Some(context_projection) = projection
+                        .output
+                        .as_object_mut()
+                        .and_then(|output| output.remove("context_projection"))
+                    {
+                        merge_context_projection_into_mcp_call_result(
+                            &mut result,
+                            context_projection,
+                        );
+                    }
+                }
+                runtime.add_peer_collaboration_to_mcp_call_result(
                     &mut result,
                     auth,
                     window,
                     project.as_deref(),
                     &ack_session_message_ids,
                 );
-
-                let result = mcp_runtime_tool_result_fallback(result, result_presentation);
                 return McpOutcome::Ok(rpc_result(
                     id,
                     if stateless_2026 {
@@ -1707,6 +1792,37 @@ pub(super) async fn handle_call(
             .as_deref()
             .and_then(|session_id| runtime.sessions.session_project(session_id).flatten());
         let mut result = invocation.to_mcp_result();
+        if !context_request.is_empty() {
+            let resolved_project = match project.as_deref() {
+                Some(project) => runtime
+                    .resolve_project_input_for_auth(project, auth)
+                    .await
+                    .ok(),
+                None => None,
+            };
+            let mut projection = ToolResult::ok(json!({}));
+            runtime
+                .add_requested_context_projection_with_guidance(
+                    &mut projection,
+                    &context_request,
+                    resolved_project.as_ref(),
+                    auth,
+                    crate::tool_runtime::context_projection::ContextMaterialCapabilities {
+                        skill_runtime: true,
+                        memory_surface: true,
+                    },
+                    crate::tool_runtime::tool_inputs::CodingGuidanceProfile::default(),
+                    window,
+                )
+                .await;
+            if let Some(context_projection) = projection
+                .output
+                .as_object_mut()
+                .and_then(|output| output.remove("context_projection"))
+            {
+                merge_context_projection_into_mcp_call_result(&mut result, context_projection);
+            }
+        }
         runtime.add_peer_collaboration_to_mcp_call_result(
             &mut result,
             auth,

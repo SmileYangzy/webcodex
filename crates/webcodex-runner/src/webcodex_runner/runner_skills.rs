@@ -16,9 +16,11 @@ use webcodex_core::runner_protocol::{
 };
 use webcodex_core::runner_skill::{
     RunnerSkillDescriptor, RunnerSkillExecutionRequest, RunnerSkillListResponse,
-    RunnerSkillReadResponse, RunnerSkillRequest, RunnerSkillResolveResponse, RunnerSkillSource,
+    RunnerSkillNameResolveResponse, RunnerSkillReadResponse, RunnerSkillRequest,
+    RunnerSkillResolveResponse, RunnerSkillSource, MAX_RUNNER_SKILL_NAME_MATCHES,
     RUNNER_SKILL_RESPONSE_FORMAT, RUNNER_SKILL_RESPONSE_MAX_BYTES,
 };
+use webcodex_core::skill_metadata::skill_name_eq;
 
 const PYTHON_SKILL_WRAPPER: &str = r#"import os, sys
 p = sys.argv[1]
@@ -266,6 +268,10 @@ pub(crate) fn handle_runner_skill_request(
                     .map_err(|_| "skill_response_invalid".to_string())?;
                 serialize_bounded(response, "skill_response_invalid")
             }),
+        RunnerSkillRequest::ResolveName { name } => {
+            resolve_runner_skills_by_name(config, &store, &name)
+                .and_then(|response| serialize_bounded(response, "skill_response_invalid"))
+        }
         RunnerSkillRequest::Read {
             skill_id,
             expected_source,
@@ -411,6 +417,40 @@ fn resolve_runner_skill(
     let configured = configured_skills::resolve_live_skill(config, skill_id)?;
     let managed = store.resolve_active(skill_id)?;
     resolve_candidates(configured.map(|skill| skill.descriptor), managed)
+}
+
+fn resolve_runner_skills_by_name(
+    config: &SkillsConfig,
+    store: &SkillStore,
+    name: &str,
+) -> Result<RunnerSkillNameResolveResponse, String> {
+    let configured_skills::ExactNameDiscovery {
+        skills: configured,
+        discovery_truncated,
+    } = configured_skills::resolve_live_skills_by_name(config, name)?;
+    let mut skills = configured
+        .into_iter()
+        .map(|skill| skill.descriptor)
+        .collect::<Vec<_>>();
+    let managed = store.list_active()?;
+    skills.extend(
+        managed
+            .skills
+            .into_iter()
+            .filter(|skill| skill_name_eq(skill.name(), name)),
+    );
+    ensure_unique_skill_ids(&skills)?;
+    skills.sort_by(|left, right| left.skill_id().cmp(right.skill_id()));
+    skills.truncate(MAX_RUNNER_SKILL_NAME_MATCHES);
+    let response = RunnerSkillNameResolveResponse {
+        format: RUNNER_SKILL_RESPONSE_FORMAT.to_string(),
+        skills,
+        discovery_truncated,
+    };
+    response
+        .validate_for_request(name)
+        .map_err(|_| "skill_response_invalid".to_string())?;
+    Ok(response)
 }
 
 fn resolve_candidates(

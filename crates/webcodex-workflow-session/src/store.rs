@@ -835,6 +835,24 @@ impl SessionStore {
         })
     }
 
+    /// Internal evidence snapshot over the bounded retained ledger. Public
+    /// summaries keep their independent display cap; retention loss remains
+    /// explicit and must never be treated as complete attempt history.
+    pub fn retained_evidence_summary(&self, session_id: &str) -> Option<SessionSummary> {
+        self.with_record_for_query(session_id, |record, cold| {
+            let mut summary = summarize_record(record, Some(0), cold);
+            summary.events = record
+                .events
+                .iter()
+                .map(|event| event.as_ref().clone())
+                .collect();
+            summary.events_returned = summary.events.len();
+            summary.events_truncated = summary.retention_truncated;
+            summary.first_retained_sequence = summary.ledger_first_retained_sequence;
+            summary
+        })
+    }
+
     /// Exact retained changed-path evidence for recovery attribution. Unlike
     /// `summary`, this scans the full bounded durable event ledger instead of the
     /// model-facing 200-event tail, so ordinary presentation truncation does not

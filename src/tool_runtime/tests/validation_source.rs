@@ -1,4 +1,5 @@
 use super::*;
+use crate::tool_runtime::ToolResult;
 use webcodex_core::validation_source::{ObservedMutationFence, ValidationFreshness};
 
 #[test]
@@ -30,7 +31,20 @@ fn source_fence_handoff_and_generation_exhaustion_cannot_manufacture_quiescence(
         .finish(&crate::tool_runtime::ToolResult::ok(
             serde_json::json!({"job_id":"existing-job","state_changed":false}),
         ));
-    assert!(!registry.capture("job").unwrap().quiescent);
+    let pending = registry.capture("job").unwrap();
+    assert!(!pending.quiescent);
+    assert_eq!(
+        registry.pending_jobs("job"),
+        vec!["existing-job".to_string()]
+    );
+    registry.complete_pending_job("job", "existing-job");
+    let settled = registry.capture("job").unwrap();
+    assert!(settled.quiescent);
+    assert!(settled.generation > pending.generation);
+    assert_eq!(
+        registry.observe("job", Some(&settled)).freshness,
+        ValidationFreshness::Unproven
+    );
     let state = registry.project("exhausted").unwrap();
     state.lock().unwrap().generation = MAX_SOURCE_GENERATION;
     let before = registry.capture("exhausted").unwrap();
@@ -44,6 +58,69 @@ fn source_fence_handoff_and_generation_exhaustion_cannot_manufacture_quiescence(
             .observed_mutation_fence,
         ObservedMutationFence::Unknown
     );
+}
+
+#[test]
+fn source_fence_sync_completion_does_not_require_state_changed() {
+    let registry = ValidationSourceRegistry::default();
+    registry.begin("p").unwrap().finish(&ToolResult::ok(
+        serde_json::json!({"command_completed": true}),
+    ));
+    assert!(registry.capture("p").unwrap().quiescent);
+}
+
+#[test]
+fn source_fence_pending_jobs_are_bounded_and_overflow_fails_closed() {
+    let registry = ValidationSourceRegistry::default();
+    for index in 0..MAX_PENDING_JOBS_PER_PROJECT {
+        registry.begin("p").unwrap().finish(&ToolResult::ok(
+            serde_json::json!({"job_id": format!("job-{index}")}),
+        ));
+    }
+    assert_eq!(
+        registry.pending_jobs("p").len(),
+        MAX_PENDING_JOBS_PER_PROJECT
+    );
+    registry.begin("p").unwrap().finish(&ToolResult::ok(
+        serde_json::json!({"job_id": "job-overflow"}),
+    ));
+    for job_id in registry.pending_jobs("p") {
+        registry.complete_pending_job("p", &job_id);
+    }
+    assert!(!registry.capture("p").unwrap().quiescent);
+}
+
+#[test]
+fn source_fence_lost_and_outcome_unknown_jobs_remain_uncertain() {
+    for (project, output) in [
+        (
+            "lost",
+            serde_json::json!({"job_id": "lost-job", "execution_state": "lost"}),
+        ),
+        (
+            "unknown",
+            serde_json::json!({
+                "job_id": "unknown-job",
+                "command_execution_state": "outcome_unknown"
+            }),
+        ),
+        (
+            "invalid-job-id",
+            serde_json::json!({"job_id": "../invalid", "state_changed": false}),
+        ),
+        (
+            "non-string-job-id",
+            serde_json::json!({"job_id": 42, "state_changed": false}),
+        ),
+    ] {
+        let registry = ValidationSourceRegistry::default();
+        registry
+            .begin(project)
+            .unwrap()
+            .finish(&ToolResult::ok(output));
+        assert!(registry.pending_jobs(project).is_empty());
+        assert!(!registry.capture(project).unwrap().quiescent);
+    }
 }
 
 fn noop() -> crate::tool_runtime::ToolResult {

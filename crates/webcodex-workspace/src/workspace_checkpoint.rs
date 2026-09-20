@@ -1,8 +1,9 @@
 use crate::path_policy::sensitive_path;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
@@ -12,6 +13,9 @@ const MAX_DIFF_STAT_BYTES: usize = 64 * 1024;
 const MAX_UNTRACKED_BYTES: usize = 256 * 1024;
 const MAX_UNTRACKED_TOTAL_BYTES: usize = 1024 * 1024;
 const MAX_UNTRACKED_FILES: usize = 64;
+const MAX_TRACKED_SNAPSHOT_BYTES: usize = 1024 * 1024;
+const MAX_TRACKED_SNAPSHOT_TOTAL_BYTES: usize = 2 * 1024 * 1024;
+const MAX_TRACKED_SNAPSHOT_FILES: usize = 256;
 
 #[derive(Debug, Clone)]
 struct StatusEntry {
@@ -25,6 +29,14 @@ struct StatusEntry {
 struct UntrackedCheckpointFile {
     path: String,
     content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct TrackedWorktreeFile {
+    path: String,
+    content: String,
+    byte_count: usize,
+    sha256: String,
 }
 
 pub fn create_workspace_checkpoint(root: &Path, include_untracked: bool) -> Value {
@@ -51,27 +63,25 @@ fn create_workspace_checkpoint_inner(root: &Path, include_untracked: bool) -> Re
         "git status",
         MAX_STATUS_BYTES,
     )?;
-    let (status_summary, status_entries) = status_summary(&status);
-    if let Some(entry) = status_entries
-        .iter()
-        .find(|entry| entry.status != "untracked" && sensitive_path(&entry.path))
-    {
+    let (status_summary, _) = status_summary(&status);
+    let tracked_paths = tracked_changed_paths(&root)?;
+    if let Some(path) = tracked_paths.iter().find(|path| sensitive_path(path)) {
         return Err(fail_extra(
             "sensitive_or_invalid_path",
             "checkpoint tracked diff contains a sensitive path",
-            vec![("path", json!(entry.path)), ("state_changed", json!(false))],
+            vec![("path", json!(path)), ("state_changed", json!(false))],
         ));
     }
 
     let tracked_diff = bounded_git_text(
         &root,
-        &["diff", "--no-ext-diff", "--"],
+        &["diff", "--no-ext-diff", "--no-renames", "--"],
         "tracked diff",
         MAX_DIFF_BYTES,
     )?;
     let staged_diff = bounded_git_text(
         &root,
-        &["diff", "--cached", "--no-ext-diff", "--"],
+        &["diff", "--cached", "--no-ext-diff", "--no-renames", "--"],
         "staged diff",
         MAX_DIFF_BYTES,
     )?;
@@ -87,11 +97,13 @@ fn create_workspace_checkpoint_inner(root: &Path, include_untracked: bool) -> Re
         "staged diff stat",
         MAX_DIFF_STAT_BYTES,
     )?;
+    let (tracked_worktree_files, tracked_snapshot_bytes) =
+        collect_tracked_worktree_files(&root, &tracked_paths)?;
     let (untracked_files, skipped_files) = collect_untracked(&root, include_untracked)?;
 
     Ok(json!({
-        "format": "webcodex.workspace_checkpoint.v1",
-        "version": 1,
+        "format": "webcodex.workspace_checkpoint.v2",
+        "version": 2,
         "head": head,
         "branch": branch,
         "status_porcelain": status,
@@ -102,11 +114,15 @@ fn create_workspace_checkpoint_inner(root: &Path, include_untracked: bool) -> Re
         "staged_diff_bytes": staged_diff.len(),
         "diff_stat": diff_stat,
         "staged_diff_stat": staged_diff_stat,
+        "tracked_paths": tracked_paths,
+        "tracked_worktree_files": tracked_worktree_files,
+        "tracked_snapshot_bytes": tracked_snapshot_bytes,
         "untracked_files": untracked_files,
         "skipped_files": skipped_files,
         "complete": true,
         "limitations": [
-            "text_diffs_only",
+            "tracked_text_snapshots_only",
+            "byte_exact_only_for_tracked_paths_changed_when_checkpoint_was_created",
             "ignored_files_excluded",
             "large_binary_secret_like_untracked_files_skipped"
         ],
@@ -148,14 +164,81 @@ fn restore_workspace_checkpoint_inner(root: &Path, checkpoint: &Value) -> Result
         .get("staged_diff")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    validate_checkpoint_diff("tracked_diff", tracked_diff)?;
-    validate_checkpoint_diff("staged_diff", staged_diff)?;
+    let mut diff_paths = validate_checkpoint_diff(&root, "tracked_diff", tracked_diff)?;
+    for path in validate_checkpoint_diff(&root, "staged_diff", staged_diff)? {
+        push_unique(&mut diff_paths, &path);
+    }
 
     let untracked_values = checkpoint
         .get("untracked_files")
         .and_then(Value::as_array)
         .ok_or_else(|| fail("invalid_checkpoint", "untracked_files must be an array"))?;
     let untracked_files = validate_untracked_checkpoint_files(&root, untracked_values)?;
+    let byte_exact = match checkpoint.get("version") {
+        None => false,
+        Some(version) if version.as_u64() == Some(1) => false,
+        Some(version) if version.as_u64() == Some(2) => true,
+        Some(version) => {
+            return Err(fail_extra(
+                "invalid_checkpoint",
+                "unsupported checkpoint version",
+                vec![("version", version.clone())],
+            ))
+        }
+    };
+    if byte_exact
+        && checkpoint.get("format").and_then(Value::as_str)
+            != Some("webcodex.workspace_checkpoint.v2")
+    {
+        return Err(fail(
+            "invalid_checkpoint",
+            "checkpoint v2 format is missing or invalid",
+        ));
+    }
+    let checkpoint_paths = if byte_exact {
+        validate_tracked_paths(
+            checkpoint
+                .get("tracked_paths")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    fail(
+                        "invalid_checkpoint",
+                        "tracked_paths must be an array for checkpoint v2",
+                    )
+                })?,
+        )?
+    } else {
+        diff_paths.clone()
+    };
+    let checkpoint_worktree_files = if byte_exact {
+        let values = checkpoint
+            .get("tracked_worktree_files")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                fail(
+                    "invalid_checkpoint",
+                    "tracked_worktree_files must be an array for checkpoint v2",
+                )
+            })?;
+        validate_tracked_worktree_files(&root, values)?
+    } else {
+        Vec::new()
+    };
+    if byte_exact
+        && (checkpoint_worktree_files
+            .iter()
+            .any(|file| !checkpoint_paths.contains(&file.path))
+            || diff_paths.len() != checkpoint_paths.len()
+            || diff_paths
+                .iter()
+                .any(|path| !checkpoint_paths.contains(path)))
+    {
+        return Err(fail_extra(
+            "invalid_checkpoint",
+            "tracked paths, diffs, and worktree snapshots must match",
+            vec![],
+        ));
+    }
 
     let current_unstaged = git_text(
         &root,
@@ -167,6 +250,16 @@ fn restore_workspace_checkpoint_inner(root: &Path, checkpoint: &Value) -> Result
         &["diff", "--cached", "--no-ext-diff", "--"],
         "current staged diff",
     )?;
+    let current_paths = tracked_changed_paths(&root)?;
+    let current_worktree_files = if byte_exact {
+        collect_tracked_worktree_files(&root, &current_paths)?.0
+    } else {
+        Vec::new()
+    };
+    let restored_clean_paths_without_raw_bytes = byte_exact
+        && current_paths
+            .iter()
+            .any(|path| !checkpoint_paths.contains(path));
 
     if !current_unstaged.is_empty() {
         git_apply(&root, &["--reverse", "--check"], &current_unstaged).map_err(|detail| {
@@ -219,6 +312,9 @@ fn restore_workspace_checkpoint_inner(root: &Path, checkpoint: &Value) -> Result
             git_apply(&root, &[], tracked_diff)?;
             applied_checkpoint_unstaged = true;
         }
+        if byte_exact {
+            restore_tracked_worktree_files(&root, &checkpoint_worktree_files)?;
+        }
 
         for item in &untracked_files {
             let full = root.join(&item.path);
@@ -247,6 +343,7 @@ fn restore_workspace_checkpoint_inner(root: &Path, checkpoint: &Value) -> Result
             tracked_diff,
         )
         .and_then(|_| reapply_current(&root, &current_staged, &current_unstaged))
+        .and_then(|_| restore_tracked_worktree_files(&root, &current_worktree_files))
         .is_ok();
         return Err(fail_extra(
             "restore_failed",
@@ -259,19 +356,13 @@ fn restore_workspace_checkpoint_inner(root: &Path, checkpoint: &Value) -> Result
     }
 
     let mut changed_paths = Vec::new();
-    for path in changed_paths_from_diff(staged_diff)
-        .into_iter()
-        .chain(changed_paths_from_diff(tracked_diff))
-    {
+    for path in checkpoint_paths {
         push_unique(&mut changed_paths, &path);
     }
     for item in &untracked_files {
         push_unique(&mut changed_paths, &item.path);
     }
-    for path in changed_paths_from_diff(&current_unstaged)
-        .into_iter()
-        .chain(changed_paths_from_diff(&current_staged))
-    {
+    for path in current_paths {
         push_unique(&mut changed_paths, &path);
     }
 
@@ -279,8 +370,218 @@ fn restore_workspace_checkpoint_inner(root: &Path, checkpoint: &Value) -> Result
         "restored": true,
         "checkpoint_id": checkpoint_id,
         "changed_paths": changed_paths,
-        "warnings": [],
+        "warnings": if !byte_exact {
+            json!(["legacy_v1_text_diff_restore_is_not_byte_exact"])
+        } else if restored_clean_paths_without_raw_bytes {
+            json!(["checkpoint_clean_paths_restored_from_git_diff_not_byte_exact"])
+        } else {
+            json!([])
+        },
     }))
+}
+
+fn collect_tracked_worktree_files(
+    root: &Path,
+    paths: &[String],
+) -> Result<(Vec<TrackedWorktreeFile>, usize), Value> {
+    if paths.len() > MAX_TRACKED_SNAPSHOT_FILES {
+        return Err(fail_extra(
+            "checkpoint_too_large",
+            "tracked snapshot file count exceeds limit",
+            vec![("max_files", json!(MAX_TRACKED_SNAPSHOT_FILES))],
+        ));
+    }
+    let mut files = Vec::with_capacity(paths.len());
+    let mut total = 0usize;
+    for path in paths {
+        if invalid_rel_path(path) || sensitive_path(path) {
+            return Err(fail_extra(
+                "sensitive_or_invalid_path",
+                "tracked snapshot contains a sensitive or invalid path",
+                vec![("path", json!(path)), ("state_changed", json!(false))],
+            ));
+        }
+        let full = root.join(path);
+        ensure_snapshot_parent_inside(root, &full).map_err(|detail| {
+            fail_extra(
+                "sensitive_or_invalid_path",
+                "tracked snapshot path escapes project",
+                vec![("path", json!(path)), ("detail", json!(detail))],
+            )
+        })?;
+        let metadata = match fs::symlink_metadata(&full) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(fail_extra(
+                    "checkpoint_read_failed",
+                    "failed to inspect tracked worktree path",
+                    vec![("path", json!(path)), ("detail", json!(err.to_string()))],
+                ))
+            }
+            Ok(metadata) => metadata,
+        };
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if !metadata.is_file() {
+            return Err(fail_extra(
+                "unsupported_tracked_entry",
+                "tracked snapshot path is not a regular file or symlink",
+                vec![("path", json!(path))],
+            ));
+        }
+        let mut data = Vec::new();
+        fs::File::open(&full)
+            .and_then(|file| {
+                file.take((MAX_TRACKED_SNAPSHOT_BYTES + 1) as u64)
+                    .read_to_end(&mut data)
+            })
+            .map_err(|err| {
+                fail_extra(
+                    "checkpoint_read_failed",
+                    "failed to read tracked worktree file",
+                    vec![("path", json!(path)), ("detail", json!(err.to_string()))],
+                )
+            })?;
+        let hash = sha256_hex_bytes(&data);
+        validate_tracked_snapshot_bytes(path, &data, data.len(), &hash)?;
+        let content = String::from_utf8(data).map_err(|_| {
+            fail_extra(
+                "binary_or_non_utf8_diff",
+                "tracked worktree file is not valid UTF-8",
+                vec![("path", json!(path))],
+            )
+        })?;
+        total = total.saturating_add(content.len());
+        if total > MAX_TRACKED_SNAPSHOT_TOTAL_BYTES {
+            return Err(fail_extra(
+                "checkpoint_too_large",
+                "tracked snapshots exceed total byte limit",
+                vec![("max_bytes", json!(MAX_TRACKED_SNAPSHOT_TOTAL_BYTES))],
+            ));
+        }
+        files.push(TrackedWorktreeFile {
+            path: path.clone(),
+            byte_count: content.len(),
+            content,
+            sha256: hash,
+        });
+    }
+    Ok((files, total))
+}
+
+fn validate_tracked_worktree_files(
+    root: &Path,
+    values: &[Value],
+) -> Result<Vec<TrackedWorktreeFile>, Value> {
+    if values.len() > MAX_TRACKED_SNAPSHOT_FILES {
+        return Err(fail("invalid_checkpoint", "too many tracked snapshots"));
+    }
+    let mut files = Vec::with_capacity(values.len());
+    let mut total = 0usize;
+    for value in values {
+        let file = serde_json::from_value::<TrackedWorktreeFile>(value.clone()).map_err(|err| {
+            fail_extra(
+                "invalid_checkpoint",
+                "checkpoint contains an invalid tracked snapshot",
+                vec![("detail", json!(err.to_string()))],
+            )
+        })?;
+        if invalid_rel_path(&file.path)
+            || sensitive_path(&file.path)
+            || files
+                .iter()
+                .any(|existing: &TrackedWorktreeFile| existing.path == file.path)
+        {
+            return Err(fail_extra(
+                "invalid_checkpoint",
+                "checkpoint contains a duplicate, sensitive, or invalid tracked path",
+                vec![("path", json!(file.path))],
+            ));
+        }
+        ensure_snapshot_parent_inside(root, &root.join(&file.path)).map_err(|detail| {
+            fail_extra(
+                "invalid_checkpoint",
+                "checkpoint tracked path escapes project",
+                vec![("path", json!(file.path)), ("detail", json!(detail))],
+            )
+        })?;
+        validate_tracked_snapshot_bytes(
+            &file.path,
+            file.content.as_bytes(),
+            file.byte_count,
+            &file.sha256,
+        )?;
+        total = total.saturating_add(file.byte_count);
+        if total > MAX_TRACKED_SNAPSHOT_TOTAL_BYTES {
+            return Err(fail(
+                "invalid_checkpoint",
+                "tracked snapshots exceed total byte limit",
+            ));
+        }
+        files.push(file);
+    }
+    Ok(files)
+}
+
+fn validate_tracked_snapshot_bytes(
+    path: &str,
+    bytes: &[u8],
+    byte_count: usize,
+    sha256: &str,
+) -> Result<(), Value> {
+    if bytes.len() > MAX_TRACKED_SNAPSHOT_BYTES {
+        return Err(fail_extra(
+            "checkpoint_too_large",
+            "tracked snapshot exceeds byte limit",
+            vec![
+                ("path", json!(path)),
+                ("max_bytes", json!(MAX_TRACKED_SNAPSHOT_BYTES)),
+            ],
+        ));
+    }
+    if binaryish(bytes) || byte_count != bytes.len() || sha256 != sha256_hex_bytes(bytes) {
+        return Err(fail_extra(
+            "invalid_checkpoint",
+            "tracked snapshot content or metadata is invalid",
+            vec![("path", json!(path))],
+        ));
+    }
+    Ok(())
+}
+
+fn restore_tracked_worktree_files(
+    root: &Path,
+    files: &[TrackedWorktreeFile],
+) -> Result<(), String> {
+    for file in files {
+        let full = root.join(&file.path);
+        ensure_snapshot_parent_inside(root, &full)?;
+        if fs::symlink_metadata(&full).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+            fs::remove_file(&full).map_err(|err| err.to_string())?;
+        }
+        if let Some(parent) = full.parent() {
+            fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+        }
+        fs::write(&full, file.content.as_bytes()).map_err(|err| err.to_string())?;
+    }
+    Ok(())
+}
+
+fn ensure_snapshot_parent_inside(root: &Path, full: &Path) -> Result<(), String> {
+    let mut parent = full.parent().unwrap_or(root).to_path_buf();
+    while !parent.exists() {
+        parent = parent
+            .parent()
+            .ok_or_else(|| "tracked snapshot parent is unavailable".to_string())?
+            .to_path_buf();
+    }
+    let real = parent.canonicalize().map_err(|err| err.to_string())?;
+    if path_inside(root, &real) {
+        Ok(())
+    } else {
+        Err("tracked snapshot parent escapes project".to_string())
+    }
 }
 
 fn canonical_project_root(root: &Path) -> Result<PathBuf, Value> {
@@ -388,6 +689,57 @@ fn git_output(
         ));
     }
     Ok(output)
+}
+
+fn tracked_changed_paths(root: &Path) -> Result<Vec<String>, Value> {
+    let mut paths = Vec::new();
+    for args in [
+        &["diff", "--name-only", "-z", "--no-renames", "--"][..],
+        &[
+            "diff",
+            "--cached",
+            "--name-only",
+            "-z",
+            "--no-renames",
+            "--",
+        ][..],
+    ] {
+        let output = git_output(root, &args, None, true)?.stdout;
+        if output.len() > MAX_STATUS_BYTES {
+            return Err(fail_extra(
+                "checkpoint_too_large",
+                "tracked path list exceeds byte limit",
+                vec![("max_bytes", json!(MAX_STATUS_BYTES))],
+            ));
+        }
+        for path in nul_paths(&output, "tracked path list")? {
+            if invalid_rel_path(&path) {
+                return Err(fail_extra(
+                    "sensitive_or_invalid_path",
+                    "tracked diff contains an invalid path",
+                    vec![("path", json!(path)), ("state_changed", json!(false))],
+                ));
+            }
+            push_unique(&mut paths, &path);
+        }
+    }
+    Ok(paths)
+}
+
+fn nul_paths(data: &[u8], label: &str) -> Result<Vec<String>, Value> {
+    if data.is_empty() {
+        return Ok(Vec::new());
+    }
+    if data.last() != Some(&0) {
+        return Err(fail("git_failed", format!("{label} is not NUL terminated")));
+    }
+    data[..data.len() - 1]
+        .split(|byte| *byte == 0)
+        .map(|path| {
+            String::from_utf8(path.to_vec())
+                .map_err(|_| fail("binary_or_non_utf8_diff", format!("{label} is not UTF-8")))
+        })
+        .collect()
 }
 
 fn git_apply(root: &Path, args: &[&str], patch: &str) -> Result<(), String> {
@@ -655,7 +1007,7 @@ fn untracked_paths_from_status_z(raw: &[u8]) -> Vec<String> {
         .collect()
 }
 
-fn validate_checkpoint_diff(label: &str, diff: &str) -> Result<(), Value> {
+fn validate_checkpoint_diff(root: &Path, label: &str, diff: &str) -> Result<Vec<String>, Value> {
     if diff.len() > MAX_DIFF_BYTES {
         return Err(fail_extra(
             "invalid_checkpoint",
@@ -666,7 +1018,24 @@ fn validate_checkpoint_diff(label: &str, diff: &str) -> Result<(), Value> {
             ],
         ));
     }
-    for path in changed_paths_from_diff(diff) {
+    if diff.is_empty() {
+        return Ok(Vec::new());
+    }
+    let output = git_output(
+        root,
+        &["apply", "--numstat", "-z", "-"],
+        Some(diff.as_bytes()),
+        true,
+    )
+    .map_err(|error| {
+        fail_extra(
+            "invalid_checkpoint",
+            format!("{label} is not a valid Git patch"),
+            vec![("detail", error)],
+        )
+    })?;
+    let paths = paths_from_numstat_z(&output.stdout, label)?;
+    for path in &paths {
         if invalid_rel_path(&path) || sensitive_path(&path) {
             return Err(fail_extra(
                 "invalid_checkpoint",
@@ -675,7 +1044,71 @@ fn validate_checkpoint_diff(label: &str, diff: &str) -> Result<(), Value> {
             ));
         }
     }
-    Ok(())
+    Ok(paths)
+}
+
+fn paths_from_numstat_z(data: &[u8], label: &str) -> Result<Vec<String>, Value> {
+    let fields = nul_paths(data, label)?;
+    let mut paths = Vec::new();
+    let mut index = 0usize;
+    while index < fields.len() {
+        let record = &fields[index];
+        index += 1;
+        let mut parts = record.splitn(3, '\t');
+        let added = parts.next();
+        let deleted = parts.next();
+        let path = parts.next().ok_or_else(|| {
+            fail(
+                "invalid_checkpoint",
+                format!("{label} has invalid numstat output"),
+            )
+        })?;
+        if added.is_none() || deleted.is_none() {
+            return Err(fail(
+                "invalid_checkpoint",
+                format!("{label} has invalid numstat output"),
+            ));
+        }
+        if path.is_empty() {
+            for _ in 0..2 {
+                let rename_path = fields.get(index).ok_or_else(|| {
+                    fail(
+                        "invalid_checkpoint",
+                        format!("{label} has incomplete rename paths"),
+                    )
+                })?;
+                push_unique(&mut paths, rename_path);
+                index += 1;
+            }
+        } else {
+            push_unique(&mut paths, path);
+        }
+    }
+    Ok(paths)
+}
+
+fn validate_tracked_paths(values: &[Value]) -> Result<Vec<String>, Value> {
+    if values.len() > MAX_TRACKED_SNAPSHOT_FILES {
+        return Err(fail("invalid_checkpoint", "too many tracked paths"));
+    }
+    let mut paths = Vec::with_capacity(values.len());
+    for value in values {
+        let path = value.as_str().ok_or_else(|| {
+            fail(
+                "invalid_checkpoint",
+                "checkpoint contains a non-string tracked path",
+            )
+        })?;
+        if invalid_rel_path(path) || sensitive_path(path) || paths.iter().any(|item| item == path) {
+            return Err(fail_extra(
+                "invalid_checkpoint",
+                "checkpoint contains a duplicate, sensitive, or invalid tracked path",
+                vec![("path", json!(path))],
+            ));
+        }
+        paths.push(path.to_string());
+    }
+    Ok(paths)
 }
 
 fn validate_untracked_checkpoint_files(
@@ -844,28 +1277,7 @@ fn binaryish(data: &[u8]) -> bool {
         .any(|byte| *byte == 0 || (*byte < 32 && !matches!(*byte, b'\t' | b'\n' | b'\r')))
 }
 
-fn changed_paths_from_diff(diff: &str) -> Vec<String> {
-    let mut paths = Vec::new();
-    for line in diff.lines() {
-        if let Some(rest) = line.strip_prefix("diff --git ") {
-            if let Some(pos) = rest.rfind(" b/") {
-                push_unique(&mut paths, &rest[pos + 3..]);
-            }
-            continue;
-        }
-        for prefix in ["+++ b/", "--- a/"] {
-            if let Some(path) = line.strip_prefix(prefix) {
-                if path != "/dev/null" {
-                    push_unique(&mut paths, path);
-                }
-            }
-        }
-    }
-    paths
-}
-
 fn push_unique(paths: &mut Vec<String>, path: &str) {
-    let path = path.trim();
     if path.is_empty() || paths.iter().any(|existing| existing == path) {
         return;
     }

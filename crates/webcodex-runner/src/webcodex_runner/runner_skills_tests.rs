@@ -23,12 +23,16 @@ const PYTHON_PROBE: &str = concat!(
 );
 
 fn write_configured_skill(root: &std::path::Path) {
-    let package = root.join("configured");
+    write_configured_skill_with_name(root, "configured", "configured");
+}
+
+fn write_configured_skill_with_name(root: &std::path::Path, package: &str, name: &str) {
+    let package = root.join(package);
     fs::create_dir_all(package.join("references")).unwrap();
     fs::create_dir_all(package.join("scripts")).unwrap();
     fs::write(
         package.join("SKILL.md"),
-        "---\nname: configured\ndescription: configured guidance\n---\nbody\n",
+        format!("---\nname: {name}\ndescription: configured guidance\n---\nbody\n"),
     )
     .unwrap();
     fs::write(package.join("references/guide.md"), "configured resource\n").unwrap();
@@ -320,6 +324,34 @@ fn mixed_list_keeps_configured_and_managed_source_identity_explicit() {
     )
     .unwrap()
     .is_none());
+}
+
+#[test]
+fn exact_name_resolution_checks_configured_and_managed_sources_together() {
+    let configured_root = tempfile::tempdir().unwrap();
+    write_configured_skill(configured_root.path());
+    let config = SkillsConfig {
+        roots: vec![configured_root.path().to_path_buf()],
+    };
+    let (_managed_root, store, managed) = managed_fixture();
+
+    let configured = resolve_runner_skills_by_name(&config, &store, "CONFIGURED").unwrap();
+    assert!(!configured.discovery_truncated);
+    assert_eq!(configured.skills.len(), 1);
+    assert_eq!(configured.skills[0].source(), RunnerSkillSource::Configured);
+
+    write_configured_skill_with_name(configured_root.path(), "managed-copy", "Managed");
+    let duplicate = resolve_runner_skills_by_name(&config, &store, "managed").unwrap();
+    assert!(!duplicate.discovery_truncated);
+    assert_eq!(duplicate.skills.len(), 2);
+    assert!(duplicate
+        .skills
+        .iter()
+        .any(|skill| skill.source() == RunnerSkillSource::Configured));
+    assert!(duplicate
+        .skills
+        .iter()
+        .any(|skill| skill.skill_id() == managed.skill_id()));
 }
 
 #[test]

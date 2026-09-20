@@ -829,8 +829,38 @@ async fn specialized_recording_session_authority_fails_closed_at_mcp_boundary() 
     );
 }
 
+#[test]
+fn plugin_context_projection_merge_preserves_native_mcp_content() {
+    let content = json!([
+        {"type": "image", "data": "AAAA", "mimeType": "image/png"},
+        {"type": "resource", "resource": {"uri": "file:///x", "text": "payload"}}
+    ]);
+    let mut result = json!({
+        "content": content.clone(),
+        "structuredContent": {"provider_key": "provider_value"},
+        "isError": false
+    });
+    let projection = json!({"materials": [{"key": "webcodex.workflow"}]});
+
+    crate::mcp::tools::merge_context_projection_into_mcp_call_result(
+        &mut result,
+        projection.clone(),
+    );
+
+    assert_eq!(result["content"], content);
+    assert_eq!(result["isError"], false);
+    assert_eq!(
+        result["structuredContent"]["provider_key"],
+        "provider_value"
+    );
+    assert_eq!(
+        result["structuredContent"]["context_projection"],
+        projection
+    );
+}
+
 #[tokio::test]
-async fn plugin_tool_accepts_collaboration_ack_but_rejects_other_stateless_wrappers() {
+async fn plugin_tool_accepts_stateless_sidecars_but_rejects_resolution_wrapper() {
     let runtime = test_runtime();
     let auth = plugin_auth_with_scopes(&[crate::auth::SCOPE_PLUGIN_INSPECT]);
     register_plugin_runner(
@@ -876,53 +906,76 @@ async fn plugin_tool_accepts_collaboration_ack_but_rejects_other_stateless_wrapp
         .unwrap()
         .is_none());
 
-    for (id, arguments) in [
-        (
-            696,
-            json!({
-                "action":"list",
-                crate::tool_runtime::context_projection::TOOL_CALL_CONTEXT_REQUEST_FIELD: ["webcodex.workflow"]
-            }),
-        ),
-        (
-            697,
-            json!({
-                "action":"list",
-                crate::tool_runtime::sessions::TOOL_CALL_SESSION_MESSAGE_RESOLUTION_FIELD: {
-                    "message_id": "wc_msg_cached",
-                    "resolution": "handled"
+    let context = handle_mcp_request(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(696)),
+            mcp_2026_params(json!({
+                "name": crate::plugin_gateway::PLUGIN_TOOL_NAME,
+                "arguments": {
+                    "action":"list",
+                    crate::tool_runtime::context_projection::TOOL_CALL_CONTEXT_REQUEST_FIELD: ["webcodex.workflow"]
                 }
-            }),
+            })),
         ),
-    ] {
-        let outcome = handle_mcp_request(
-            &runtime,
-            rpc(
-                "tools/call",
-                Some(json!(id)),
-                mcp_2026_params(json!({
-                    "name": crate::plugin_gateway::PLUGIN_TOOL_NAME,
-                    "arguments": arguments
-                })),
-            ),
-            Some(&auth),
-        )
-        .await;
-        let McpOutcome::BadRequest(value) = outcome else {
-            panic!("specialized plugin_tool must reject non-ACK generic continuity wrappers");
-        };
-        let encoded = serde_json::to_string(&value).unwrap();
-        assert!(encoded.contains("unknown field"), "{encoded}");
-        assert!(runtime
-            .runner_registry
-            .poll(RunnerPollRequest {
-                client_id: "runner-a".to_string(),
-                runner_instance_id: "runner-instance-a".to_string(),
-            })
-            .await
-            .unwrap()
-            .is_none());
-    }
+        Some(&auth),
+    )
+    .await;
+    let McpOutcome::Ok(context) = context else {
+        panic!("specialized plugin_tool must accept the context_request sidecar");
+    };
+    assert_eq!(context["result"]["isError"], false, "{context}");
+    assert_eq!(
+        context["result"]["content"][0]["text"],
+        "Plugin metadata available in structuredContent."
+    );
+    let material = &context["result"]["structuredContent"]["context_projection"]["materials"][0];
+    assert_eq!(material["key"], "webcodex.workflow");
+    assert_eq!(material["status"], "available");
+    assert!(runtime
+        .runner_registry
+        .poll(RunnerPollRequest {
+            client_id: "runner-a".to_string(),
+            runner_instance_id: "runner-instance-a".to_string(),
+        })
+        .await
+        .unwrap()
+        .is_none());
+
+    let resolution = handle_mcp_request(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(697)),
+            mcp_2026_params(json!({
+                "name": crate::plugin_gateway::PLUGIN_TOOL_NAME,
+                "arguments": {
+                    "action":"list",
+                    crate::tool_runtime::sessions::TOOL_CALL_SESSION_MESSAGE_RESOLUTION_FIELD: {
+                        "message_id": "wc_msg_cached",
+                        "resolution": "handled"
+                    }
+                }
+            })),
+        ),
+        Some(&auth),
+    )
+    .await;
+    let McpOutcome::BadRequest(value) = resolution else {
+        panic!("specialized plugin_tool must reject the resolution wrapper");
+    };
+    let encoded = serde_json::to_string(&value).unwrap();
+    assert!(encoded.contains("unknown field"), "{encoded}");
+    assert!(runtime
+        .runner_registry
+        .poll(RunnerPollRequest {
+            client_id: "runner-a".to_string(),
+            runner_instance_id: "runner-instance-a".to_string(),
+        })
+        .await
+        .unwrap()
+        .is_none());
 }
 
 #[tokio::test]
@@ -2092,6 +2145,12 @@ async fn tool_manifest_returns_sparse_static_plugin_tool_contract_without_runner
         .iter()
         .find(|tool| tool["name"] == crate::plugin_gateway::PLUGIN_TOOL_NAME)
         .expect("stateless plugin_tool");
+    assert!(stateless_gateway["inputSchema"]["properties"]
+        .get(crate::tool_runtime::context_projection::TOOL_CALL_CONTEXT_REQUEST_FIELD)
+        .is_some());
+    assert!(stateless_gateway["inputSchema"]["properties"]
+        .get(crate::tool_runtime::sessions::TOOL_CALL_SESSION_MESSAGE_RESOLUTION_FIELD)
+        .is_none());
     for field in ["action", "runner", "plugin", "tool", "binding", "arguments"] {
         assert_eq!(
             stateless_gateway["inputSchema"]["properties"][field],

@@ -461,6 +461,8 @@ fn handle_file_read_range_request(
 #[derive(Debug, Deserialize)]
 struct SkillPackageListOptions {
     limit: usize,
+    #[serde(default)]
+    after: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -619,10 +621,13 @@ fn handle_skill_list_packages_request(
         } else {
             continue;
         };
-        candidate_count = candidate_count.saturating_add(1);
         let Some(name) = entry.file_name().to_str().map(str::to_string) else {
             continue;
         };
+        if options.after.as_ref().is_some_and(|after| name <= *after) {
+            continue;
+        }
+        candidate_count = candidate_count.saturating_add(1);
         retained.insert((name, kind));
         if retained.len() > options.limit {
             if let Some(last) = retained.iter().next_back().cloned() {

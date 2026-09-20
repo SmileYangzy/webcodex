@@ -14,8 +14,8 @@ use super::{ExecutionPurpose, ExecutionShell, ToolRuntime};
 use crate::auth::AuthContext;
 use crate::runner_http::{command_preview, ShellJobStartMetadata, COMMAND_PREVIEW_MAX_CHARS};
 use crate::runner_protocol::{
-    ShellJobActivity, ShellJobActivityPhase, ShellJobActivitySource, ShellJobActivityState,
-    ShellJobInfo, ShellJobOpRequest, ShellJobStructuredExecutionMetadata,
+    ShellCommandExecutionState, ShellJobActivity, ShellJobActivityPhase, ShellJobActivitySource,
+    ShellJobActivityState, ShellJobInfo, ShellJobOpRequest, ShellJobStructuredExecutionMetadata,
     ShellJobTestCountEvidence, ShellJobValidationStep,
 };
 
@@ -744,6 +744,47 @@ pub(crate) fn agent_job_summary_value(job: &ShellJobInfo) -> Value {
 }
 
 impl ToolRuntime {
+    pub(crate) async fn reconcile_validation_source_jobs(
+        &self,
+        project: &str,
+        auth: Option<&AuthContext>,
+    ) {
+        let pending_jobs = self.validation_sources.pending_jobs(project);
+        if pending_jobs.is_empty() {
+            return;
+        }
+        let access = crate::runner_http::runner_access_from_auth(auth);
+        for job_id in pending_jobs {
+            let Ok(job) = self
+                .runner_registry
+                .get_job_for_auth(access.as_ref(), &job_id)
+                .await
+            else {
+                continue;
+            };
+            let lifecycle = RunnerJobLifecycle::from_wire(&job.status).ok();
+            let proven_terminal = lifecycle.is_some_and(|lifecycle| {
+                lifecycle.is_terminal() && lifecycle != RunnerJobLifecycle::Lost
+            });
+            let execution_ended = matches!(
+                job.command_execution_state,
+                Some(
+                    ShellCommandExecutionState::Completed
+                        | ShellCommandExecutionState::TimedOut
+                        | ShellCommandExecutionState::NotStarted
+                )
+            );
+            if job.project_id.as_deref() == Some(project)
+                && proven_terminal
+                && job.ended_at.is_some()
+                && execution_ended
+            {
+                self.validation_sources
+                    .complete_pending_job(project, &job_id);
+            }
+        }
+    }
+
     /// Runtime-only model projection for Job inventory. The base summary remains
     /// the canonical compact execution metadata used by internal reconciliation.
     fn model_job_summary_value(&self, job: &ShellJobInfo) -> Value {

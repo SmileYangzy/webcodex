@@ -46,7 +46,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 .failure(super::ToolFailureEvidence::ProvenNoStateChangeNonActionable)
                 .lifecycle(super::ToolSessionLifecycleEffect::Mutation),
         ),
-        "Create a bounded workspace checkpoint outside the project worktree. Captures HEAD, status, text diffs, and optional small untracked text files.",
+        "Create a bounded workspace checkpoint outside the project worktree. Captures HEAD, status, text diffs, raw text bytes for currently changed tracked paths, and optional small untracked text files. Tracked snapshots are limited to 256 files, 1 MiB each and 2 MiB total; this is not a full repository backup.",
     )),
     model_spec(
         def(
@@ -116,7 +116,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             false,
             super::ToolSessionEvidencePolicy::NONE.changed_paths(super::ToolChangedPathEvidence::ResultField("changed_paths")).lifecycle(super::ToolSessionLifecycleEffect::Mutation),
             ),
-            "Restore a checkpoint after confirm=true. Requires matching HEAD and refuses unsafe current state rather than half-restoring.",
+            "Restore a checkpoint after confirm=true. Requires matching HEAD and refuses unsafe current state rather than half-restoring. New snapshots preserve raw bytes for tracked paths changed at capture; legacy snapshots and paths clean at capture use Git diffs and report byte-fidelity limitations.",
         ),
         PERMISSION_RISK_PATCH,
     )),

@@ -20,7 +20,8 @@ use std::time::{Duration, Instant};
 use unicase::UniCase;
 use webcodex_core::runner_skill::{
     RunnerSkillDescriptor, RunnerSkillExecutionRequest, RunnerSkillListResponse,
-    RunnerSkillReadResponse, RunnerSkillRequest, RunnerSkillResolveResponse, RunnerSkillSource,
+    RunnerSkillNameResolveResponse, RunnerSkillReadResponse, RunnerSkillRequest,
+    RunnerSkillResolveResponse, RunnerSkillSource,
 };
 use webcodex_core::skill_metadata::parse_skill_metadata;
 pub(crate) use webcodex_core::skill_metadata::{
@@ -36,6 +37,7 @@ use webcodex_core::skill_store::{
 pub(crate) const SKILL_ROOT: &str = ".agents/skills";
 pub(crate) const SKILL_DEFINITION_FILE: &str = "SKILL.md";
 pub(crate) const MAX_SKILL_DISCOVERY_PACKAGES: usize = 256;
+const MAX_SKILL_EXACT_DISCOVERY_PACKAGES: usize = 4096;
 pub(crate) const MAX_SKILL_INVALID_DIAGNOSTICS: usize = 8;
 pub(crate) const MAX_SKILL_RESOURCE_FILE_BYTES: usize = 512 * 1024;
 pub(crate) const MAX_SKILL_CATALOG_RESULT_BYTES: usize = 64 * 1024;
@@ -388,14 +390,14 @@ impl ToolRuntime {
         target_skill_id: &str,
     ) -> ExactSkillProbeOutcome {
         let packages = match self
-            .list_agent_skill_packages(project, SkillSourceMetricOperation::ExactResolve)
+            .list_all_agent_skill_packages(project, SkillSourceMetricOperation::ExactResolve)
             .await
         {
             Ok(packages) => packages,
             Err(_) => return ExactSkillProbeOutcome::SourceUnavailable,
         };
         let mut candidate = None;
-        for package in packages.entries {
+        for package in packages {
             if !valid_package_name(&package.name) || package.kind != "dir" {
                 continue;
             }
@@ -437,6 +439,209 @@ impl ToolRuntime {
         candidate
             .map(ExactSkillProbeOutcome::Candidate)
             .unwrap_or(ExactSkillProbeOutcome::Absent)
+    }
+
+    async fn exact_skill_name_matches_complete(
+        &self,
+        project: &ResolvedProject,
+        auth: Option<&AuthContext>,
+        name: &str,
+    ) -> Result<Vec<CatalogSkill>, &'static str> {
+        let key = skill_name_key(name);
+        let packages = self
+            .list_all_agent_skill_packages(project, SkillSourceMetricOperation::ExactResolve)
+            .await?;
+        let mut matches = Vec::new();
+        let mut seen_ids = std::collections::BTreeSet::new();
+        for package in packages {
+            if !valid_package_name(&package.name) || package.kind != "dir" {
+                continue;
+            }
+            let package_root = format!("{}/{}", SKILL_ROOT, package.name);
+            let definition_path = format!("{package_root}/{SKILL_DEFINITION_FILE}");
+            let read = match self
+                .read_agent_skill_file(
+                    project,
+                    SkillSourceMetricOperation::ExactResolve,
+                    &package_root,
+                    &definition_path,
+                    1,
+                    MAX_SKILL_DISCOVERY_READ_LINES,
+                    MAX_SKILL_DEFINITION_BYTES,
+                    MAX_SKILL_DEFINITION_BYTES,
+                )
+                .await
+            {
+                Ok(read) => read,
+                Err(SkillIoError::Unavailable) => return Err("skills_catalog_unavailable"),
+                Err(_) => continue,
+            };
+            let metadata = match parse_skill_metadata(&read.content) {
+                Ok(metadata) => metadata,
+                Err(_) => continue,
+            };
+            if skill_name_key(&metadata.name) != key {
+                continue;
+            }
+            let skill_id = skill_id(&project.resolved_id, &package.name);
+            if !seen_ids.insert(skill_id.clone()) {
+                return Err("skills_catalog_unavailable");
+            }
+            matches.push(CatalogSkill {
+                descriptor: SkillDescriptor {
+                    skill_id,
+                    name: metadata.name,
+                    description: metadata.description,
+                    definition_revision: read.sha256,
+                    package_revision: None,
+                    source_scope: "project",
+                    trust: "project_content",
+                    name_conflict: false,
+                },
+                order_key: package.name,
+            });
+        }
+
+        let runner = self
+            .resolve_runner_skills_by_name(project, auth, name)
+            .await?;
+        if let Some(runner) = runner {
+            if runner.discovery_truncated {
+                return Err("skill_catalog_truncated");
+            }
+            for skill in runner.skills {
+                if skill_name_key(skill.name()) != key {
+                    continue;
+                }
+                if !seen_ids.insert(skill.skill_id().to_string()) {
+                    return Err("skills_catalog_unavailable");
+                }
+                let (descriptor, order_key) = match skill {
+                    RunnerSkillDescriptor::Configured {
+                        skill_id,
+                        name,
+                        description,
+                        definition_revision,
+                    } => {
+                        let order_key = skill_id.clone();
+                        (
+                            SkillDescriptor {
+                                skill_id,
+                                name,
+                                description,
+                                definition_revision,
+                                package_revision: None,
+                                source_scope: "runner",
+                                trust: "operator_configured_guidance",
+                                name_conflict: false,
+                            },
+                            order_key,
+                        )
+                    }
+                    RunnerSkillDescriptor::Managed {
+                        skill_id,
+                        skill_key,
+                        name,
+                        description,
+                        package_revision,
+                        definition_revision,
+                    } => (
+                        SkillDescriptor {
+                            skill_id,
+                            name,
+                            description,
+                            definition_revision,
+                            package_revision: Some(package_revision),
+                            source_scope: "runner",
+                            trust: "operator_installed_guidance",
+                            name_conflict: false,
+                        },
+                        skill_key,
+                    ),
+                };
+                matches.push(CatalogSkill {
+                    descriptor,
+                    order_key,
+                });
+            }
+        }
+        matches.sort_by(|left, right| left.order_key.cmp(&right.order_key));
+        recompute_name_conflicts(&mut matches);
+        Ok(matches)
+    }
+
+    async fn resolve_runner_skills_by_name(
+        &self,
+        project: &ResolvedProject,
+        auth: Option<&AuthContext>,
+        name: &str,
+    ) -> Result<Option<RunnerSkillNameResolveResponse>, &'static str> {
+        let observation_started = Instant::now();
+        let response = self
+            .runner_skill_request(
+                project,
+                auth,
+                RunnerSkillRequest::ResolveName {
+                    name: name.to_string(),
+                },
+                true,
+                Some(SkillSourceMetricOperation::ExactResolve),
+            )
+            .await
+            .map_err(|_| "skills_catalog_unavailable")?;
+        let Some(response) = response else {
+            return Ok(None);
+        };
+        if response.exit_code != Some(0) || response.error.is_some() {
+            observe_skill_source_request(
+                self.metrics.as_ref(),
+                SkillSourceMetricSource::RunnerLocal,
+                SkillSourceMetricOperation::ExactResolve,
+                observation_started,
+                Some(&response),
+                SkillSourceMetricOutcomeClass::RunnerError,
+                None,
+            );
+            return Err("skills_catalog_unavailable");
+        }
+        let resolved: RunnerSkillNameResolveResponse =
+            match serde_json::from_str(response.stdout.as_deref().unwrap_or_default()) {
+                Ok(resolved) => resolved,
+                Err(_) => {
+                    observe_skill_source_request(
+                        self.metrics.as_ref(),
+                        SkillSourceMetricSource::RunnerLocal,
+                        SkillSourceMetricOperation::ExactResolve,
+                        observation_started,
+                        Some(&response),
+                        SkillSourceMetricOutcomeClass::InvalidResponse,
+                        None,
+                    );
+                    return Err("skills_catalog_unavailable");
+                }
+            };
+        if resolved.validate_for_request(name).is_err() {
+            observe_skill_source_request(
+                self.metrics.as_ref(),
+                SkillSourceMetricSource::RunnerLocal,
+                SkillSourceMetricOperation::ExactResolve,
+                observation_started,
+                Some(&response),
+                SkillSourceMetricOutcomeClass::InvalidResponse,
+                None,
+            );
+            return Err("skills_catalog_unavailable");
+        }
+        observe_skill_source_request(
+            self.metrics.as_ref(),
+            SkillSourceMetricSource::RunnerLocal,
+            SkillSourceMetricOperation::ExactResolve,
+            observation_started,
+            Some(&response),
+            SkillSourceMetricOutcomeClass::Success,
+            Some(resolved.skills.len()),
+        );
+        Ok(Some(resolved))
     }
 
     async fn probe_runner_skill_exact(
@@ -1022,7 +1227,14 @@ impl ToolRuntime {
             Ok(catalog) => catalog,
             Err(_) => return skill_error("skill_catalog_unavailable", &project.resolved_id, None),
         };
-        let matches = match exact_skill_name_matches(&catalog, &name) {
+        let matches = if catalog.discovery_truncated {
+            self.exact_skill_name_matches_complete(project, auth, &name)
+                .await
+        } else {
+            exact_skill_name_matches(&catalog, &name)
+                .map(|matches| matches.into_iter().cloned().collect())
+        };
+        let matches = match matches {
             Ok(matches) => matches,
             Err(kind) => {
                 return skill_error(
@@ -1869,8 +2081,67 @@ impl ToolRuntime {
         project: &ResolvedProject,
         operation: SkillSourceMetricOperation,
     ) -> Result<AgentSkillPackageList, &'static str> {
+        self.list_agent_skill_packages_page(project, operation, None)
+            .await
+    }
+
+    async fn list_all_agent_skill_packages(
+        &self,
+        project: &ResolvedProject,
+        operation: SkillSourceMetricOperation,
+    ) -> Result<Vec<AgentSkillPackageEntry>, &'static str> {
+        let mut entries = Vec::new();
+        let mut after = None;
+        loop {
+            let page = self
+                .list_agent_skill_packages_page(project, operation, after.as_deref())
+                .await?;
+            if page.entries.is_empty() {
+                return if page.truncated {
+                    Err("skills_catalog_unavailable")
+                } else {
+                    Ok(entries)
+                };
+            }
+            let next_after = page
+                .entries
+                .last()
+                .expect("non-empty Skill package page")
+                .name
+                .clone();
+            if after
+                .as_deref()
+                .is_some_and(|cursor| next_after.as_str() <= cursor)
+            {
+                return Err("skills_catalog_unavailable");
+            }
+            if entries.len().saturating_add(page.entries.len()) > MAX_SKILL_EXACT_DISCOVERY_PACKAGES
+            {
+                return Err("skill_catalog_truncated");
+            }
+            entries.extend(page.entries);
+            if !page.truncated {
+                return Ok(entries);
+            }
+            if entries.len() >= MAX_SKILL_EXACT_DISCOVERY_PACKAGES {
+                return Err("skill_catalog_truncated");
+            }
+            after = Some(next_after);
+        }
+    }
+
+    async fn list_agent_skill_packages_page(
+        &self,
+        project: &ResolvedProject,
+        operation: SkillSourceMetricOperation,
+        after: Option<&str>,
+    ) -> Result<AgentSkillPackageList, &'static str> {
         let client_id = project.config.client_id.clone();
-        let payload = json!({"limit": MAX_SKILL_DISCOVERY_PACKAGES + 1}).to_string();
+        let payload = json!({
+            "limit": MAX_SKILL_DISCOVERY_PACKAGES + 1,
+            "after": after,
+        })
+        .to_string();
         let wait_timeout = 20_u64;
         let (request_id, rx) = self
             .runner_registry
@@ -1954,6 +2225,22 @@ impl ToolRuntime {
                 None,
             );
             return Err("skills_catalog_unavailable");
+        }
+        let mut previous = after;
+        for entry in &parsed.entries {
+            if previous.is_some_and(|cursor| entry.name.as_str() <= cursor) {
+                observe_skill_source_request(
+                    self.metrics.as_ref(),
+                    SkillSourceMetricSource::Project,
+                    operation,
+                    request_started,
+                    Some(&response),
+                    SkillSourceMetricOutcomeClass::InvalidResponse,
+                    None,
+                );
+                return Err("skills_catalog_unavailable");
+            }
+            previous = Some(&entry.name);
         }
         let observed_count = parsed.entries.len();
         observe_skill_source_request(

@@ -1027,6 +1027,8 @@ impl ToolRuntime {
         if let Some(result) = reject_structured_validation_ssh_resource(ssh_resource.as_deref()) {
             return result;
         }
+        self.reconcile_validation_source_jobs(&source_project, request.auth)
+            .await;
         let source_fence = self.validation_sources.capture(&source_project);
         let mut result = if tool_name == "go_test" || sync_wait_secs < timeout_secs {
             // The effective synchronous grace is shorter than the total

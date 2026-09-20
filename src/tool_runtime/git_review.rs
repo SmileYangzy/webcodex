@@ -314,6 +314,7 @@ fn is_test_path(lower: &str) -> bool {
     segments
         .iter()
         .any(|segment| matches!(*segment, "test" | "tests"))
+        || lower.ends_with("_test.go")
         || lower.ends_with("_test.rs")
         || lower.ends_with("_tests.rs")
         || lower.contains(".test.")
@@ -1236,6 +1237,9 @@ mod tests {
         let test = classify_path("tests/auth.rs");
         assert!(test.iter().any(|class| class == "test"));
         assert!(!test.iter().any(|class| class == "production"));
+        let go_test = classify_path("internal/auth/token_test.go");
+        assert!(go_test.iter().any(|class| class == "test"));
+        assert!(!go_test.iter().any(|class| class == "production"));
         let docs = classify_path("docs/AUTH.md");
         assert!(docs.iter().any(|class| class == "docs"));
     }

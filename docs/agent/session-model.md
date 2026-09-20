@@ -10,6 +10,11 @@ independent bounds: longer forensic/recovery retention does not enlarge one mode
 response, and the ledger remains a bounded tail rather than an archive. If
 `retention_truncated` is true, event-derived summary counts describe the retained
 ledger rather than claiming lifetime-complete history.
+Validation and closeout evidence use the bounded retained ledger internally,
+not the public 200-event display window. A display-only truncation must not
+erase an available attempt boundary; genuinely evicted boundaries remain
+unavailable. This does not strengthen source freshness beyond its observed
+mutation fence or prove the absence of external writes.
 Executable constraints that agents must obey live in
 [`AGENTS.md`](../../AGENTS.md); this document is the Workflow Sessions domain
 source linked from §6. Standing architecture summary:

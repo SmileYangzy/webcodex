@@ -158,6 +158,37 @@ fn default_session_retention_exceeds_model_summary_window_and_persists() {
     assert_eq!(restored_summary.events_total, persisted_events);
     assert_eq!(restored_summary.events_returned, MAX_SUMMARY_LIMIT);
     assert_eq!(restored.status().max_events_per_session, 2000);
+    let evidence = restored
+        .retained_evidence_summary(&session.session_id)
+        .unwrap();
+    assert_eq!(evidence.events.len(), persisted_events);
+    assert_eq!(evidence.events_returned, persisted_events);
+    assert!(!evidence.events_truncated);
+    assert_eq!(evidence.first_retained_sequence, 0);
+}
+
+#[test]
+fn retained_evidence_summary_preserves_actual_retention_loss() {
+    let store = SessionStore::new(10, 3);
+    let session = store.start_session(None, None);
+    for _ in 0..5 {
+        let start = store.record_tool_call_started(
+            Some(&session.session_id),
+            SessionTransport::Api,
+            "runtime_status",
+            &json!({}),
+            session_tool_contract("runtime_status"),
+        );
+        store.record_tool_call_finished(start, true, &json!({}), None, None);
+    }
+    let evidence = store
+        .retained_evidence_summary(&session.session_id)
+        .unwrap();
+    assert_eq!(evidence.events_returned, 3);
+    assert!(evidence.events_truncated);
+    assert!(evidence.retention_truncated);
+    assert_eq!(evidence.first_retained_sequence, evidence.events_total - 3);
+    assert!(!crate::current_attempt_event_view(&evidence).complete);
 }
 
 #[test]

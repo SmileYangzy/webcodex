@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use unicase::UniCase;
 
 pub const MAX_SKILL_NAME_CHARS: usize = 96;
 pub const MAX_SKILL_DESCRIPTION_CHARS: usize = 512;
@@ -9,6 +10,17 @@ pub const MAX_SKILL_FRONTMATTER_LINES: usize = 64;
 pub struct SkillMetadata {
     pub name: String,
     pub description: String,
+}
+
+pub fn valid_skill_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.trim() == name
+        && name.chars().count() <= MAX_SKILL_NAME_CHARS
+        && !name.chars().any(char::is_control)
+}
+
+pub fn skill_name_eq(left: &str, right: &str) -> bool {
+    UniCase::unicode(left) == UniCase::unicode(right)
 }
 
 /// Parse the canonical bounded Agent Skill frontmatter used by both Control
@@ -54,10 +66,7 @@ pub fn parse_skill_metadata(text: &str) -> Result<SkillMetadata, &'static str> {
     }
     let name = name.ok_or("skill_name_missing")?;
     let description = description.ok_or("skill_description_missing")?;
-    if name.is_empty()
-        || name.chars().count() > MAX_SKILL_NAME_CHARS
-        || name.chars().any(char::is_control)
-    {
+    if !valid_skill_name(&name) {
         return Err("skill_name_invalid");
     }
     if description.is_empty()

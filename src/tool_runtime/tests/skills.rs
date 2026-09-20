@@ -15,8 +15,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use webcodex_core::runner_skill::{
     RunnerSkillDescriptor, RunnerSkillExecutionRequest, RunnerSkillListResponse,
-    RunnerSkillReadResponse, RunnerSkillRequest, RunnerSkillResolveResponse, RunnerSkillSource,
-    RUNNER_SKILL_EXECUTION_REQUEST_KIND, RUNNER_SKILL_RESPONSE_FORMAT,
+    RunnerSkillNameResolveResponse, RunnerSkillReadResponse, RunnerSkillRequest,
+    RunnerSkillResolveResponse, RunnerSkillSource, RUNNER_SKILL_EXECUTION_REQUEST_KIND,
+    RUNNER_SKILL_RESPONSE_FORMAT,
 };
 
 fn write_skill(root: &Path, package: &str, name: &str, description: &str, body: &str) {
@@ -262,6 +263,63 @@ async fn skill_load_is_exact_case_insensitive_and_fails_closed_on_ambiguity() {
         .all(|skill| skill["name_conflict"] == true));
 }
 
+#[tokio::test]
+async fn skill_load_resolves_exact_names_beyond_the_bounded_catalog_page() {
+    let root = tempfile::tempdir().unwrap();
+    for index in 0..256 {
+        write_skill(
+            root.path(),
+            &format!("a-filler-{index:03}"),
+            &format!("filler-{index:03}"),
+            "Catalog pagination filler",
+            "filler body\n",
+        );
+    }
+    write_skill(
+        root.path(),
+        "z-target-a",
+        "paged-target",
+        "Exact target beyond the first catalog page",
+        "paged target body\n",
+    );
+    let runtime = ToolRuntime::new_for_tests();
+    let project =
+        register_runner_project_at_path(&runtime, "skill-load-paged", "demo", root.path()).await;
+
+    let (loaded, _) = call_kernel_with_local_agent(
+        &runtime,
+        "skill-load-paged",
+        "skill_load",
+        json!({"project": project, "name": "PAGED-TARGET"}),
+        true,
+    )
+    .await;
+    assert!(loaded.success, "{:?}", loaded.error);
+    assert_eq!(loaded.output["name"], "paged-target");
+    assert!(loaded.output["text"]
+        .as_str()
+        .is_some_and(|text| text.contains("paged target body")));
+
+    write_skill(
+        root.path(),
+        "z-target-b",
+        "Paged-Target",
+        "Duplicate exact target beyond the first catalog page",
+        "duplicate paged target body\n",
+    );
+    let (ambiguous, _) = call_kernel_with_local_agent(
+        &runtime,
+        "skill-load-paged",
+        "skill_load",
+        json!({"project": project, "name": "paged-target"}),
+        true,
+    )
+    .await;
+    assert!(!ambiguous.success);
+    assert_eq!(ambiguous.output["error_kind"], "skill_name_ambiguous");
+    assert_eq!(ambiguous.output["candidate_count"], 2);
+}
+
 #[derive(Debug, Clone)]
 struct FakeConfiguredSkillState {
     skill_id: String,
@@ -287,6 +345,8 @@ struct FakeManagedSkillState {
 
 #[derive(Debug, Clone)]
 struct FakeOperatorSkillState {
+    list_discovery_truncated: bool,
+    exact_discovery_truncated: bool,
     configured: Option<FakeConfiguredSkillState>,
     managed: Option<FakeManagedSkillState>,
 }
@@ -362,6 +422,7 @@ async fn call_kernel_with_fake_operator_store(
                     match &operation {
                         RunnerSkillRequest::List => "skill:list",
                         RunnerSkillRequest::Resolve { .. } => "skill:resolve",
+                        RunnerSkillRequest::ResolveName { .. } => "skill:resolve_name",
                         RunnerSkillRequest::Read { .. } => "skill:read",
                         _ => "skill:management",
                     }
@@ -389,7 +450,7 @@ async fn call_kernel_with_fake_operator_store(
                                         skills,
                                         invalid_count: 0,
                                         diagnostics: Vec::new(),
-                                        discovery_truncated: false,
+                                        discovery_truncated: state.list_discovery_truncated,
                                     })
                                     .unwrap(),
                                 ),
@@ -437,6 +498,42 @@ async fn call_kernel_with_fake_operator_store(
                                 }
                                 (Some(0), Some(stdout), None)
                             }
+                        }
+                    }
+                    RunnerSkillRequest::ResolveName { name } => {
+                        let key = skill_name_key(&name);
+                        let mut skills = Vec::new();
+                        if let Some(configured) = state
+                            .configured
+                            .as_ref()
+                            .filter(|configured| skill_name_key(&configured.name) == key)
+                        {
+                            skills.push(configured_descriptor(configured));
+                        }
+                        if let Some(managed) = state
+                            .managed
+                            .as_ref()
+                            .filter(|managed| skill_name_key(&managed.name) == key)
+                        {
+                            skills.push(managed_descriptor(managed));
+                        }
+                        let mut seen = std::collections::BTreeSet::new();
+                        if skills.iter().any(|skill| !seen.insert(skill.skill_id())) {
+                            (None, None, Some("skill_catalog_unavailable".to_string()))
+                        } else {
+                            skills.truncate(2);
+                            (
+                                Some(0),
+                                Some(
+                                    serde_json::to_string(&RunnerSkillNameResolveResponse {
+                                        format: RUNNER_SKILL_RESPONSE_FORMAT.to_string(),
+                                        skills,
+                                        discovery_truncated: state.exact_discovery_truncated,
+                                    })
+                                    .unwrap(),
+                                ),
+                                None,
+                            )
                         }
                     }
                     RunnerSkillRequest::Read {
@@ -692,6 +789,8 @@ async fn project_and_operator_skill_catalog_union_is_fresh_conflict_safe_and_pac
     let package_b = "wc_skillpkg_u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7s".to_string();
     let definition = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_string();
     let operator = Arc::new(Mutex::new(FakeOperatorSkillState {
+        list_discovery_truncated: false,
+        exact_discovery_truncated: false,
         configured: None,
         managed: Some(FakeManagedSkillState {
             skill_id: "wc_skill_EREREREREREREREREREREQ".to_string(),
@@ -834,6 +933,8 @@ async fn project_configured_and_managed_skills_share_one_conflict_safe_catalog()
     let managed_revision = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
     let managed_package = "wc_skillpkg_qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo".to_string();
     let sources = Arc::new(Mutex::new(FakeOperatorSkillState {
+        list_discovery_truncated: false,
+        exact_discovery_truncated: false,
         configured: Some(FakeConfiguredSkillState {
             skill_id: configured_id.clone(),
             name: "duplicate".to_string(),
@@ -958,6 +1059,8 @@ async fn configured_skill_exact_read_uses_unified_resolve_then_read() {
     let configured_id = "wc_skill_IiIiIiIiIiIiIiIiIiIiIg".to_string();
     let configured_revision = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
     let sources = Arc::new(Mutex::new(FakeOperatorSkillState {
+        list_discovery_truncated: false,
+        exact_discovery_truncated: false,
         configured: Some(FakeConfiguredSkillState {
             skill_id: configured_id.clone(),
             name: "configured".to_string(),
@@ -1030,6 +1133,96 @@ async fn configured_skill_exact_read_uses_unified_resolve_then_read() {
 }
 
 #[tokio::test]
+async fn skill_load_uses_runner_exact_name_resolution_when_catalog_projection_is_truncated() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = ToolRuntime::new_for_tests();
+    let client_id = "runner-skill-name-resolution";
+    register_agent_with_projects(
+        &runtime,
+        client_id,
+        None,
+        RunnerCapabilities {
+            file_read: true,
+            skill_runtime: true,
+            ..Default::default()
+        },
+        vec![registered_project(
+            "project",
+            root.path().to_string_lossy().as_ref(),
+        )],
+    )
+    .await;
+    let project = crate::tool_runtime::runner_project_runtime_id(client_id, "project");
+    let configured_id = "wc_skill_RnRnRnRnRnRnRnRnRnRnRA".to_string();
+    let configured_revision = "c".repeat(64);
+    let sources = Arc::new(Mutex::new(FakeOperatorSkillState {
+        list_discovery_truncated: true,
+        exact_discovery_truncated: false,
+        configured: Some(FakeConfiguredSkillState {
+            skill_id: configured_id.clone(),
+            name: "git-workflow".to_string(),
+            description: "Configured Git workflow guidance".to_string(),
+            definition_revision: configured_revision,
+            definition_text: "git workflow definition".to_string(),
+            resource_text: "git workflow resource".to_string(),
+            read_error: None,
+            next_definition_revision_after_probe: None,
+        }),
+        managed: None,
+    }));
+
+    let (loaded, kinds) = call_kernel_with_fake_operator_store(
+        &runtime,
+        client_id,
+        "skill_load",
+        json!({"project": project, "name": "GIT-WORKFLOW"}),
+        sources.clone(),
+    )
+    .await;
+    assert!(loaded.success, "{:?}", loaded.error);
+    assert_eq!(loaded.output["skill_id"], configured_id);
+    assert!(kinds.iter().any(|kind| kind == "skill:resolve_name"));
+    assert!(kinds.iter().any(|kind| kind == "skill:read"));
+
+    sources.lock().unwrap().managed = Some(FakeManagedSkillState {
+        skill_id: "wc_skill_SnSnSnSnSnSnSnSnSnSnSA".to_string(),
+        skill_key: "git-workflow-managed".to_string(),
+        name: "Git-Workflow".to_string(),
+        description: "Managed Git workflow guidance".to_string(),
+        package_revision: "wc_skillpkg_u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7s".to_string(),
+        definition_revision: "d".repeat(64),
+        resource_text: "managed git workflow resource".to_string(),
+    });
+    let (ambiguous, _) = call_kernel_with_fake_operator_store(
+        &runtime,
+        client_id,
+        "skill_load",
+        json!({"project": project, "name": "git-workflow"}),
+        sources.clone(),
+    )
+    .await;
+    assert!(!ambiguous.success);
+    assert_eq!(ambiguous.output["error_kind"], "skill_name_ambiguous");
+    assert_eq!(ambiguous.output["candidate_count"], 2);
+
+    {
+        let mut state = sources.lock().unwrap();
+        state.managed = None;
+        state.exact_discovery_truncated = true;
+    }
+    let (truncated, _) = call_kernel_with_fake_operator_store(
+        &runtime,
+        client_id,
+        "skill_load",
+        json!({"project": project, "name": "git-workflow"}),
+        sources,
+    )
+    .await;
+    assert!(!truncated.success);
+    assert_eq!(truncated.output["error_kind"], "skill_catalog_truncated");
+}
+
+#[tokio::test]
 async fn managed_skill_exact_read_uses_unified_resolve_then_read() {
     let root = tempfile::tempdir().unwrap();
     let runtime = ToolRuntime::new_for_tests();
@@ -1054,6 +1247,8 @@ async fn managed_skill_exact_read_uses_unified_resolve_then_read() {
     let managed_revision = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
     let managed_package = "wc_skillpkg_qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo".to_string();
     let sources = Arc::new(Mutex::new(FakeOperatorSkillState {
+        list_discovery_truncated: false,
+        exact_discovery_truncated: false,
         configured: None,
         managed: Some(FakeManagedSkillState {
             skill_id: managed_id.clone(),
@@ -1114,6 +1309,8 @@ async fn exact_skill_resolution_fails_closed_on_duplicate_target_across_sources(
     let managed_revision = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
     let managed_package = "wc_skillpkg_qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo".to_string();
     let sources = Arc::new(Mutex::new(FakeOperatorSkillState {
+        list_discovery_truncated: false,
+        exact_discovery_truncated: false,
         configured: Some(FakeConfiguredSkillState {
             skill_id: duplicate_id.clone(),
             name: "configured".to_string(),
@@ -1183,6 +1380,8 @@ async fn exact_skill_resolution_fails_closed_when_applicable_source_is_unavailab
     let project = crate::tool_runtime::runner_project_runtime_id(client_id, "project");
     let configured_revision = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
     let sources = Arc::new(Mutex::new(FakeOperatorSkillState {
+        list_discovery_truncated: false,
+        exact_discovery_truncated: false,
         configured: Some(FakeConfiguredSkillState {
             skill_id: "wc_skill_mZmZmZmZmZmZmZmZmZmZmQ".to_string(),
             name: "configured-unavailable".to_string(),
@@ -1263,6 +1462,8 @@ async fn configured_exact_read_pins_probe_revision_across_resource_read() {
     let revision_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let revision_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     let sources = Arc::new(Mutex::new(FakeOperatorSkillState {
+        list_discovery_truncated: false,
+        exact_discovery_truncated: false,
         configured: Some(FakeConfiguredSkillState {
             skill_id: configured_id.clone(),
             name: "configured".to_string(),
@@ -2246,6 +2447,8 @@ async fn configured_skill_resource_executes_without_model_source_roundtrip_and_f
     let definition_revision =
         "abababababababababababababababababababababababababababababababab".to_string();
     let operator = Arc::new(Mutex::new(FakeOperatorSkillState {
+        list_discovery_truncated: false,
+        exact_discovery_truncated: false,
         configured: Some(FakeConfiguredSkillState {
             skill_id: skill_id.clone(),
             name: "configured-exec".to_string(),
@@ -2371,6 +2574,8 @@ async fn run_skill_resource_denies_project_content_and_requires_managed_package_
     .await;
     let project = crate::tool_runtime::runner_project_runtime_id(client_id, "project");
     let operator = Arc::new(Mutex::new(FakeOperatorSkillState {
+        list_discovery_truncated: false,
+        exact_discovery_truncated: false,
         configured: None,
         managed: None,
     }));
@@ -2414,6 +2619,8 @@ async fn run_skill_resource_denies_project_content_and_requires_managed_package_
         "dededededededededededededededededededededededededededededededede".to_string();
     let package_revision = "wc_skillpkg_u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7s".to_string();
     let managed = Arc::new(Mutex::new(FakeOperatorSkillState {
+        list_discovery_truncated: false,
+        exact_discovery_truncated: false,
         configured: None,
         managed: Some(FakeManagedSkillState {
             skill_id: managed_id.clone(),

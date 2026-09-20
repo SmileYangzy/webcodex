@@ -10,13 +10,16 @@ use webcodex_core::runner_skill::{
     RunnerSkillReadResponse, RunnerSkillSource, MAX_RUNNER_SKILL_READ_TEXT_BYTES,
     RUNNER_SKILL_RESPONSE_FORMAT,
 };
-use webcodex_core::skill_metadata::{parse_skill_metadata, MAX_SKILL_DEFINITION_BYTES};
+use webcodex_core::skill_metadata::{
+    parse_skill_metadata, skill_name_eq, MAX_SKILL_DEFINITION_BYTES,
+};
 use webcodex_workspace::file_read_range;
 
 const SKILL_DEFINITION_FILE: &str = "SKILL.md";
 const MAX_SKILL_PACKAGE_NAME_BYTES: usize = 160;
 const MAX_CONFIGURED_SKILL_DIAGNOSTICS: usize = 8;
 const MAX_CONFIGURED_SKILL_PACKAGES: usize = 256;
+const MAX_CONFIGURED_SKILL_EXACT_SCAN_PACKAGES: usize = 4096;
 const MAX_CONFIGURED_SKILL_RESOURCE_FILE_BYTES: usize = 512 * 1024;
 const MAX_CONFIGURED_SKILL_ROOT_SCAN_ENTRIES: usize = 1024;
 
@@ -40,10 +43,17 @@ pub(super) struct LiveDiscovery {
     pub(super) discovery_truncated: bool,
 }
 
+#[derive(Debug, Default)]
+pub(super) struct ExactNameDiscovery {
+    pub(super) skills: Vec<LiveSkill>,
+    pub(super) discovery_truncated: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConfiguredSkillScanTrigger {
     CatalogList,
     ExactReadResolution,
+    ExactNameResolution,
 }
 
 impl ConfiguredSkillScanTrigger {
@@ -51,6 +61,7 @@ impl ConfiguredSkillScanTrigger {
         match self {
             Self::CatalogList => "catalog_list",
             Self::ExactReadResolution => "exact_read_resolution",
+            Self::ExactNameResolution => "exact_name_resolution",
         }
     }
 }
@@ -296,6 +307,138 @@ pub(super) fn resolve_live_skill(
     target_skill_id: &str,
 ) -> Result<Option<LiveSkill>, String> {
     resolve_live_skill_by_id(config, target_skill_id).map(|(skill, _)| skill)
+}
+
+pub(super) fn resolve_live_skills_by_name(
+    config: &SkillsConfig,
+    target_name: &str,
+) -> Result<ExactNameDiscovery, String> {
+    let mut discovery = LiveDiscovery::default();
+    let started = Instant::now();
+    let mut stats = ConfiguredSkillScanStats::default();
+    let mut packages_examined = 0usize;
+    let mut seen_ids = BTreeSet::new();
+    for configured_root in &config.roots {
+        stats.roots_examined = stats.roots_examined.saturating_add(1);
+        let root_metadata = match fs::symlink_metadata(configured_root) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                push_diagnostic(
+                    &mut discovery.diagnostics,
+                    "configured_skill_root_not_found",
+                );
+                continue;
+            }
+            Err(_) => {
+                push_diagnostic(
+                    &mut discovery.diagnostics,
+                    "configured_skill_root_unavailable",
+                );
+                continue;
+            }
+        };
+        if metadata_is_link_like(&root_metadata) {
+            push_diagnostic(
+                &mut discovery.diagnostics,
+                "configured_skill_root_link_not_allowed",
+            );
+            continue;
+        }
+        if !root_metadata.is_dir() {
+            push_diagnostic(
+                &mut discovery.diagnostics,
+                "configured_skill_root_not_directory",
+            );
+            continue;
+        }
+        let root = match configured_root.canonicalize() {
+            Ok(root) if root.is_dir() => root,
+            _ => {
+                push_diagnostic(
+                    &mut discovery.diagnostics,
+                    "configured_skill_root_unavailable",
+                );
+                continue;
+            }
+        };
+        let entries = match bounded_root_entries(&root, &mut stats) {
+            Ok(entries) => entries,
+            Err(code) => {
+                if code == "configured_skill_root_scan_limit_exceeded" {
+                    discovery.discovery_truncated = true;
+                    push_diagnostic(&mut discovery.diagnostics, code);
+                    break;
+                }
+                return Err(code.to_string());
+            }
+        };
+        for package_name in entries {
+            packages_examined = packages_examined.saturating_add(1);
+            if packages_examined > MAX_CONFIGURED_SKILL_EXACT_SCAN_PACKAGES {
+                discovery.discovery_truncated = true;
+                push_diagnostic(
+                    &mut discovery.diagnostics,
+                    "configured_skill_exact_scan_limit_exceeded",
+                );
+                break;
+            }
+            match load_live_skill(configured_root, &root, &package_name, &mut stats) {
+                Ok(skill) if skill_name_eq(skill.descriptor.name(), target_name) => {
+                    if !seen_ids.insert(skill.descriptor.skill_id().to_string()) {
+                        observe_configured_skill_scan(
+                            &stats,
+                            &discovery,
+                            started,
+                            ConfiguredSkillScanTrigger::ExactNameResolution,
+                            "error",
+                        );
+                        return Err("configured_skill_identity_collision".to_string());
+                    }
+                    discovery.skills.push(skill);
+                    if discovery.skills.len()
+                        == webcodex_core::runner_skill::MAX_RUNNER_SKILL_NAME_MATCHES
+                    {
+                        observe_configured_skill_scan(
+                            &stats,
+                            &discovery,
+                            started,
+                            ConfiguredSkillScanTrigger::ExactNameResolution,
+                            "ambiguous",
+                        );
+                        return Ok(ExactNameDiscovery {
+                            skills: discovery.skills,
+                            discovery_truncated: false,
+                        });
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    discovery.invalid_count = discovery.invalid_count.saturating_add(1);
+                }
+            }
+        }
+        if discovery.discovery_truncated {
+            break;
+        }
+    }
+    discovery
+        .skills
+        .sort_by(|left, right| left.descriptor.skill_id().cmp(right.descriptor.skill_id()));
+    observe_configured_skill_scan(
+        &stats,
+        &discovery,
+        started,
+        ConfiguredSkillScanTrigger::ExactNameResolution,
+        if discovery.discovery_truncated {
+            "truncated"
+        } else {
+            "success"
+        },
+    );
+    Ok(ExactNameDiscovery {
+        skills: discovery.skills,
+        discovery_truncated: discovery.discovery_truncated,
+    })
 }
 
 fn bounded_root_entries(

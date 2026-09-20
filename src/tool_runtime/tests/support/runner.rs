@@ -390,6 +390,11 @@ fn run_runner_skill_list_packages_locally(req: &RunnerRequest) -> (i32, String, 
         .and_then(|value| value["limit"].as_u64())
         .map(|value| value as usize)
         .unwrap_or(257);
+    let after = req
+        .content
+        .as_deref()
+        .and_then(|content| serde_json::from_str::<Value>(content).ok())
+        .and_then(|value| value["after"].as_str().map(str::to_string));
     let entries =
         match std::fs::read_dir(&root) {
             Ok(entries) => entries,
@@ -416,6 +421,9 @@ fn run_runner_skill_list_packages_locally(req: &RunnerRequest) -> (i32, String, 
         })
         .collect::<Vec<_>>();
     items.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
+    if let Some(after) = after.as_deref() {
+        items.retain(|item| item["name"].as_str().is_some_and(|name| name > after));
+    }
     let truncated = items.len() > limit;
     items.truncate(limit);
     (

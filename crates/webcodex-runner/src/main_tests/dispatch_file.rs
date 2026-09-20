@@ -108,6 +108,20 @@ fn skill_file_ops_are_project_contained_text_only_and_path_private() {
         .to_string()
         .contains(&tmp.path().display().to_string()));
 
+    std::fs::create_dir_all(tmp.path().join(".agents/skills/zoo")).unwrap();
+    let paged = line_edit_json(handle_file_request(
+        &policy,
+        &json_file_op_request(
+            tmp.path(),
+            "file_skill_list_packages",
+            ".agents/skills",
+            serde_json::json!({"limit": 257, "after": "foo"}),
+        ),
+    ));
+    assert_eq!(paged["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(paged["entries"][0]["name"], "zoo");
+    assert_eq!(paged["truncated"], false);
+
     let mut read = json_file_op_request(
         tmp.path(),
         "file_skill_read_file",

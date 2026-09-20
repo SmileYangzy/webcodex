@@ -2,13 +2,14 @@
 //! Unlike the Code Mode serialization fence this includes direct calls and all
 //! Sessions. It is NOT a filesystem watcher, write lock, or source snapshot.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use webcodex_core::validation_source::{
     ValidationSourceFence, ValidationSourceState, MAX_SOURCE_GENERATION,
 };
 
 const MAX_TRACKED_PROJECTS: usize = 4096;
+const MAX_PENDING_JOBS_PER_PROJECT: usize = 256;
 
 #[derive(Debug)]
 struct ProjectObservation {
@@ -16,6 +17,7 @@ struct ProjectObservation {
     generation: u64,
     active: usize,
     uncertain: bool,
+    pending_jobs: BTreeSet<String>,
 }
 
 impl ProjectObservation {
@@ -31,7 +33,7 @@ impl ProjectObservation {
         ValidationSourceFence {
             epoch: self.epoch.clone(),
             generation: self.generation,
-            quiescent: self.active == 0 && !self.uncertain,
+            quiescent: self.active == 0 && self.pending_jobs.is_empty() && !self.uncertain,
         }
     }
 }
@@ -57,6 +59,7 @@ impl ValidationSourceRegistry {
             generation: 0,
             active: 0,
             uncertain: false,
+            pending_jobs: BTreeSet::new(),
         }));
         projects.insert(project.to_string(), Arc::clone(&state));
         Some(state)
@@ -76,6 +79,33 @@ impl ValidationSourceRegistry {
         ValidationSourceState::observe(start, self.capture(project).as_ref())
     }
 
+    pub(crate) fn pending_jobs(&self, project: &str) -> Vec<String> {
+        let state = self
+            .projects
+            .lock()
+            .ok()
+            .and_then(|projects| projects.get(project).cloned());
+        state
+            .and_then(|state| state.lock().ok().map(|state| state.pending_jobs.clone()))
+            .map(|jobs| jobs.into_iter().collect())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn complete_pending_job(&self, project: &str, job_id: &str) {
+        let state = self
+            .projects
+            .lock()
+            .ok()
+            .and_then(|projects| projects.get(project).cloned());
+        if let Some(state) = state {
+            if let Ok(mut state) = state.lock() {
+                if state.pending_jobs.remove(job_id) {
+                    state.advance();
+                }
+            }
+        }
+    }
+
     pub(crate) fn begin(&self, project: &str) -> Option<MutationObservationGuard> {
         let state = self.project(project)?;
         {
@@ -86,6 +116,7 @@ impl ValidationSourceRegistry {
         Some(MutationObservationGuard {
             state,
             completed: false,
+            pending_job: None,
         })
     }
 }
@@ -93,34 +124,57 @@ impl ValidationSourceRegistry {
 pub(crate) struct MutationObservationGuard {
     state: Arc<Mutex<ProjectObservation>>,
     completed: bool,
+    pending_job: Option<String>,
 }
 
 impl MutationObservationGuard {
     pub(crate) fn finish(mut self, result: &super::ToolResult) {
-        // Returning a Job, losing delivery, or lacking mutation truth cannot
-        // prove that the potential writer stopped. Keep this epoch uncertain.
         let output = &result.output;
-        self.completed = output
+        let uncertain = output
             .get("execution_state")
             .and_then(serde_json::Value::as_str)
-            != Some("outcome_unknown")
-            && output
+            .is_some_and(|state| matches!(state, "outcome_unknown" | "lost"))
+            || output
                 .get("failure_kind")
                 .and_then(serde_json::Value::as_str)
-                != Some("outcome_unknown")
-            && output.get("job_id").filter(|id| !id.is_null()).is_none()
-            && (output
-                .get("state_changed")
-                .and_then(serde_json::Value::as_bool)
-                .is_some()
-                || output
-                    .get("command_completed")
-                    .and_then(serde_json::Value::as_bool)
-                    == Some(true)
-                || output
-                    .get("command_started")
-                    .and_then(serde_json::Value::as_bool)
-                    == Some(false));
+                .is_some_and(|state| matches!(state, "outcome_unknown" | "lost"))
+            || output
+                .get("command_execution_state")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|state| state == "outcome_unknown");
+        if uncertain {
+            return;
+        }
+
+        let command_completed = output
+            .get("command_completed")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        let command_not_started = output
+            .get("command_started")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false);
+        if let Some(job_id) = output.get("job_id").filter(|job_id| !job_id.is_null()) {
+            let Some(job_id) = job_id
+                .as_str()
+                .filter(|job_id| super::helpers::is_safe_job_id(job_id))
+            else {
+                return;
+            };
+            if command_completed || command_not_started {
+                self.completed = true;
+            } else {
+                self.pending_job = Some(job_id.to_string());
+            }
+            return;
+        }
+
+        self.completed = output
+            .get("state_changed")
+            .and_then(serde_json::Value::as_bool)
+            .is_some()
+            || command_completed
+            || command_not_started;
     }
 }
 
@@ -129,7 +183,15 @@ impl Drop for MutationObservationGuard {
         if let Ok(mut state) = self.state.lock() {
             state.advance();
             state.active = state.active.saturating_sub(1);
-            state.uncertain |= !self.completed;
+            if let Some(job_id) = self.pending_job.take() {
+                if state.pending_jobs.len() < MAX_PENDING_JOBS_PER_PROJECT {
+                    state.pending_jobs.insert(job_id);
+                } else {
+                    state.uncertain = true;
+                }
+            } else {
+                state.uncertain |= !self.completed;
+            }
         }
     }
 }
